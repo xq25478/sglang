@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Union
 
 from python.sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget
 from python.sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecBatchResponseFromDraftToTarget, RemoteSpecBatchRequestFromTargetToDraft
@@ -20,17 +20,17 @@ class RemoteSpecBaseCommunicator(ABC):
         pass
 
     @abstractmethod
-    def send_batch(self, requests: List[RemoteSpecBatchResponseFromDraftToTarget, RemoteSpecBatchRequestFromTargetToDraft]) -> None:
+    def send_batch(self, requests: List[Union[RemoteSpecBatchResponseFromDraftToTarget, RemoteSpecBatchRequestFromTargetToDraft]]) -> None:
         pass
 
     @abstractmethod
-    def send_single_request(self, request: [RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]) -> None:
+    def send_single_request(self, request: Union[RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]) -> None:
         pass
 
     @abstractmethod
-    def receive_batch(self) -> List[RemoteSpecBatchResponseFromDraftToTarget, RemoteSpecBatchRequestFromTargetToDraft]:
+    def receive_batch(self) -> List[Union[RemoteSpecBatchResponseFromDraftToTarget, RemoteSpecBatchRequestFromTargetToDraft]]:
         pass
 
     @abstractmethod
-    def receive_single_response(self) -> [RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]:
+    def receive_single_response(self) -> Union[RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]:
         pass
