@@ -102,6 +102,36 @@ class SamplingParams:
         if self.top_k == -1:
             self.top_k = TOP_K_ALL  # whole vocabulary
 
+    def to_dict(self):
+        stop_token_ids_list = list(self.stop_token_ids) if self.stop_token_ids else None
+        return {
+            "max_new_tokens": self.max_new_tokens,
+            "stop_strs": self.stop_strs,
+            "stop_token_ids": stop_token_ids_list,
+            "stop_regex_strs": self.stop_regex_strs,
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "repetition_penalty": self.repetition_penalty,
+            "min_new_tokens": self.min_new_tokens,
+            "n": self.n,
+            "json_schema": self.json_schema,
+            "regex": self.regex,
+            "ebnf": self.ebnf,
+            "structural_tag": self.structural_tag,
+            "ignore_eos": self.ignore_eos,
+            "skip_special_tokens": self.skip_special_tokens,
+            "spaces_between_special_tokens": self.spaces_between_special_tokens,
+            "no_stop_trim": self.no_stop_trim,
+            "custom_params": self.custom_params,
+            "stream_interval": self.stream_interval,
+            "logit_bias": self.logit_bias,
+            "sampling_seed": self.sampling_seed,
+        }
+        
     def verify(self, vocab_size):
         if self.temperature < 0.0:
             raise ValueError(

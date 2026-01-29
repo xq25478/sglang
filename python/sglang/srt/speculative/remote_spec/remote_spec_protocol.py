@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from enum import Enum
+from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 class RemoteSpecAction(Enum):
@@ -48,6 +49,52 @@ class RemoteSpecRequestFromTargetToDraft:
     # time record for debug
     target_send_time: Optional[float] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+            # action: enum / str 统一归一化
+            if hasattr(self.action, "value"):
+                action = self.action.value
+            else:
+                action = self.action
+            # sampling_params: 显式展开
+            if self.sampling_params is not None:
+                if hasattr(self.sampling_params, "to_dict"):
+                    sampling_params = self.sampling_params.to_dict()
+                else:
+                    raise TypeError(
+                        f"sampling_params must have to_dict(), got {type(self.sampling_params)}"
+                    )
+            else:
+                sampling_params = None
+            return {
+                "request_id": self.request_id,
+                "action": action,
+                "spec_cnt": self.spec_cnt,
+                "spec_type": self.spec_type,
+                "input_ids": self.input_ids,
+                "output_ids": self.output_ids,
+                "draft_token_ids": self.draft_token_ids,
+                "num_draft_tokens": self.num_draft_tokens,
+                "sampling_params": sampling_params,
+                "grammar": self.grammar,
+                "target_send_time": self.target_send_time,
+            }
+        
+    @classmethod
+    def from_dict(cls, d):
+        d = dict(d)
+        d["action"] = RemoteSpecAction(d["action"])
+        sp = d.get("sampling_params")
+        
+        if sp is not None:
+            stop_strs = sp["stop_strs"]
+            sp.pop("stop_strs")
+            sampling_params= SamplingParams(**sp)
+            sampling_params.stop_strs = stop_strs
+            d["sampling_params"] = sampling_params
+            
+        return cls(**d)
+    
+    
 @dataclass
 class RemoteSpecBatchRequestFromTargetToDraft:
     '''
@@ -76,6 +123,30 @@ class RemoteSpecResponseFromDraftToTarget:
     draft_receive_time: Optional[float] = None
     draft_send_time: Optional[float] = None
 
+
+    def to_dict(self) -> Dict[str, Any]:
+        if hasattr(self.action, "value"):
+            action = self.action.value
+        else:
+            action = self.action
+        return {
+            "request_id": self.request_id,
+            "action": action,
+            "spec_cnt": self.spec_cnt,
+            "spec_type": self.spec_type,
+            "draft_token_ids": self.draft_token_ids,
+            "draft_logprobs": self.draft_logprobs,
+            "target_send_time": self.target_send_time,
+            "draft_receive_time": self.draft_receive_time,
+            "draft_send_time": self.draft_send_time,
+        }
+        
+    @classmethod
+    def from_dict(cls, d):
+        d = dict(d)
+        d["action"] = RemoteSpecAction(d["action"])
+        return cls(**d)
+    
 @dataclass
 class RemoteSpecBatchResponseFromDraftToTarget:
     '''
