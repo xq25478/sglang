@@ -71,7 +71,6 @@ class RemoteSpecConfig:
     # Network configuration
     zmq_addr: str = "127.0.0.1"
     zmq_port: str = "30009"
-    zmq_timeout: int = 10
     
     # Algorithm configuration
     num_draft_tokens: int = 5
@@ -97,26 +96,24 @@ class RemoteSpecConfig:
         Returns:
             Configured RemoteSpecConfig instance
         """
-        zmq_addr = server_args.zmq_addr
+        zmq_addr = server_args.remote_speculative_zmq_addr or "127.0.0.1"
         
         # 单机最佳 ipc 多机选择 tcp
-        if zmq_addr in [ "127.0.0.1", "0.0.0.0" ]:
+        if zmq_addr in ["127.0.0.1", "0.0.0.0"]:
             zmq_transport = "ipc"
         else:
             zmq_transport = "tcp"
         
         return cls(
-            role = server_args.speculate_role,
-            zmq_addr = server_args.zmq_addr or "127.0.0.1",
-            zmq_port = server_args.zmq_port or "30009",
-            zmq_timeout = server_args.speculative_zmq_timeout,
-            num_draft_tokens = server_args.speculative_num_steps or 5,
-            topk = server_args.speculative_eagle_topk or 1,
-            promote_interval = server_args.speculative_promote_interval,
-            page_size = server_args.page_size,
-            tp_size = server_args.tp_size,
-            enable_cuda_graph = not server_args.disable_cuda_graph,
-            zmq_transport = zmq_transport,
+            role=server_args.remote_speculative_role,
+            zmq_addr=zmq_addr,
+            zmq_port=server_args.remote_speculative_zmq_port or "30009",
+            num_draft_tokens=server_args.speculative_num_steps or 5,
+            topk=server_args.speculative_eagle_topk or 1,
+            page_size=server_args.page_size,
+            tp_size=server_args.tp_size,
+            enable_cuda_graph=not server_args.disable_cuda_graph,
+            zmq_transport=zmq_transport,
         )
     
     @property
@@ -180,7 +177,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
     ZMQ-based communication backend.
     
     This implementation:
-    - Uses SmartBidirectionalWorker for efficient async communication
+    - Uses C++ ZMQ backend (DealerEndpoint) for efficient async communication
     - Supports smart deduplication (keeps only latest spec_cnt per request)
     - Uses batch serialization for efficiency
     - Runs receive in a separate process to avoid GIL

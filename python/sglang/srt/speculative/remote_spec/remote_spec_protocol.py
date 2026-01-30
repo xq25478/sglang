@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Optional, List, Dict, Any
 from enum import Enum
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -55,6 +55,11 @@ class RemoteSpecRequestFromTargetToDraft:
                 action = self.action.value
             else:
                 action = self.action
+            # spec_type: enum / str 统一归一化
+            if hasattr(self.spec_type, "value"):
+                spec_type = self.spec_type.value
+            else:
+                spec_type = self.spec_type
             # sampling_params: 显式展开
             if self.sampling_params is not None:
                 if hasattr(self.sampling_params, "to_dict"):
@@ -69,7 +74,7 @@ class RemoteSpecRequestFromTargetToDraft:
                 "request_id": self.request_id,
                 "action": action,
                 "spec_cnt": self.spec_cnt,
-                "spec_type": self.spec_type,
+                "spec_type": spec_type,
                 "input_ids": self.input_ids,
                 "output_ids": self.output_ids,
                 "draft_token_ids": self.draft_token_ids,
@@ -82,9 +87,16 @@ class RemoteSpecRequestFromTargetToDraft:
     @classmethod
     def from_dict(cls, d):
         d = dict(d)
-        d["action"] = RemoteSpecAction(d["action"])
-        sp = d.get("sampling_params")
+        # Only keep fields that are defined in the dataclass
+        field_names = {f.name for f in fields(cls)}
+        d = {k: v for k, v in d.items() if k in field_names}
         
+        d["action"] = RemoteSpecAction(d["action"])
+        # Convert spec_type string back to enum
+        if "spec_type" in d and not isinstance(d["spec_type"], SpecType):
+            d["spec_type"] = SpecType(d["spec_type"])
+        
+        sp = d.get("sampling_params")
         if sp is not None:
             stop_strs = sp["stop_strs"]
             sp.pop("stop_strs")
@@ -125,15 +137,21 @@ class RemoteSpecResponseFromDraftToTarget:
 
 
     def to_dict(self) -> Dict[str, Any]:
+        # action: enum / str 统一归一化
         if hasattr(self.action, "value"):
             action = self.action.value
         else:
             action = self.action
+        # spec_type: enum / str 统一归一化
+        if hasattr(self.spec_type, "value"):
+            spec_type = self.spec_type.value
+        else:
+            spec_type = self.spec_type
         return {
             "request_id": self.request_id,
             "action": action,
             "spec_cnt": self.spec_cnt,
-            "spec_type": self.spec_type,
+            "spec_type": spec_type,
             "draft_token_ids": self.draft_token_ids,
             "draft_logprobs": self.draft_logprobs,
             "target_send_time": self.target_send_time,
@@ -144,7 +162,15 @@ class RemoteSpecResponseFromDraftToTarget:
     @classmethod
     def from_dict(cls, d):
         d = dict(d)
+        # Only keep fields that are defined in the dataclass
+        field_names = {f.name for f in fields(cls)}
+        d = {k: v for k, v in d.items() if k in field_names}
+        
         d["action"] = RemoteSpecAction(d["action"])
+        # Convert spec_type string back to enum
+        if "spec_type" in d and not isinstance(d["spec_type"], SpecType):
+            d["spec_type"] = SpecType(d["spec_type"])
+        
         return cls(**d)
     
 @dataclass

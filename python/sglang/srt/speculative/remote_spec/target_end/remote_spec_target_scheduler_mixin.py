@@ -9,7 +9,7 @@ from collections import defaultdict
 from typing import Dict, List
 import logging
 import torch
-from sglang.srt.speculative.remote_spec.mock_communicator import MockRemoteSpecWorker
+# from sglang.srt.speculative.remote_spec.mock_communicator import MockRemoteSpecWorker
 
 logger = logging.getLogger(__name__)
 

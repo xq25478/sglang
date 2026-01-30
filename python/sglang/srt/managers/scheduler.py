@@ -18,6 +18,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -230,6 +231,10 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+# Import from refactored remote speculative decoding module
+from sglang.srt.speculative.remote_spec.draft_end.remote_spec_draft_scheduler_mixin import (
+    RemoteSpecDraftSchedulerMixin as SchedulerRemoteSpecDraftMixin,
+)
 from sglang.srt.speculative.remote_spec.target_end.remote_spec_target_scheduler_mixin import RemoteSpecTargetSchedulerMixin
 
 if is_mps():
@@ -283,6 +288,7 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
     SchedulerDllmMixin,
+    SchedulerRemoteSpecDraftMixin,
     RemoteSpecTargetSchedulerMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
@@ -425,6 +431,8 @@ class Scheduler(
         # Init request dispatcher
         self.init_request_dispatcher()
 
+        self.init_remote_spec_communication()
+
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
             self.lora_overlap_loader = LoRAOverlapLoader(
@@ -435,6 +443,62 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
+
+    def init_remote_spec_communication(self):
+        """Initialize remote speculative decoding communication."""
+        role = self.server_args.remote_speculative_role
+        if role in ["target", "draft"]:
+            from sglang.srt.speculative.remote_spec.remote_spec_communication import (
+                RemoteSpecConfig,
+                RemoteSpecZMQCommunicator,
+            )
+
+            remote_spec_config = RemoteSpecConfig.from_server_args(self.server_args)
+            self.zmq_communicator = RemoteSpecZMQCommunicator(config=remote_spec_config)
+            self.zmq_communicator.start()
+
+            if role == "draft":
+                self.paused_reqs: List[Req] = []
+                self.paused_reqs_lock = threading.RLock()
+                logger.info(
+                    "\033[33m ================ Draft ZMQ Communicator Started ================\033[0m"
+                )
+                logger.info(
+                    f"\033[33m Endpoint: {self.zmq_communicator.get_endpoint()}\033[0m"
+                )
+                logger.info(
+                    "\033[33m ================================================================ \033[0m"
+                )
+        elif role is not None:
+            raise ValueError(f"Invalid remote speculative role: {role}")
+
+        self.spec_forward_cycle = 0
+
+    def _find_fork_point(self, *args, **kwargs):
+        role = self.server_args.remote_speculative_role
+        if role == "draft":
+            return SchedulerRemoteSpecDraftMixin._find_fork_point(
+                self, *args, **kwargs
+            )
+        if role == "target":
+            return RemoteSpecTargetSchedulerMixin._find_fork_point(
+                self, *args, **kwargs
+            )
+        raise RuntimeError("_find_fork_point is only valid for remote speculative roles.")
+
+    def _is_self_high_overhead(self, *args, **kwargs):
+        role = self.server_args.remote_speculative_role
+        if role == "draft":
+            return SchedulerRemoteSpecDraftMixin._is_self_high_overhead(
+                self, *args, **kwargs
+            )
+        if role == "target":
+            return RemoteSpecTargetSchedulerMixin._is_self_high_overhead(
+                self, *args, **kwargs
+            )
+        raise RuntimeError(
+            "_is_self_high_overhead is only valid for remote speculative roles."
+        )
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -3489,6 +3553,8 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
+        elif server_args.remote_speculative_role == "draft":
+            scheduler.event_loop_normal_remote_spec_draft()
         elif (
             scheduler.spec_algorithm.is_remote()
             and scheduler.server_args.remote_speculative_role == "target"

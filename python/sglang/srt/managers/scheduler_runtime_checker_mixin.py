@@ -271,6 +271,15 @@ class SchedulerRuntimeCheckerMixin:
             )
 
     def check_memory(self: Scheduler):
+        # For Draft mode: skip check when there are paused requests with dynamic KV state
+        # check_memory is called during "idle" (batch = None), but Draft may still have
+        # paused_reqs waiting for Target's next message. Their KV state is dynamic.
+        if self.server_args.remote_speculative_role == "draft":
+            has_paused_reqs = len(getattr(self, 'paused_reqs', [])) > 0
+            if has_paused_reqs:
+                # Skip memory check - state is dynamic with paused requests
+                return
+                
         if self.is_hybrid_swa:
             memory_leak, token_msg = self._check_hybrid_memory()
         elif self.is_hybrid_ssm and self.tree_cache.supports_mamba():

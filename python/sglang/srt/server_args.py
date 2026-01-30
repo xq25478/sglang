@@ -518,6 +518,8 @@ class ServerArgs:
     remote_speculative_max_batch_size: int = 32
     remote_speculative_reject_interval: int = 5000
     remote_speculative_no_draft_ratio: float = 0.5
+    remote_speculative_zmq_addr: Optional[str] = None
+    remote_speculative_zmq_port: Optional[str] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -4886,7 +4888,19 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
         )
-
+        parser.add_argument(
+            "--remote-speculative-zmq-addr",
+            type=str,
+            help="ZMQ address for remote speculative decoding, e.g., '127.0.0.1'.",
+            default="127.0.0.1",
+        )
+        parser.add_argument(
+            "--remote-speculative-zmq-port",
+            type=str,
+            help="ZMQ port for remote speculative decoding, e.g., '30009'.",
+            default="30009",
+        )
+        
         # Multi-layer Eagle speculative decoding
         parser.add_argument(
             "--enable-multi-layer-eagle",
