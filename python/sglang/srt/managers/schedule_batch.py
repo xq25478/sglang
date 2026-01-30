@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import enum
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
@@ -817,6 +819,9 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # For remote speculative decoding
+        self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1361,6 +1366,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+
+    # For RemoteSpecWorker
+    # If None, falls back to server_args.speculative_num_draft_tokens
+    draft_num_tokens: Optional[int] = None
 
     @classmethod
     def init_new(

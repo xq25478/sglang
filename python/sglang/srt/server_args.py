@@ -513,6 +513,9 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
+    # Remote speculative decoding
+    remote_speculative_role: Literal["target", "draft"] = "target"
+
     # Expert parallelism
     ep_size: int = 1
     moe_a2a_backend: Literal[
@@ -4751,7 +4754,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "REMOTE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4886,6 +4889,15 @@ class ServerArgs:
             "--enable-multi-layer-eagle",
             action="store_true",
             help="Enable multi-layer Eagle speculative decoding.",
+        )
+
+        # Remote speculative decoding
+        parser.add_argument(
+            "--remote-speculative-role",
+            type=str,
+            choices=["target", "draft"],
+            help="The role of the remote speculative decoding. Can be one of 'target' (default) or 'draft'.",
+            default=ServerArgs.remote_speculative_role,
         )
 
         # Expert parallelism

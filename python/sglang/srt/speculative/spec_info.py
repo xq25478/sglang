@@ -10,6 +10,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.remote_spec.target_end.remote_spec_worker import (
+        RemoteSpecWorker,
+    )
 
 
 class SpeculativeAlgorithm(Enum):
@@ -19,6 +22,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    REMOTE = auto()
     NONE = auto()
 
     @classmethod
@@ -46,12 +50,22 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
+    def is_remote(self) -> bool:
+        return self == SpeculativeAlgorithm.REMOTE
+
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
     def create_worker(
         self, server_args: ServerArgs
-    ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
+    ) -> Optional[
+        Union[
+            Type[BaseSpecWorker],
+            Type[TpModelWorker],
+            Type[NGRAMWorker],
+            Type[RemoteSpecWorker],
+        ]
+    ]:
         assert (
             not self.is_none()
         ), "Cannot create worker for NONE speculative algorithm."
@@ -101,9 +115,19 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_remote():
+            if enable_overlap:
+                raise ValueError(
+                    f"Speculative algorithm {self.name} does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.remote_spec.target_end.remote_spec_worker import (
+                RemoteSpecWorker,
+            )
+
+            return RemoteSpecWorker
 
         raise ValueError("Unreachable code path in create_worker.")
-
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.
