@@ -256,7 +256,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
-
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
@@ -386,7 +385,6 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
-
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
@@ -763,10 +761,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         
-        # Handle RemoteSpecWorker case where topk_p, topk_index, hidden_states may be None
+        # Handle RemoteSpecWorker case where topk_p, topk_index, hidden_states may be None or empty
         # RemoteSpecWorker doesn't use these fields for draft generation
-        has_topk_fields = self.topk_p is not None and self.topk_index is not None
-        has_hidden_states = self.hidden_states is not None
+        # Also check for empty tensors (e.g., from create_idle_input which creates shape (0, topk))
+        has_topk_fields = (
+            self.topk_p is not None and len(self.topk_p) > 0 and
+            self.topk_index is not None and len(self.topk_index) > 0
+        )
+        has_hidden_states = self.hidden_states is not None and len(self.hidden_states) > 0
         
         if has_been_filtered:
             # in eagle_utils.py:verify, we have already filtered the batch by `unfinished_index`
@@ -784,7 +786,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if has_hidden_states:
                 self.hidden_states = self.hidden_states[: len(new_indices)]
             
-            if self.verified_id is not None:
+            if self.verified_id is not None and len(self.verified_id) > 0:
                 self.verified_id = self.verified_id[: len(new_indices)]
         else:
             # in some cases(e.g draft_extend), we have not filtered the batch by `unfinished_index`
@@ -795,7 +797,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             if has_hidden_states:
                 self.hidden_states = self.hidden_states[new_indices]
             
-            if self.verified_id is not None:
+            if self.verified_id is not None and len(self.verified_id) > 0:
                 self.verified_id = self.verified_id[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):

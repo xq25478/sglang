@@ -230,6 +230,7 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.speculative.remote_spec.target_end.remote_spec_target_scheduler_mixin import RemoteSpecTargetSchedulerMixin
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -282,6 +283,7 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
     SchedulerDllmMixin,
+    RemoteSpecTargetSchedulerMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -1316,7 +1318,10 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                start_time = time.perf_counter()
                 result = self.run_batch(batch)
+                end_time = time.perf_counter()
+                logger.info(f"Scheduler.run_batch took {end_time - start_time} seconds")
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
@@ -3484,6 +3489,11 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
+        elif (
+            scheduler.spec_algorithm.is_remote()
+            and scheduler.server_args.remote_speculative_role == "target"
+        ):
+            scheduler.event_loop_normal_remote_spec_target()
         elif server_args.pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap:

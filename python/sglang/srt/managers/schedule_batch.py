@@ -821,6 +821,31 @@ class Req(ReqDllmMixin):
 
         # For remote speculative decoding
         self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
+        # Expected format:
+        # {
+        #     # Required field:
+        #     "draft_tokens": torch.Tensor,      # shape: (num_steps,) - draft tokens on CPU
+        #     
+        #     # Optional field (reserved for future rejection sampling):
+        #     "draft_probs": torch.Tensor,       # shape: (num_steps,) - logprob of each draft token on CPU
+        # }
+        # 
+        # RemoteSpecWorker will automatically construct:
+        # - parent_list: [-1, 0, 1, ...] for linear chain (topk=1)
+        # - top_scores_index: [0, 1, 2, ...] for linear chain
+        # - verified_id from req.output_ids[-1]
+        # 
+        # TODO: Remove this test code after remote communication is implemented.
+        self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
+        # {
+        #     "draft_tokens": torch.tensor([198, 106287, 3837], dtype=torch.int64, device="cpu"),
+        #     # "draft_probs": torch.tensor([0.9396, 0.8859, 0.8858], dtype=torch.float32, device="cpu"),  # optional
+        # }
+        self.spec_cnt: int = 0
+        self.len_output_ids: int = 0
+        self.cur_drafts: Optional[List[int]] = []
+        self.draft_cnt: int = 0
+        self.accept_cnt: int = 0
 
     @property
     def seqlen(self) -> int:
@@ -1370,6 +1395,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For RemoteSpecWorker
     # If None, falls back to server_args.speculative_num_draft_tokens
     draft_num_tokens: Optional[int] = None
+    is_high_overhead: bool = False # False means not high overhead, True means high overhead
 
     @classmethod
     def init_new(

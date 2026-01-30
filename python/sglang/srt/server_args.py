@@ -514,7 +514,10 @@ class ServerArgs:
     enable_multi_layer_eagle: bool = False
 
     # Remote speculative decoding
-    remote_speculative_role: Literal["target", "draft"] = "target"
+    remote_speculative_role: Optional[Literal["target", "draft"]] = None
+    remote_speculative_max_batch_size: int = 32
+    remote_speculative_reject_interval: int = 5000
+    remote_speculative_no_draft_ratio: float = 0.5
 
     # Expert parallelism
     ep_size: int = 1
@@ -4898,6 +4901,24 @@ class ServerArgs:
             choices=["target", "draft"],
             help="The role of the remote speculative decoding. Can be one of 'target' (default) or 'draft'.",
             default=ServerArgs.remote_speculative_role,
+        )
+        parser.add_argument(
+            "--remote-speculative-max-batch-size",
+            type=int,
+            default=ServerArgs.remote_speculative_max_batch_size,
+            help="The maximum batch size for remote speculative decoding. If the batch size is larger than this value, the server will be considered as high overhead.",
+        )
+        parser.add_argument(
+            "--remote-speculative-reject-interval",
+            type=int,
+            default=ServerArgs.remote_speculative_reject_interval,
+            help="The interval to resend draft requests to draft server. If the interval is 1, the server will resend the draft requests every time.",
+        )
+        parser.add_argument(
+            "--remote-speculative-no-draft-ratio",
+            type=float,
+            default=ServerArgs.remote_speculative_no_draft_ratio,
+            help="The ratio of requests with no draft tokens to the total batch size. If the ratio is larger than this value, the server will only decode one token.",
         )
 
         # Expert parallelism

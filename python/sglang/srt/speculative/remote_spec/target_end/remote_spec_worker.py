@@ -117,11 +117,11 @@ class RemoteSpecWorker:
             )
         else:
             draft_num_tokens = getattr(batch, 'draft_num_tokens', self.speculative_num_draft_tokens)
-            #! just for testing dynamic draft_num_tokens ===================
-            import random
-            draft_num_tokens = random.randint(1, 4)
-            batch.draft_num_tokens = draft_num_tokens
-            # ==============================================================
+            # #! just for testing dynamic draft_num_tokens ===================
+            # import random
+            # draft_num_tokens = random.randint(1, 4)
+            # batch.draft_num_tokens = draft_num_tokens
+            # # ==============================================================
             spec_steps = draft_num_tokens - 1 if draft_num_tokens > 1 else 1
             
             logger.info(f"\033[36m[RemoteSpec] draft_num_tokens={draft_num_tokens}, "
