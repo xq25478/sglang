@@ -125,8 +125,8 @@ class RemoteSpecTargetSchedulerMixin:
 
             if is_matched:
                 req.draft_tokens_and_logits = {
-                    "draft_tokens": torch.tensor(cur_draft_tokens, dtype=torch.int64, device="cpu"),
-                    "draft_logprobs": torch.tensor(draft_logprobs, dtype=torch.float32, device="cpu"),
+                    "draft_tokens": torch.tensor(draft_tokens[1:], dtype=torch.int64, device="cpu"),
+                    "draft_logprobs": torch.tensor(draft_logprobs[1:], dtype=torch.float32, device="cpu"),
                 }
                 req.cur_drafts = draft_tokens[1:]
                 logger.info(f"\033[34m [Target][Verify] Request {rid=} all matched, "
