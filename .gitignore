@@ -272,3 +272,5 @@ sgl-kernel/csrc/**/*_musa/
 *.glb
 *.ply
 *.npz
+launch_main.py
+test_service.sh

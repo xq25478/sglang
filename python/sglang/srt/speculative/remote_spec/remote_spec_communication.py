@@ -66,7 +66,7 @@ class RemoteSpecConfig:
     """
     
     # Role configuration
-    role: str = "Target" # "Target" or "Draft"
+    role: str = "target" # "Target" or "Draft"
     
     # Network configuration
     zmq_addr: str = "127.0.0.1"
@@ -119,12 +119,12 @@ class RemoteSpecConfig:
     @property
     def is_target(self) -> bool:
         """Check if this is the Target server."""
-        return self.role == "Target"
+        return self.role == "target"
     
     @property
     def is_draft(self) -> bool:
         """Check if this is the Draft server."""
-        return self.role == "Draft"
+        return self.role == "draft"
     
     @property
     def supports_tree_draft(self) -> bool:
@@ -146,8 +146,8 @@ class RemoteSpecConfig:
         Raises:
             ValueError: If configuration is invalid
         """
-        if self.role not in ("Target", "Draft"):
-            raise ValueError(f"Invalid role: {self.role}. Must be 'Target' or 'Draft'")
+        if self.role not in ("target", "draft"):
+            raise ValueError(f"Invalid role: {self.role}. Must be 'target' or 'draft'")
         
         if self.num_draft_tokens < 1:
             raise ValueError(f"num_draft_tokens must be >= 1, got {self.num_draft_tokens}")
@@ -210,7 +210,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
         self.zmq_communicator = DealerEndpoint(  
                                 self.config.role, 
                                 self.zmq_endpoint, 
-                                bind = self.config.role == "Target")
+                                bind = self.config.role == "target")
         
     def get_endpoint(self) -> str:
         return self.zmq_endpoint
@@ -287,6 +287,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             else:
                 msgs = []
                 for _msg in _msgs:
+                    # logger.info(f"************** {_msg=}")
                     if isinstance(_msg, RemoteSpecRequestFromTargetToDraft):
                         msgs.append(RemoteSpecRequestFromTargetToDraft.from_dict(_msg))
                         
@@ -315,8 +316,8 @@ if __name__ == "__main__":
 
     PAYLOAD_TOKENS = 20_000
 
-    remote_config_t = RemoteSpecConfig(role="Target")
-    remote_config_d = RemoteSpecConfig(role="Draft")
+    remote_config_t = RemoteSpecConfig(role="target")
+    remote_config_d = RemoteSpecConfig(role="draft")
 
     zmq_comm_t = RemoteSpecZMQCommunicator(remote_config_t)
     zmq_comm_d = RemoteSpecZMQCommunicator(remote_config_d)

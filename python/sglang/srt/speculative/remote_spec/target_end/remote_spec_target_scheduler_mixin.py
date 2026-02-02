@@ -25,7 +25,7 @@ class RemoteSpecTargetSchedulerMixin:
         self.req_to_draft_token: Dict[str, Dict[int, Optional[Tuple[List[int], List[float]]]]] = defaultdict(dict)
         self.is_rejected: bool = False
         self.rejected_forward_ct: int = 0
-        # self.zmq_worker = MockRemoteSpecWorker()
+        # self.zmq_communicator = MockRemoteSpecWorker()
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -39,7 +39,7 @@ class RemoteSpecTargetSchedulerMixin:
 
             # Launch the current batch
             if batch:
-                if self._is_self_high_overhead(batch):
+                if self._is_self_high_overhead_target(batch):
                     batch.draft_num_tokens = 1
                 else:
                     draft_num_tokens = self._decide_speculative_num_draft_tokens(batch)
@@ -56,12 +56,12 @@ class RemoteSpecTargetSchedulerMixin:
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
             
-            if self.last_batch is not None and not self._is_self_high_overhead(self.last_batch):
+            if self.last_batch is not None and not self._is_self_high_overhead_target(self.last_batch):
                 self._recv_and_process_draft_responses()
 
 
     def _recv_and_process_draft_responses(self) -> None:
-        messages = self.zmq_worker.recv_all_objs()
+        messages = self.zmq_communicator.recv_all_objs()
         if messages:
             messages = [RemoteSpecResponseFromDraftToTarget.from_dict(msg) for msg in messages]
 
@@ -74,10 +74,10 @@ class RemoteSpecTargetSchedulerMixin:
                     continue
                 if msg.action == RemoteSpecAction.DRAFT:
                     self.req_to_draft_token[msg.request_id][msg.spec_cnt] = (msg.draft_token_ids, msg.draft_logprobs)
-                    # logger.info(f"\033[34m [Target][Recv] Received draft tokens from draft server {msg.request_id}, spec_cnt {msg.spec_cnt},"
-                    #             f"TD trans time: {msg.draft_receive_time - msg.target_send_time}," 
-                    #             f"D processing time: {msg.draft_send_time - msg.draft_receive_time},"
-                    #             f"DT trans time: {target_recv_time - msg.draft_send_time} \033[0m")
+                    logger.info(f"\033[34m [Target][Recv] Received draft tokens from draft server {msg.request_id}, spec_cnt {msg.spec_cnt},"
+                                f"TD trans time: {msg.draft_receive_time - msg.target_send_time}," 
+                                f"D processing time: {msg.draft_send_time - msg.draft_receive_time},"
+                                f"DT trans time: {target_recv_time - msg.draft_send_time} \033[0m")
             
         if self.last_batch is None:
             return
@@ -135,9 +135,9 @@ class RemoteSpecTargetSchedulerMixin:
             else:
                 req.draft_tokens_and_logits = self._get_default_draft_tokens_and_logprobs()
                 req.cur_drafts = []
-                # logger.info(
-                # f"\033[34m [Target][Verify] Request {rid} partial match, "
-                # f"spec_cnt={spec_cnt}, accepted={num_accepted}/{num_draft} \033[0m")
+                logger.info(
+                f"\033[34m [Target][Verify] Request {rid} partial match, "
+                f"spec_cnt={spec_cnt}, accepted={num_accepted}/{num_draft} \033[0m")
 
             try:
                 del self.req_to_draft_token[rid][spec_cnt]
@@ -160,7 +160,7 @@ class RemoteSpecTargetSchedulerMixin:
             num_draft_tokens=0,
         )
 
-        success = self.zmq_worker.send_obj(finished_or_aborted_req)
+        success = self.zmq_communicator.send_obj(finished_or_aborted_req)
         if not success:
             logger.error(f"\033[34m [Target][Notify] Failed to send finished or aborted request {req.rid} spec_cnt {req.spec_cnt} to draft server, action: {action} \033[0m")
 
@@ -182,7 +182,7 @@ class RemoteSpecTargetSchedulerMixin:
         return default_draft_tokens
 
 
-    def _is_self_high_overhead(self, batch: ScheduleBatch) -> bool:
+    def _is_self_high_overhead_target(self, batch: ScheduleBatch) -> bool:
         current_bsz = max(batch.batch_size(), self.running_batch.batch_size())
         if current_bsz > self.server_args.remote_speculative_max_batch_size:
             batch.is_high_overhead = True
@@ -223,7 +223,7 @@ class RemoteSpecTargetSchedulerMixin:
 
             draft_reqs_to_send.append(draft_req)
 
-        success = self.zmq_worker.send_objs(draft_reqs_to_send)
+        success = self.zmq_communicator.send_objs(draft_reqs_to_send)
         if not success:
             self.req_to_draft_token[req.rid][req.spec_cnt] = None
 

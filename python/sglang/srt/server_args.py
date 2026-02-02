@@ -4888,18 +4888,6 @@ class ServerArgs:
             default=ServerArgs.speculative_ngram_capacity,
             help="The cache capacity for ngram speculative decoding.",
         )
-        parser.add_argument(
-            "--remote-speculative-zmq-addr",
-            type=str,
-            help="ZMQ address for remote speculative decoding, e.g., '127.0.0.1'.",
-            default="127.0.0.1",
-        )
-        parser.add_argument(
-            "--remote-speculative-zmq-port",
-            type=str,
-            help="ZMQ port for remote speculative decoding, e.g., '30009'.",
-            default="30009",
-        )
         
         # Multi-layer Eagle speculative decoding
         parser.add_argument(
@@ -4933,6 +4921,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.remote_speculative_no_draft_ratio,
             help="The ratio of requests with no draft tokens to the total batch size. If the ratio is larger than this value, the server will only decode one token.",
+        )
+        parser.add_argument(
+            "--remote-speculative-zmq-addr",
+            type=str,
+            help="ZMQ address for remote speculative decoding, e.g., '127.0.0.1'.",
+            default="127.0.0.1",
+        )
+        parser.add_argument(
+            "--remote-speculative-zmq-port",
+            type=str,
+            help="ZMQ port for remote speculative decoding, e.g., '30009'.",
+            default="30009",
         )
 
         # Expert parallelism

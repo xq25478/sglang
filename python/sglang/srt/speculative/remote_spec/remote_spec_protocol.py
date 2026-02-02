@@ -99,9 +99,12 @@ class RemoteSpecRequestFromTargetToDraft:
         sp = d.get("sampling_params")
         if sp is not None:
             stop_strs = sp["stop_strs"]
+            stop_regex_strs = sp["stop_regex_strs"]
             sp.pop("stop_strs")
+            sp.pop("stop_regex_strs")
             sampling_params= SamplingParams(**sp)
             sampling_params.stop_strs = stop_strs
+            sampling_params.stop_regex_strs = stop_regex_strs
             d["sampling_params"] = sampling_params
             
         return cls(**d)

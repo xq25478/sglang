@@ -42,6 +42,7 @@ from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
     RemoteSpecRequestFromTargetToDraft as DraftRequest,
     RemoteSpecResponseFromDraftToTarget as DraftResponse,
     RemoteSpecAction,
+    SpecType
 )
 from sglang.srt.speculative.remote_spec.draft_end.remote_spec_state_mamager import (
     RemoteSpecDraftState,
@@ -174,7 +175,7 @@ class RemoteSpecDraftSchedulerMixin:
             self.last_batch = batch
 
             # Periodic cleanup
-            if self.draft_forward_cycle % 100 == 0:
+            if self.draft_forward_cycle % 1000000000000 == 0:
                 self._cleanup_stale_draft_states()
     
     # =========================================================================
@@ -187,14 +188,14 @@ class RemoteSpecDraftSchedulerMixin:
             return
         
         # Check for high load before processing requests
-        if self._is_self_high_overhead():
+        if self._is_self_high_overhead_draft():
             self._send_reject_message()
             return
         
         messages = self._recv_draft_requests()
         # BREAKPOINT: Uncomment to force debugger stop when messages received
-        if messages:
-            breakpoint()  # Force breakpoint when messages are received
+        # if messages:
+        #     breakpoint()  # Force breakpoint when messages are received
         
         draft_recv_time = time.perf_counter()
         
@@ -213,7 +214,11 @@ class RemoteSpecDraftSchedulerMixin:
     def _recv_draft_requests(self) -> List[DraftRequest]:
         """Receive draft requests from communication worker."""
         try:
-            return self.zmq_communicator.recv_all_objs()
+            msgs = []
+            _msgs = self.zmq_communicator.recv_all_objs()
+            for _msg in _msgs:
+                msgs.append(DraftRequest.from_dict(_msg))
+            return msgs
         except (ConnectionError, OSError) as e:
             logger.error(f"[Draft] Network error in _recv_draft_requests: {e}", exc_info=True)
             return []
@@ -684,6 +689,11 @@ class RemoteSpecDraftSchedulerMixin:
         req.draft_is_paused = False
         req.len_output_ids = 0
         
+        req.last_node = None
+        req.kv_committed_len = 0
+        req.kv_committed_freed = False
+        req.kv_overallocated_freed = False
+        
         state.location = "waiting_queue"
         req.logprob_start_len = len(req.origin_input_ids) - 1
         self._reset_req_logprob_fields(req)
@@ -748,7 +758,7 @@ class RemoteSpecDraftSchedulerMixin:
         
         req = Req(
             rid=req_id,
-            origin_input_text=draft_req.input_text or "",
+            origin_input_text="", # draft_req.input_text or "",
             origin_input_ids=input_ids,
             sampling_params=sampling_params,
             spec_cnt=draft_req.spec_cnt,
@@ -1008,7 +1018,7 @@ class RemoteSpecDraftSchedulerMixin:
     # Placeholder stubs for compatibility
     # =========================================================================
 
-    def _is_self_high_overhead(self) -> bool:
+    def _is_self_high_overhead_draft(self) -> bool:
         """Check if server is under high load based on batch size."""
         if not hasattr(self, 'running_batch') or self.running_batch is None:
             return False

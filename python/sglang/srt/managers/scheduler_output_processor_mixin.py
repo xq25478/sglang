@@ -539,7 +539,7 @@ class SchedulerOutputProcessorMixin:
                 req.grammar.finished = req.finished()
 
             # V3: 检查draft请求是否需要pause
-            if hasattr(self, '_check_and_pause_draft_req'):
+            if self.server_args.remote_speculative_role == "draft" and hasattr(self, '_check_and_pause_draft_req'):
                 # logger.info(f"\033[35m [Draft][Check and Pause] {req.rid} {len(req.origin_input_ids)=}, {len(req.output_ids)=}, {req.stable_boundary=}, {req.output_ids=}, {next_token_id=} \033[0m")
                 if self._check_and_pause_draft_req(req):
                     # 需要pause，添加到paused_reqs
