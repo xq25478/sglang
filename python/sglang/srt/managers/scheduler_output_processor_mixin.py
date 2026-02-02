@@ -978,6 +978,15 @@ class SchedulerOutputProcessorMixin:
             if req is skip_req:
                 continue
 
+            # Skip draft spec requests - they should not be sent to detokenizer
+            # Draft requests are only for generating candidate tokens for target model
+            if hasattr(req, 'spec_type') and req.spec_type == SpecType.DRAFT_REQUEST:
+                continue
+
+            # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
+            if self.model_config.is_multimodal_gen and req.to_finish:
+                continue
+
             if req.finished():
                 if req.finished_output:
                     # With the overlap schedule, a request will try to output twice and hit this line twice

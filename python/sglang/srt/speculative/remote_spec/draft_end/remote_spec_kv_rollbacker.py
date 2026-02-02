@@ -225,9 +225,21 @@ class RemoteSpecKVRollbacker:
             # Free the indices back to the pool
             self.token_to_kv_pool_allocator.free(kv_indices)
             
-            logger.debug(
+            # CRITICAL: Update kv_committed_len and kv_allocated_len after rollback
+            # This fixes the memory leak where kv_committed_len keeps accumulating
+            # through generate-rollback cycles without being decremented
+            old_committed = req.kv_committed_len
+            old_allocated = req.kv_allocated_len
+            
+            # After rollback to fork_point, the new KV length should be fork_point
+            req.kv_committed_len = fork_point
+            req.kv_allocated_len = fork_point
+            
+            logger.info(
                 f"[RemoteSpecKVRollbacker] Local rollback for {req.rid}: "
                 f"freed [{fork_point}, {current_kv_len}), "
+                f"kv_committed: {old_committed} -> {req.kv_committed_len}, "
+                f"kv_allocated: {old_allocated} -> {req.kv_allocated_len}, "
                 f"prefix_len={prefix_len}"
             )
             return True

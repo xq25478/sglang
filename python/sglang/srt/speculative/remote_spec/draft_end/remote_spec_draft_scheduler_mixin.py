@@ -175,7 +175,7 @@ class RemoteSpecDraftSchedulerMixin:
             self.last_batch = batch
 
             # Periodic cleanup
-            if self.draft_forward_cycle % 1000000000000 == 0:
+            if self.draft_forward_cycle % 100 == 0:
                 self._cleanup_stale_draft_states()
     
     # =========================================================================
