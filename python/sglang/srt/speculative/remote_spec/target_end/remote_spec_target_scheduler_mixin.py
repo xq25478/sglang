@@ -160,9 +160,7 @@ class RemoteSpecTargetSchedulerMixin:
             num_draft_tokens=0,
         )
 
-        success = self.zmq_communicator.send_obj(finished_or_aborted_req)
-        if not success:
-            logger.error(f"\033[34m [Target][Notify] Failed to send finished or aborted request {req.rid} spec_cnt {req.spec_cnt} to draft server, action: {action} \033[0m")
+        self.zmq_communicator.send_obj(finished_or_aborted_req)
 
         try:
             if req.rid in self.req_to_draft_token:
@@ -223,9 +221,7 @@ class RemoteSpecTargetSchedulerMixin:
 
             draft_reqs_to_send.append(draft_req)
 
-        success = self.zmq_communicator.send_objs(draft_reqs_to_send)
-        if not success:
-            self.req_to_draft_token[req.rid][req.spec_cnt] = None
+        self.zmq_communicator.send_objs(draft_reqs_to_send)
 
     
     def process_reject_action(self) -> None:

@@ -477,6 +477,7 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.set_completion_time()
                 if self.spec_algorithm.is_remote() and self.server_args.remote_speculative_role == "target":
                     self.notify_draft_request_finished_or_aborted(req, RemoteSpecAction.FINISH)
+                    logger.info(f"\033[34m ########### accept cnt: {req.accept_cnt}, draft cnt: {req.draft_cnt}, accept rate: {req.accept_cnt / req.draft_cnt if req.draft_cnt > 0 else 0} \033[0m")
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -977,11 +978,12 @@ class SchedulerOutputProcessorMixin:
         for req in reqs:
             if req is skip_req:
                 continue
-
+            
             # Skip draft spec requests - they should not be sent to detokenizer
             # Draft requests are only for generating candidate tokens for target model
             if hasattr(req, 'spec_type') and req.spec_type == SpecType.DRAFT_REQUEST:
                 continue
+
 
             # Multimodal partial stream chunks break the detokenizer, so drop aborted requests here.
             if self.model_config.is_multimodal_gen and req.to_finish:
