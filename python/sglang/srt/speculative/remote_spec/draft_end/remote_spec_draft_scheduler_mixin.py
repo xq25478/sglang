@@ -952,7 +952,7 @@ class RemoteSpecDraftSchedulerMixin:
         
         new_lens = tensor([seq_len(r) for r in reqs], torch.int64)
         batch.seq_lens = torch.cat([batch.seq_lens, new_lens]) if batch.seq_lens is not None else new_lens
-        batch.seq_lens_cpu = torch.tensor(batch.seq_lens, dtype=torch.int64)
+        batch.seq_lens_cpu = torch.tensor(batch.seq_lens, dtype=torch.int64).cpu()
         
         new_orig = tensor([seq_len(r) for r in reqs], torch.int32)
         batch.orig_seq_lens = torch.cat([batch.orig_seq_lens, new_orig]) if batch.orig_seq_lens is not None else new_orig
@@ -1002,7 +1002,7 @@ class RemoteSpecDraftSchedulerMixin:
         
         batch.req_pool_indices = tensor([r.req_pool_idx for r in reqs], torch.int64)
         batch.seq_lens = tensor([seq_len(r) for r in reqs], torch.int64)
-        batch.seq_lens_cpu = torch.tensor(batch.seq_lens, dtype=torch.int64)
+        batch.seq_lens_cpu = torch.tensor(batch.seq_lens, dtype=torch.int64).cpu()
         batch.orig_seq_lens = tensor([seq_len(r) for r in reqs], torch.int32)
         batch.out_cache_loc = None
         batch.seq_lens_sum = batch.seq_lens.sum().item()
@@ -1032,19 +1032,14 @@ class RemoteSpecDraftSchedulerMixin:
 
     def _send_reject_message(self):
         """Send rejection message to Target."""
-        from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
-            RemoteSpecResponseFromDraftToTarget,
-            RemoteSpecAction,
-        )
-        
         # Send a reject message to indicate high load
-        reject_msg = RemoteSpecResponseFromDraftToTarget(
+        reject_msg = DraftResponse(
             request_id="system",
             spec_cnt=0,
             action=RemoteSpecAction.REJECT,
-            spec_type=None,
-            draft_tokens=[],
-            draft_logits=[],
+            spec_type=SpecType.DRAFT_RESPONSE,
+            draft_token_ids=[],
+            draft_logprobs=[],
             target_send_time=None,
             draft_receive_time=None,
             draft_send_time=time.perf_counter(),

@@ -71,13 +71,14 @@ class RemoteSpecTargetSchedulerMixin:
                 assert isinstance(msg, RemoteSpecResponseFromDraftToTarget), "Invalid message type"
                 if msg.action == RemoteSpecAction.REJECT:
                     self.process_reject_action()
+                    logger.info(f"\033[35m [Target][Recv] Received reject action from draft server {msg.request_id} \033[0m")
                     continue
                 if msg.action == RemoteSpecAction.DRAFT:
                     self.req_to_draft_token[msg.request_id][msg.spec_cnt] = (msg.draft_token_ids, msg.draft_logprobs)
-                    logger.info(f"\033[34m [Target][Recv] Received draft tokens from draft server {msg.request_id}, spec_cnt {msg.spec_cnt},"
-                                f"TD trans time: {msg.draft_receive_time - msg.target_send_time}," 
-                                f"D processing time: {msg.draft_send_time - msg.draft_receive_time},"
-                                f"DT trans time: {target_recv_time - msg.draft_send_time} \033[0m")
+                    # logger.info(f"\033[34m [Target][Recv] Received draft tokens from draft server {msg.request_id}, spec_cnt {msg.spec_cnt},"
+                    #             f"TD trans time: {msg.draft_receive_time - msg.target_send_time}," 
+                    #             f"D processing time: {msg.draft_send_time - msg.draft_receive_time},"
+                    #             f"DT trans time: {target_recv_time - msg.draft_send_time} \033[0m")
             
         if self.last_batch is None:
             return
@@ -135,9 +136,9 @@ class RemoteSpecTargetSchedulerMixin:
             else:
                 req.draft_tokens_and_logits = self._get_default_draft_tokens_and_logprobs()
                 req.cur_drafts = []
-                logger.info(
-                f"\033[34m [Target][Verify] Request {rid} partial match, "
-                f"spec_cnt={spec_cnt}, accepted={num_accepted}/{num_draft} \033[0m")
+                # logger.info(
+                # f"\033[34m [Target][Verify] Request {rid} partial match, "
+                # f"spec_cnt={spec_cnt}, accepted={num_accepted}/{num_draft} \033[0m")
 
             try:
                 del self.req_to_draft_token[rid][spec_cnt]
@@ -192,7 +193,7 @@ class RemoteSpecTargetSchedulerMixin:
         return self.server_args.speculative_num_draft_tokens
 
     def send_batch_draft_requests(self, batch: ScheduleBatch, speculative_num_draft_tokens: int) -> None:
-        if self.is_rejected and (self.rejected_forward_ct + 1) % self.server_args.remote_speculative_reject_interval != 0:
+        if self.is_rejected and self.server_args.remote_speculative_reject_interval > 0 and ((self.forward_ct - self.rejected_forward_ct + 1) % self.server_args.remote_speculative_reject_interval != 0):
             return
 
         self.is_rejected = False
@@ -233,15 +234,21 @@ class RemoteSpecTargetSchedulerMixin:
         if batch.forward_mode == ForwardMode.EXTEND:
             return self.server_args.speculative_num_draft_tokens
         
+        if self.is_rejected:
+            logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to 1 due to reject. \033[0m")
+            return 1
+        
         no_draft_reqs = 0
         bs = batch.batch_size()
         for req in batch.reqs:
             if getattr(req, "rid", "").startswith("HEALTH_CHECK"):
                 continue
-            if req.cur_drafts is None:
+            if not req.cur_drafts:
                 no_draft_reqs += 1
         if no_draft_reqs / bs >= self.server_args.remote_speculative_no_draft_ratio:
+            logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to 1 due to no draft ratio too high: {no_draft_reqs/bs} >= {self.server_args.remote_speculative_no_draft_ratio}. \033[0m")
             return 1
+        logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to {self.server_args.speculative_num_draft_tokens}. \033[0m")
         return self.server_args.speculative_num_draft_tokens
 
 
