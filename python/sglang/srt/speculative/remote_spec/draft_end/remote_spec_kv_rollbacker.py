@@ -268,6 +268,9 @@ class RemoteSpecKVRollbacker:
         if req.req_pool_idx is None:
             return
         
+        kv_len = req.kv_committed_len
+        req.fill_ids = (req.origin_input_ids + req.output_ids)[:kv_len]
+        
         self.tree_cache.cache_finished_req(req)
         req.req_pool_idx = None
         
@@ -287,6 +290,9 @@ class RemoteSpecKVRollbacker:
         """
         if req.req_pool_idx is None:
             return
+        
+        kv_len = req.kv_committed_len
+        req.fill_ids = (req.origin_input_ids + req.output_ids)[:kv_len]
         
         self.tree_cache.cache_finished_req(req)
         req.req_pool_idx = None

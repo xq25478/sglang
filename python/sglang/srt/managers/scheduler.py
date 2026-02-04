@@ -1382,10 +1382,10 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                start_time = time.perf_counter()
+                # start_time = time.perf_counter()
                 result = self.run_batch(batch)
-                end_time = time.perf_counter()
-                logger.info(f"Scheduler.run_batch took {end_time - start_time} seconds")
+                # end_time = time.perf_counter()
+                # logger.info(f"Scheduler.run_batch took {end_time - start_time} seconds")
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states.
