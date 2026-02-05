@@ -1,4 +1,4 @@
-from sglang.srt.utils import DynamicGradMode
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 from typing import Optional, Union, Tuple
 from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors, ForwardMode
@@ -61,17 +61,39 @@ class RemoteSpecTargetSchedulerMixin:
 
 
     def _recv_and_process_draft_responses(self) -> None:
-        messages = self.zmq_communicator.recv_all_objs()
+        # TP适配：仅rank 0接收ZMQ消息
+        if self.tp_size == 1 or self.tp_rank == 0:
+            if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
+                messages = self.zmq_communicator.recv_all_objs()
+            else:
+                messages = []
+            if messages:
+                messages = [RemoteSpecResponseFromDraftToTarget.from_dict(msg) for msg in messages]
+        else:
+            messages = None
+        
+        # TP适配：broadcast消息到所有rank（pickle可直接序列化dataclass）
+        if self.tp_size > 1:
+            start_time = time.perf_counter()
+            messages = broadcast_pyobj(
+                messages if messages else [],  # 空列表代替None
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+            end_time = time.perf_counter()
+            if self.tp_rank == 0:
+                logger.info(f"\033[35m [Target][Recv] Broadcast messages time: {(end_time - start_time)*1e6:.1f}us \033[0m")
+
+        target_recv_time = time.perf_counter()
+
         if messages:
-            messages = [RemoteSpecResponseFromDraftToTarget.from_dict(msg) for msg in messages]
-
-            target_recv_time = time.perf_counter()
-
             for msg in messages:
                 assert isinstance(msg, RemoteSpecResponseFromDraftToTarget), "Invalid message type"
                 if msg.action == RemoteSpecAction.REJECT:
                     self.process_reject_action()
-                    logger.info(f"\033[35m [Target][Recv] Received reject action from draft server {msg.request_id} \033[0m")
+                    if self.tp_rank == 0:
+                        logger.info(f"\033[35m [Target][Recv] Received reject action from draft server {msg.request_id} \033[0m")
                     continue
                 if msg.action == RemoteSpecAction.DRAFT:
                     self.req_to_draft_token[msg.request_id][msg.spec_cnt] = (msg.draft_token_ids, msg.draft_logprobs)
@@ -110,7 +132,8 @@ class RemoteSpecTargetSchedulerMixin:
         if not self.req_to_draft_token[rid][spec_cnt]:
             req.cur_drafts = []
             req.draft_tokens_and_logits = self._get_default_draft_tokens_and_logprobs()
-            logger.info(f"\033[34m [Target] Still waiting for draft tokens from draft server {rid=} {spec_cnt=}, or send failed \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[34m [Target] Still waiting for draft tokens from draft server {rid=} {spec_cnt=}, or send failed \033[0m")
             return
         else:
             draft_tokens, draft_logprobs = self.req_to_draft_token[rid][spec_cnt]
@@ -130,8 +153,9 @@ class RemoteSpecTargetSchedulerMixin:
                     "draft_logprobs": torch.tensor(draft_logprobs[1:], dtype=torch.float32, device="cpu"),
                 }
                 req.cur_drafts = draft_tokens[1:]
-                logger.info(f"\033[34m [Target][Verify] Request {rid=} all matched, "
-                f"spec_cnt={spec_cnt}, accepted={num_accepted}/{num_draft} \033[0m")
+                if self.tp_rank == 0:
+                    logger.info(f"\033[34m [Target][Verify] Request {rid=} all matched, "
+                    f"spec_cnt={spec_cnt}, accepted={num_accepted}/{num_draft} \033[0m")
             
             else:
                 req.draft_tokens_and_logits = self._get_default_draft_tokens_and_logprobs()
@@ -143,7 +167,8 @@ class RemoteSpecTargetSchedulerMixin:
             try:
                 del self.req_to_draft_token[rid][spec_cnt]
             except Exception as e:
-                logger.error(f"\033[34m [Target][Verify] Failed to delete req_to_draft_token for request {rid} spec_cnt {spec_cnt}: {e} \033[0m")
+                if self.tp_rank == 0:
+                    logger.error(f"\033[34m [Target][Verify] Failed to delete req_to_draft_token for request {rid} spec_cnt {spec_cnt}: {e} \033[0m")
 
 
     def notify_draft_request_finished_or_aborted(self, req: Req, action: RemoteSpecAction) -> None:
@@ -161,13 +186,17 @@ class RemoteSpecTargetSchedulerMixin:
             num_draft_tokens=0,
         )
 
-        self.zmq_communicator.send_obj(finished_or_aborted_req)
+        # TP适配：仅rank 0发送ZMQ消息
+        if self.tp_size == 1 or self.tp_rank == 0:
+            if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
+                self.zmq_communicator.send_obj(finished_or_aborted_req)
 
         try:
             if req.rid in self.req_to_draft_token:
                 del self.req_to_draft_token[req.rid]
         except Exception as e:
-            logger.error(f"\033[34m [Target][Notify] Failed to delete req_to_draft_token for request {req.rid} spec_cnt {req.spec_cnt}: {e} \033[0m")
+            if self.tp_rank == 0:
+                logger.error(f"\033[34m [Target][Notify] Failed to delete req_to_draft_token for request {req.rid} spec_cnt {req.spec_cnt}: {e} \033[0m")
 
     def _get_default_draft_tokens_and_logprobs(self) -> Dict[str, torch.Tensor]:
         if self.tokenizer:
@@ -222,7 +251,10 @@ class RemoteSpecTargetSchedulerMixin:
 
             draft_reqs_to_send.append(draft_req)
 
-        self.zmq_communicator.send_objs(draft_reqs_to_send)
+        # TP适配：仅rank 0发送ZMQ消息
+        if self.tp_size == 1 or self.tp_rank == 0:
+            if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
+                self.zmq_communicator.send_objs(draft_reqs_to_send)
 
     
     def process_reject_action(self) -> None:
@@ -235,7 +267,8 @@ class RemoteSpecTargetSchedulerMixin:
             return self.server_args.speculative_num_draft_tokens
         
         if self.is_rejected:
-            logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to 1 due to reject. \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to 1 due to reject. \033[0m")
             return 1
         
         no_draft_reqs = 0
@@ -246,9 +279,11 @@ class RemoteSpecTargetSchedulerMixin:
             if not req.cur_drafts:
                 no_draft_reqs += 1
         if no_draft_reqs / bs >= self.server_args.remote_speculative_no_draft_ratio:
-            logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to 1 due to no draft ratio too high: {no_draft_reqs/bs} >= {self.server_args.remote_speculative_no_draft_ratio}. \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to 1 due to no draft ratio too high: {no_draft_reqs/bs} >= {self.server_args.remote_speculative_no_draft_ratio}. \033[0m")
             return 1
-        logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to {self.server_args.speculative_num_draft_tokens}. \033[0m")
+        if self.tp_rank == 0:
+            logger.info(f"\033[35m [Target][Num draft tokens] speculative_num_draft_tokens adjust to {self.server_args.speculative_num_draft_tokens}. \033[0m")
         return self.server_args.speculative_num_draft_tokens
 
 

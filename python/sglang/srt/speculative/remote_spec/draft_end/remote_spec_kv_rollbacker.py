@@ -35,6 +35,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.speculative.remote_spec.remote_spec_protocol import SpecType
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -65,6 +67,7 @@ class RemoteSpecKVRollbacker:
         page_size: int = 1,
         promote_interval: int = 50,  # Unused, kept for API compatibility
         num_draft_tokens: int = 5,   # Unused, kept for API compatibility
+        tp_rank: int = 0,  # TP适配：用于控制日志输出
     ) -> None:
         """
         Initialize the KV manager.
@@ -76,12 +79,14 @@ class RemoteSpecKVRollbacker:
             page_size: KV cache page size
             promote_interval: Unused (kept for compatibility)
             num_draft_tokens: Unused (kept for compatibility)
+            tp_rank: TP rank for controlling log output (default: 0)
         """
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator  # Alias for compatibility
         self.req_to_token_pool = req_to_token_pool
         self.tree_cache = tree_cache
         self.page_size = page_size
+        self.tp_rank = tp_rank
     
     def get_prefix_len(self, req: "Req") -> int:
         """
@@ -183,10 +188,11 @@ class RemoteSpecKVRollbacker:
         """
         # Safety check: local_rollback is not safe when page_size > 1
         if self.page_size > 1:
-            logger.warning(
-                f"[RemoteSpecKVRollbacker] local_rollback called with page_size={self.page_size}, "
-                "this is not safe! Use re-prefill instead."
-            )
+            if self.tp_rank == 0:
+                logger.warning(
+                    f"[RemoteSpecKVRollbacker] local_rollback called with page_size={self.page_size}, "
+                    "this is not safe! Use re-prefill instead."
+                )
             return False
         
         if req.req_pool_idx is None:
@@ -199,10 +205,11 @@ class RemoteSpecKVRollbacker:
         # Safety check: ensure we're not freeing RadixCache indices
         prefix_len = self.get_prefix_len(req)
         if fork_point < prefix_len:
-            logger.error(
-                f"[RemoteSpecKVRollbacker] local_rollback called with fork_point={fork_point} < "
-                f"prefix_len={prefix_len}, this would free RadixCache indices! Aborting."
-            )
+            if self.tp_rank == 0:
+                logger.error(
+                    f"[RemoteSpecKVRollbacker] local_rollback called with fork_point={fork_point} < "
+                    f"prefix_len={prefix_len}, this would free RadixCache indices! Aborting."
+                )
             return False
         
         try:
@@ -212,10 +219,11 @@ class RemoteSpecKVRollbacker:
             end = min(current_kv_len, max_len)
             
             if start >= end:
-                logger.warning(
-                    f"[RemoteSpecKVRollbacker] Invalid rollback range for {req.rid}: "
-                    f"start={start}, end={end}, max_len={max_len}"
-                )
+                if self.tp_rank == 0:
+                    logger.warning(
+                        f"[RemoteSpecKVRollbacker] Invalid rollback range for {req.rid}: "
+                        f"start={start}, end={end}, max_len={max_len}"
+                    )
                 return False
             
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -235,18 +243,20 @@ class RemoteSpecKVRollbacker:
             req.kv_committed_len = fork_point
             req.kv_allocated_len = fork_point
             
-            logger.info(
-                f"[RemoteSpecKVRollbacker] Local rollback for {req.rid}: "
-                f"freed [{fork_point}, {current_kv_len}), "
-                f"kv_committed: {old_committed} -> {req.kv_committed_len}, "
-                f"kv_allocated: {old_allocated} -> {req.kv_allocated_len}, "
-                f"prefix_len={prefix_len}"
-            )
+            if self.tp_rank == 0:
+                logger.info(
+                    f"[RemoteSpecKVRollbacker] Local rollback for {req.rid}: "
+                    f"freed [{fork_point}, {current_kv_len}), "
+                    f"kv_committed: {old_committed} -> {req.kv_committed_len}, "
+                    f"kv_allocated: {old_allocated} -> {req.kv_allocated_len}, "
+                    f"prefix_len={prefix_len}"
+                )
             return True
         except Exception as e:
-            logger.warning(
-                f"[RemoteSpecKVRollbacker] Failed to local_rollback for {req.rid}: {e}"
-            )
+            if self.tp_rank == 0:
+                logger.warning(
+                    f"[RemoteSpecKVRollbacker] Failed to local_rollback for {req.rid}: {e}"
+                )
             return False
     
     def release_all_kv_for_finished_req(self, req: "Req") -> None:
@@ -274,9 +284,10 @@ class RemoteSpecKVRollbacker:
         self.tree_cache.cache_finished_req(req)
         req.req_pool_idx = None
         
-        logger.debug(
-            f"[RemoteSpecKVRollbacker] Released all KV for finished request {req.rid}"
-        )
+        if self.tp_rank == 0:
+            logger.debug(
+                f"[RemoteSpecKVRollbacker] Released all KV for finished request {req.rid}"
+            )
     
     def release_all_kv_for_reprefill_req(self, req: "Req") -> None:
         """
@@ -297,9 +308,10 @@ class RemoteSpecKVRollbacker:
         self.tree_cache.cache_finished_req(req)
         req.req_pool_idx = None
         
-        logger.debug(
-            f"[RemoteSpecKVRollbacker] Released all KV for re-prefill {req.rid}"
-        )
+        if self.tp_rank == 0:
+            logger.debug(
+                f"[RemoteSpecKVRollbacker] Released all KV for re-prefill {req.rid}"
+            )
     
     # =========================================================================
     # Legacy and compatibility API methods

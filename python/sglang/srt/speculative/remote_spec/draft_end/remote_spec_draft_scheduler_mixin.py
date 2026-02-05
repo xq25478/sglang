@@ -51,7 +51,7 @@ from sglang.srt.speculative.remote_spec.draft_end.remote_spec_state_mamager impo
 from sglang.srt.speculative.remote_spec.draft_end.remote_spec_kv_rollbacker import (
     RemoteSpecKVRollbacker,
 )
-from sglang.srt.utils import DynamicGradMode
+from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 
 if TYPE_CHECKING:
     pass
@@ -96,6 +96,7 @@ class RemoteSpecDraftSchedulerMixin:
             req_to_token_pool=self.req_to_token_pool,
             tree_cache=self.tree_cache,
             page_size=getattr(self.server_args, 'page_size', 1),
+            tp_rank=self.tp_rank,  # TP适配：传入tp_rank用于控制日志输出
         )
         
         self.draft_forward_cycle = 0
@@ -184,22 +185,44 @@ class RemoteSpecDraftSchedulerMixin:
     
     def recv_and_process_draft_requests(self):
         """Process draft requests from Target server."""
-        if not hasattr(self, 'zmq_communicator') or self.zmq_communicator is None:
-            return
+        # TP适配：检查zmq_communicator（仅rank 0有ZMQ连接）
+        if self.tp_size == 1:
+            if not hasattr(self, 'zmq_communicator') or self.zmq_communicator is None:
+                return
         
-        # Check for high load before processing requests
+        # Check for high load before processing requests (所有rank执行相同判断)
         if self._is_self_high_overhead_draft():
-            self._send_reject_message()
+            # TP适配：仅rank 0发送reject消息
+            if self.tp_size == 1 or self.tp_rank == 0:
+                self._send_reject_message()
             return
         
-        messages = self._recv_draft_requests()
-        # BREAKPOINT: Uncomment to force debugger stop when messages received
-        # if messages:
-        #     breakpoint()  # Force breakpoint when messages are received
+        # TP适配：仅rank 0接收ZMQ消息
+        if self.tp_size == 1 or self.tp_rank == 0:
+            messages = self._recv_draft_requests()
+        else:
+            messages = None
+        
+        # TP适配：broadcast消息到所有rank
+        if self.tp_size > 1:
+            messages = broadcast_pyobj(
+                messages if messages else [],
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        
+        # 如果没有消息，提前返回
+        if not messages:
+            return
         
         draft_recv_time = time.perf_counter()
         
         control_msgs, latest_msgs = self.deduplicate_draft_requests(messages, draft_recv_time)
+        
+        # 如果没有有效消息，提前返回
+        if not control_msgs and not latest_msgs:
+            return
         
         self.token_to_kv_pool_allocator.free_group_begin()
         
@@ -215,15 +238,20 @@ class RemoteSpecDraftSchedulerMixin:
         """Receive draft requests from communication worker."""
         try:
             msgs = []
-            _msgs = self.zmq_communicator.recv_all_objs()
+            if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
+                _msgs = self.zmq_communicator.recv_all_objs()
+            else:
+                _msgs = []
             for _msg in _msgs:
                 msgs.append(DraftRequest.from_dict(_msg))
             return msgs
         except (ConnectionError, OSError) as e:
-            logger.error(f"[Draft] Network error in _recv_draft_requests: {e}", exc_info=True)
+            if self.tp_rank == 0:
+                logger.error(f"[Draft] Network error in _recv_draft_requests: {e}", exc_info=True)
             return []
         except Exception as e:
-            logger.error(f"[Draft] Unexpected error in _recv_draft_requests: {e}", exc_info=True)
+            if self.tp_rank == 0:
+                logger.error(f"[Draft] Unexpected error in _recv_draft_requests: {e}", exc_info=True)
             return []
     
     def deduplicate_draft_requests(
@@ -257,7 +285,7 @@ class RemoteSpecDraftSchedulerMixin:
         
         # Log deduplication
         total, kept = len(messages), len(latest_msgs) + len(control_msgs)
-        if total > kept:
+        if total > kept and self.tp_rank == 0:
             logger.info(f"\033[36m [Draft][Recv] Deduplicated: {total} -> {kept} \033[0m")
         
         return control_msgs, latest_msgs
@@ -269,7 +297,8 @@ class RemoteSpecDraftSchedulerMixin:
             action = draft_req.action
             
             if action in [RemoteSpecAction.FINISH, RemoteSpecAction.ABORT]:
-                logger.info(f"[Draft] Received {action} for {req_id}")
+                if self.tp_rank == 0:
+                    logger.info(f"[Draft] Received {action} for {req_id}")
                 self._finish_draft_request(req_id)
     
     def _process_draft_requests(self, latest_msgs: Dict[str, DraftRequest]) -> List[Req]:
@@ -296,7 +325,8 @@ class RemoteSpecDraftSchedulerMixin:
                 req = state.req_object
                 
                 if req is None:
-                    logger.warning(f"[Draft] {req_id} has None req_object")
+                    if self.tp_rank == 0:
+                        logger.warning(f"[Draft] {req_id} has None req_object")
                     self._finish_draft_request(req_id)
                     continue
                 
@@ -331,7 +361,8 @@ class RemoteSpecDraftSchedulerMixin:
                     )
                 
             except Exception as e:
-                logger.error(f"\033[31m [Draft] Error processing {req_id}: {e} \033[0m")
+                if self.tp_rank == 0:
+                    logger.error(f"\033[31m [Draft] Error processing {req_id}: {e} \033[0m")
                 try:
                     self._finish_draft_request(req_id)
                 except:
@@ -365,10 +396,11 @@ class RemoteSpecDraftSchedulerMixin:
         reqs_to_merge: List[Req],
     ) -> None:
         """Handle case where tokens are identical."""
-        logger.info(
-            f"\033[34m [Draft][No Change] {req.rid}, "
-            f"spec_cnt={draft_req.spec_cnt}, location={state.location} \033[0m"
-        )
+        if self.tp_rank == 0:
+            logger.info(
+                f"\033[34m [Draft][No Change] {req.rid}, "
+                f"spec_cnt={draft_req.spec_cnt}, location={state.location} \033[0m"
+            )
         
         self._update_req_state(req, draft_req, state)
         self._resume_or_update(req, state, reqs_to_merge)
@@ -422,7 +454,8 @@ class RemoteSpecDraftSchedulerMixin:
         """Handle Case 1: Equal length sequences."""
         if fork_point == current_len - 1:
             # Case 1.1: Only last token differs
-            logger.info(f"\033[36m [Case 1.1] {req.rid}, replacing last token \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[36m [Case 1.1] {req.rid}, replacing last token \033[0m")
             self._update_tokens(req, fork_point, target_fill_ids[fork_point:])
             self._update_req_state(req, draft_req, state)
             self._resume_or_update(req, state, reqs_to_merge)
@@ -450,7 +483,8 @@ class RemoteSpecDraftSchedulerMixin:
         
         if fork_point == target_len:
             # Case 2.1: Target is prefix of Draft
-            logger.info(f"\033[36m [Case 2.1] {req.rid}, Draft ahead, continuing \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[36m [Case 2.1] {req.rid}, Draft ahead, continuing \033[0m")
             self._update_req_state(req, draft_req, state)
             self._resume_or_update(req, state, reqs_to_merge)
         else:
@@ -481,10 +515,12 @@ class RemoteSpecDraftSchedulerMixin:
         """
         if fork_point == current_len:
             # Case 3.1: Draft is prefix of Target - needs extend
-            logger.info(f"\033[36m [Case 3.1] {req.rid}, re-prefill for extend \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[36m [Case 3.1] {req.rid}, re-prefill for extend \033[0m")
         else:
             # Case 3.2: Tokens differ - needs extend
-            logger.info(f"\033[36m [Case 3.2] {req.rid}, re-prefill for extend \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[36m [Case 3.2] {req.rid}, re-prefill for extend \033[0m")
         
         # All Case 3 scenarios need extend, use re-prefill
         self._prepare_for_reprefill(req, target_fill_ids, draft_req, state)
@@ -513,7 +549,8 @@ class RemoteSpecDraftSchedulerMixin:
         
         if can_decode_after_rollback and self.draft_kv_manager.can_local_rollback(req, fork_point):
             # Local rollback + decode
-            logger.info(f"\033[35m [Case {case_name}] {req.rid}, local rollback + decode \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[35m [Case {case_name}] {req.rid}, local rollback + decode \033[0m")
             if needs_kv_release:
                 self.draft_kv_manager.local_rollback(req, fork_point, current_kv_len)
             self._update_tokens(req, fork_point, target_fill_ids[fork_point:])
@@ -521,7 +558,8 @@ class RemoteSpecDraftSchedulerMixin:
             self._resume_or_update(req, state, reqs_to_merge)
         else:
             # Need extend or divergence in RadixCache region - use re-prefill
-            logger.info(f"\033[36m [Case {case_name}] {req.rid}, re-prefill \033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[36m [Case {case_name}] {req.rid}, re-prefill \033[0m")
             self._prepare_for_reprefill(req, target_fill_ids, draft_req, state)
     
     # =========================================================================
@@ -603,7 +641,8 @@ class RemoteSpecDraftSchedulerMixin:
         
         if req.req_pool_idx is None:
             # Edge case: lost KV while paused (shouldn't happen normally)
-            logger.warning(f"[Draft][Resume] {req.rid} has no KV, moving to waiting_queue")
+            if self.tp_rank == 0:
+                logger.warning(f"[Draft][Resume] {req.rid} has no KV, moving to waiting_queue")
             state.location = "waiting_queue"
             if req not in self.waiting_queue:
                 self._add_request_to_queue(req)
@@ -614,7 +653,8 @@ class RemoteSpecDraftSchedulerMixin:
             reqs_to_merge.append(req)
         
         state.location = "running_batch"
-        logger.debug(f"[Draft][Resume] {req.rid} resuming to running_batch")
+        if self.tp_rank == 0:
+            logger.debug(f"[Draft][Resume] {req.rid} resuming to running_batch")
     
     def _update_in_running_batch(
         self,
@@ -631,7 +671,8 @@ class RemoteSpecDraftSchedulerMixin:
         """
         if req.req_pool_idx is None:
             # Edge case: req in batch but lost KV (shouldn't happen)
-            logger.warning(f"[Draft][Update] {req.rid} has no KV, moving to waiting_queue")
+            if self.tp_rank == 0:
+                logger.warning(f"[Draft][Update] {req.rid} has no KV, moving to waiting_queue")
             state.location = "waiting_queue"
             if req not in self.waiting_queue:
                 self._add_request_to_queue(req)
@@ -639,7 +680,8 @@ class RemoteSpecDraftSchedulerMixin:
         
         # Req is already in running_batch with valid KV - just continue decoding
         # No action needed here, scheduler will process it normally
-        logger.debug(f"[Draft][Update] {req.rid} continuing in running_batch")
+        if self.tp_rank == 0:
+            logger.debug(f"[Draft][Update] {req.rid} continuing in running_batch")
     
     # =========================================================================
     # KV Operations (Strategy 5)
@@ -668,7 +710,8 @@ class RemoteSpecDraftSchedulerMixin:
         state: RemoteSpecDraftState,
     ) -> None:
         """Prepare for re-prefill when divergence in RadixCache region."""
-        logger.info(f"[Draft][RePrefill] {req.rid}, new_len={len(target_fill_ids)}")
+        if self.tp_rank == 0:
+            logger.info(f"[Draft][RePrefill] {req.rid}, new_len={len(target_fill_ids)}")
         
         self._remove_from_all_locations(req)
         
@@ -733,7 +776,8 @@ class RemoteSpecDraftSchedulerMixin:
             try:
                 sampling_params.normalize(self.tokenizer)
             except Exception as e:
-                logger.warning(f"[Draft] Failed to normalize SamplingParams for {req_id}: {e}, fixing manually")
+                if self.tp_rank == 0:
+                    logger.warning(f"[Draft] Failed to normalize SamplingParams for {req_id}: {e}, fixing manually")
                 # Manual fix if normalize fails
                 if not hasattr(sampling_params, 'stop_strs') or sampling_params.stop_strs is None:
                     sampling_params.stop_strs = []
@@ -800,7 +844,8 @@ class RemoteSpecDraftSchedulerMixin:
             last_output_length=0,
         ))
         
-        logger.debug(f"[Draft][New] {req_id}, len={len(input_ids)}")
+        if self.tp_rank == 0:
+            logger.debug(f"[Draft][New] {req_id}, len={len(input_ids)}")
     
     def _finish_draft_request(self, req_id: str) -> None:
         """Clean up finished request (ONLY place RadixCache is updated)."""
@@ -821,7 +866,8 @@ class RemoteSpecDraftSchedulerMixin:
             self.draft_kv_manager.release_all_kv_for_finished_req(req)
         
         self._delete_draft_state(req_id)
-        logger.debug(f"[Draft][Finish] {req_id}")
+        if self.tp_rank == 0:
+            logger.debug(f"[Draft][Finish] {req_id}")
     
     def _cleanup_stale_draft_states(self) -> None:
         """Clean up timed-out draft states."""
@@ -829,13 +875,15 @@ class RemoteSpecDraftSchedulerMixin:
             try:
                 self._finish_draft_request(req_id)
             except Exception as e:
-                logger.warning(f"[Draft] Cleanup failed for {req_id}: {e}")
+                if self.tp_rank == 0:
+                    logger.warning(f"[Draft] Cleanup failed for {req_id}: {e}")
             finally:
                 # Ensure state is deleted even if finish fails
                 try:
                     self._delete_draft_state(req_id)
                 except Exception as cleanup_error:
-                    logger.error(f"[Draft] Failed to delete state for {req_id}: {cleanup_error}")
+                    if self.tp_rank == 0:
+                        logger.error(f"[Draft] Failed to delete state for {req_id}: {cleanup_error}")
     
     # =========================================================================
     # Pause and Response
@@ -849,14 +897,15 @@ class RemoteSpecDraftSchedulerMixin:
         tokens_generated = len(req.output_ids) - req.draft_generation_start_len
         
         # Debug logging
-        logger.info(
-            f"[Draft][CheckPause] {req.rid}: "
-            f"output_len={len(req.output_ids)}, "
-            f"start_len={req.draft_generation_start_len}, "
-            f"tokens_generated={tokens_generated}, "
-            f"target={req.draft_tokens_target}, "
-            f"paused={req.draft_is_paused}"
-        )
+        if self.tp_rank == 0:
+            logger.info(
+                f"[Draft][CheckPause] {req.rid}: "
+                f"output_len={len(req.output_ids)}, "
+                f"start_len={req.draft_generation_start_len}, "
+                f"tokens_generated={tokens_generated}, "
+                f"target={req.draft_tokens_target}, "
+                f"paused={req.draft_is_paused}"
+            )
         
         if tokens_generated >= req.draft_tokens_target:
             self._send_draft_response(req)
@@ -899,7 +948,11 @@ class RemoteSpecDraftSchedulerMixin:
             draft_send_time=time.perf_counter(),
         )
         
-        self.zmq_communicator.send_obj(response)
+        # TP适配：仅rank 0发送ZMQ消息
+        if self.tp_size == 1 or self.tp_rank == 0:
+            if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
+                self.zmq_communicator.send_obj(response)
+        
         req.draft_generation_start_len = len(req.output_ids)
         
         # logger.info(
@@ -1032,6 +1085,14 @@ class RemoteSpecDraftSchedulerMixin:
 
     def _send_reject_message(self):
         """Send rejection message to Target."""
+        # TP适配：仅rank 0发送ZMQ消息
+        if self.tp_size > 1 and self.tp_rank != 0:
+            return
+        
+        # 检查zmq_communicator是否可用
+        if not hasattr(self, 'zmq_communicator') or self.zmq_communicator is None:
+            return
+        
         # Send a reject message to indicate high load
         reject_msg = DraftResponse(
             request_id="system",

@@ -454,14 +454,11 @@ class Scheduler(
             )
 
             remote_spec_config = RemoteSpecConfig.from_server_args(self.server_args)
-            self.zmq_communicator = RemoteSpecZMQCommunicator(config=remote_spec_config)
-            self.zmq_communicator.start()
-
-            if role == "draft":
-                self.paused_reqs: List[Req] = []
-                self.paused_reqs_lock = threading.RLock()
+            if self.tp_size == 1 or self.tp_rank == 0:
+                self.zmq_communicator = RemoteSpecZMQCommunicator(config=remote_spec_config)
+                self.zmq_communicator.start()
                 logger.info(
-                    "\033[33m ================ Draft ZMQ Communicator Started ================\033[0m"
+                    "\033[33m ================ ZMQ Communicator Started ================\033[0m"
                 )
                 logger.info(
                     f"\033[33m Endpoint: {self.zmq_communicator.get_endpoint()}\033[0m"
@@ -469,6 +466,12 @@ class Scheduler(
                 logger.info(
                     "\033[33m ================================================================ \033[0m"
                 )
+            else:
+                self.zmq_communicator = None
+
+            if role == "draft":
+                self.paused_reqs: List[Req] = []
+                self.paused_reqs_lock = threading.RLock()
         elif role is not None:
             raise ValueError(f"Invalid remote speculative role: {role}")
 

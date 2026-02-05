@@ -88,6 +88,11 @@ class RemoteSpecWorker:
             server_args.speculative_algorithm
         )
         
+        # TP相关属性
+        self.tp_rank = tp_rank
+        self.tp_group = target_worker.get_tp_group()
+        self.tp_size = self.tp_group.world_size if self.tp_group else 1
+        
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
@@ -124,8 +129,9 @@ class RemoteSpecWorker:
             # # ==============================================================
             spec_steps = draft_num_tokens - 1 if draft_num_tokens > 1 else 1
             
-            logger.info(f"\033[36m[RemoteSpec] draft_num_tokens={draft_num_tokens}, "
-                       f"spec_steps={spec_steps}\033[0m")
+            if self.tp_rank == 0:
+                logger.info(f"\033[36m[RemoteSpec] draft_num_tokens={draft_num_tokens}, "
+                           f"spec_steps={spec_steps}\033[0m")
             
             spec_info = self.construct_draft_input(batch, draft_num_tokens, spec_steps)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
@@ -294,15 +300,16 @@ class RemoteSpecWorker:
         # Synchronize to ensure kernel execution is complete
         torch.cuda.synchronize()
         
-        logger.debug(
-            f"\033[36m[RemoteSpec] build_tree result: \n"
-            f"tree_mask shape={tree_mask.shape}, \n"
-            f"positions={positions}, \n"
-            f"retrive_index={retrive_index}, \n"
-            f"retrive_next_token={retrive_next_token}, \n"
-            f"retrive_next_sibling={retrive_next_sibling}, \n"
-            f"final_draft_tokens={final_draft_tokens} \033[0m"
-        )
+        if self.tp_rank == 0:
+            logger.debug(
+                f"\033[36m[RemoteSpec] build_tree result: \n"
+                f"tree_mask shape={tree_mask.shape}, \n"
+                f"positions={positions}, \n"
+                f"retrive_index={retrive_index}, \n"
+                f"retrive_next_token={retrive_next_token}, \n"
+                f"retrive_next_sibling={retrive_next_sibling}, \n"
+                f"final_draft_tokens={final_draft_tokens} \033[0m"
+            )
         
         return EagleVerifyInput(
             draft_token=final_draft_tokens,
