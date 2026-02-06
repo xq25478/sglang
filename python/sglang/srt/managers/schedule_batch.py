@@ -2219,7 +2219,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if not self.reqs[i].finished()
                 and self.reqs[i] not in chunked_req_to_exclude
                 and not getattr(self.reqs[i], 'draft_is_paused', False)
-                and getattr(self.reqs[i], 'req_pool_idx', None) is not None  # Filter out requests with freed KV
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

@@ -482,11 +482,50 @@ class RemoteSpecDraftSchedulerMixin:
         target_len = len(target_fill_ids)
         
         if fork_point == target_len:
-            # Case 2.1: Target is prefix of Draft
+            # Case 2.1: Target is prefix of Draft (Draft is ahead)
+            # CRITICAL: We need to send the tokens Target needs (from target_len position)
+            # NOT the tokens Draft newly generated (from current output_len position)
+            
+            target_output_len = target_len - len(req.origin_input_ids)
+            draft_output_len = len(req.output_ids)
+            tokens_ahead = draft_output_len - target_output_len
+            
             if self.tp_rank == 0:
-                logger.info(f"\033[36m [Case 2.1] {req.rid}, Draft ahead, continuing \033[0m")
-            self._update_req_state(req, draft_req, state)
-            self._resume_or_update(req, state, reqs_to_merge)
+                logger.info(
+                    f"\033[36m [Case 2.1] {req.rid}, Draft ahead. "
+                    f"draft_output_len={draft_output_len}, target_output_len={target_output_len}, "
+                    f"tokens_ahead={tokens_ahead}, target={draft_req.num_draft_tokens} \033[0m"
+                )
+            
+            # Update state
+            req.draft_generation_start_len = target_output_len
+            req.spec_cnt = draft_req.spec_cnt
+            req.draft_tokens_target = draft_req.num_draft_tokens
+            req.len_output_ids = draft_output_len
+            state.last_updated_time = time.time()
+            
+            if tokens_ahead >= draft_req.num_draft_tokens:
+                # Already have enough tokens ahead, send immediately without inference
+                if self.tp_rank == 0:
+                    logger.info(
+                        f"\033[33m [Case 2.1] {req.rid}: Already ahead by {tokens_ahead} tokens, "
+                        f"sending immediately and keeping paused \033[0m"
+                    )
+                self._send_draft_response(req)
+                req.draft_is_paused = True
+                with self.paused_reqs_lock:
+                    if req not in self.paused_reqs:
+                        self.paused_reqs.append(req)
+                state.location = "paused"
+            else:
+                # Need to generate more tokens to reach target
+                if self.tp_rank == 0:
+                    logger.info(
+                        f"\033[33m [Case 2.1] {req.rid}: Only ahead by {tokens_ahead} tokens, "
+                        f"need to generate {draft_req.num_draft_tokens - tokens_ahead} more \033[0m"
+                    )
+                req.draft_is_paused = False
+                self._resume_or_update(req, state, reqs_to_merge)
         else:
             # Case 2.2: Tokens differ
             self._handle_multi_token_divergence(
@@ -577,11 +616,7 @@ class RemoteSpecDraftSchedulerMixin:
         """Update request state for decode continuation."""
         req.spec_cnt = draft_req.spec_cnt
         req.draft_tokens_target = draft_req.num_draft_tokens
-        # Only reset draft_generation_start_len if it hasn't been set yet (initial state)
-        # or if the request was paused and is now resuming
-        # Don't reset during active decode to avoid breaking token counting
-        if not hasattr(req, 'draft_generation_start_len') or req.draft_generation_start_len == 0 or req.draft_is_paused:
-            req.draft_generation_start_len = len(req.output_ids)
+        req.draft_generation_start_len = len(req.output_ids)
         req.draft_is_paused = False
         req.len_output_ids = len(req.output_ids)
         state.last_updated_time = time.time()

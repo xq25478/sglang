@@ -543,13 +543,7 @@ class SchedulerOutputProcessorMixin:
             # V3: 检查draft请求是否需要pause
             if self.server_args.remote_speculative_role == "draft" and hasattr(self, '_check_and_pause_draft_req'):
                 # logger.info(f"\033[35m [Draft][Check and Pause] {req.rid} {len(req.origin_input_ids)=}, {len(req.output_ids)=}, {req.stable_boundary=}, {req.output_ids=}, {next_token_id=} \033[0m")
-                if self._check_and_pause_draft_req(req):
-                    # 需要pause，添加到paused_reqs
-                    if hasattr(self, 'paused_reqs') and hasattr(self, 'paused_reqs_lock'):
-                        with self.paused_reqs_lock:
-                            if req not in self.paused_reqs:
-                                self.paused_reqs.append(req)
-                    # 注意：不在这里移除，会在filter_batch时处理
+                self._check_and_pause_draft_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
