@@ -219,7 +219,7 @@ class RemoteSpecTargetSchedulerMixin:
         return False
 
     def _decide_speculative_num_draft_tokens(self, batch: ScheduleBatch) -> int:
-        return self.server_args.speculative_num_draft_tokens
+        return self.server_args.speculative_num_steps
 
     def send_batch_draft_requests(self, batch: ScheduleBatch, speculative_num_draft_tokens: int) -> None:
         if self.is_rejected and self.server_args.remote_speculative_reject_interval > 0 and ((self.forward_ct - self.rejected_forward_ct + 1) % self.server_args.remote_speculative_reject_interval != 0):
