@@ -130,6 +130,10 @@ public:
         sock_.set(zmq::sockopt::rcvbuf, 4 * 1024 * 1024);
     }
 
+    ~DealerEndpoint() {
+        stop(); // 析构函数添加 stop，保证 Python 端程序停止，自动调用 stop 函数。
+    }
+
     bool has_send_data() {
         std::lock_guard<std::mutex> lock(send_mtx_);
         return !send_queue_.empty();
