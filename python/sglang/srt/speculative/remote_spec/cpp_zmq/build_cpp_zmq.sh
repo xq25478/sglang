@@ -9,6 +9,7 @@ pushd "$SCRIPT_DIR"
 pip config set global.index-url https://mirrors.jd.com/pypi/web/simple
 pip config set global.trusted-host mirrors.jd.com
 pip install pybind11 msgpack
+apt-get update && apt-get install -y libmsgpack-dev
 
 # 编译扩展
 python3 setup.py build_ext --inplace

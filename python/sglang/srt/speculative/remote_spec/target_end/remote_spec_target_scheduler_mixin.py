@@ -4,7 +4,7 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch, Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors, ForwardMode
 from sglang.srt.environ import envs
 import time
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequestFromTargetToDraft, RemoteSpecAction, SpecType, RemoteSpecResponseFromDraftToTarget
+from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequest, RemoteSpecAction, SpecType
 from collections import defaultdict
 from typing import Dict, List
 import logging
@@ -67,8 +67,6 @@ class RemoteSpecTargetSchedulerMixin:
                 messages = self.zmq_communicator.recv_all_objs()
             else:
                 messages = []
-            if messages:
-                messages = [RemoteSpecResponseFromDraftToTarget.from_dict(msg) for msg in messages]
         else:
             messages = None
         
@@ -89,7 +87,7 @@ class RemoteSpecTargetSchedulerMixin:
 
         if messages:
             for msg in messages:
-                assert isinstance(msg, RemoteSpecResponseFromDraftToTarget), "Invalid message type"
+                assert isinstance(msg, RemoteSpecRequest), "Invalid message type"
                 if msg.action == RemoteSpecAction.REJECT:
                     self.process_reject_action()
                     if self.tp_rank == 0:
@@ -175,7 +173,7 @@ class RemoteSpecTargetSchedulerMixin:
         if getattr(req, "rid", "").startswith("HEALTH_CHECK"):
             return
         
-        finished_or_aborted_req = RemoteSpecRequestFromTargetToDraft(
+        finished_or_aborted_req = RemoteSpecRequest(
             request_id=req.rid,
             spec_cnt=req.spec_cnt,
             action=action,
@@ -189,7 +187,13 @@ class RemoteSpecTargetSchedulerMixin:
         # TP适配：仅rank 0发送ZMQ消息
         if self.tp_size == 1 or self.tp_rank == 0:
             if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
-                self.zmq_communicator.send_obj(finished_or_aborted_req)
+                all_drafts_identity = self.zmq_communicator.get_all_drafts_identity()
+                if not all_drafts_identity:
+                    logger.warning("当前无 Draft 可用，检查 Draft 状态！")
+                    to_send_identity = "NO DRAFT" # 
+                else:
+                    to_send_identity = all_drafts_identity[0] # 当前策略为第一个 后续需要升级策略
+                self.zmq_communicator.send_obj(finished_or_aborted_req,to_send_identity)
 
         try:
             if req.rid in self.req_to_draft_token:
@@ -233,7 +237,7 @@ class RemoteSpecTargetSchedulerMixin:
             if getattr(req, "rid", "").startswith("HEALTH_CHECK"):
                 continue
 
-            draft_req = RemoteSpecRequestFromTargetToDraft(
+            draft_req = RemoteSpecRequest(
                 request_id=req.rid,
                 spec_cnt=req.spec_cnt,
                 action=RemoteSpecAction.DRAFT,
@@ -254,7 +258,13 @@ class RemoteSpecTargetSchedulerMixin:
         # TP适配：仅rank 0发送ZMQ消息
         if self.tp_size == 1 or self.tp_rank == 0:
             if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
-                self.zmq_communicator.send_objs(draft_reqs_to_send)
+                all_drafts_identity = self.zmq_communicator.get_all_drafts_identity()
+                if not all_drafts_identity:
+                    logger.warning("当前无 Draft 可用，检查 Draft 状态！")
+                    to_send_identity = "NO DRAFT" # 
+                else:
+                    to_send_identity = all_drafts_identity[0] # 当前策略为第一个 后续需要升级策略
+                self.zmq_communicator.send_objs(draft_reqs_to_send,to_send_identity)
 
     
     def process_reject_action(self) -> None:

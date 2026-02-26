@@ -1,23 +1,26 @@
 from abc import ABC, abstractmethod
 from typing import List, Any, Optional, Dict, Tuple, Union
-
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecBatchResponseFromDraftToTarget, RemoteSpecBatchRequestFromTargetToDraft
+from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequest
 from sglang.srt.environ import envs, EnvStr
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.remote_spec.cpp_zmq import DealerEndpoint, RouterEndpoint
 
 from dataclasses import dataclass
 import os
 import time
 import logging
-from sglang.srt.server_args import ServerArgs
-    
-logger = logging.getLogger(__name__)
+import uuid
+import atexit
+import signal
+import sys
+import threading
 
+logger = logging.getLogger(__name__)
 
 class RemoteSpecBaseCommunicator(ABC):
     '''
     RemoteSpecBaseCommunicator is the base class for all remote spec communicators.
-    It is responsible for sending and receiving RemoteSpecRequestFromTargetToDraft and RemoteSpecResponseFromDraftToTarget.
+    It is responsible for sending and receiving RemoteSpecRequest.
     '''
     def __init__(self) -> None:
         self.start()
@@ -31,15 +34,15 @@ class RemoteSpecBaseCommunicator(ABC):
         pass
 
     @abstractmethod
-    def send_objs(self, requests: List[Union[RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]]) -> None:
+    def send_objs(self, requests: List[RemoteSpecRequest]) -> None:
         pass
 
     @abstractmethod
-    def send_obj(self, request: Union[RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]) -> None:
+    def send_obj(self, request:RemoteSpecRequest) -> None:
         pass
 
     @abstractmethod
-    def recv_all_objs(self) -> List[Union[RemoteSpecBatchResponseFromDraftToTarget, RemoteSpecBatchRequestFromTargetToDraft]]:
+    def recv_all_objs(self) -> List[RemoteSpecRequest]:
         pass
 
 
@@ -185,20 +188,11 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
     Args:
         config: Remote speculative decoding configuration
         context: Optional ZMQ context (created if not provided)
-    """
-    # _instance = None
-    
-    # # 单例模式
-    # def __new__(cls, *args, **kwargs):
-    #     if cls._instance is None:
-    #         cls._instance = super().__new__(cls,*args,**kwargs)
-    #     return cls._instance
-    
+    """    
     def __init__(
         self,
         config: RemoteSpecConfig,
     ):
-        from sglang.srt.speculative.remote_spec.cpp_zmq import DealerEndpoint
         
         self.config = config
         # 引入 debug 选项，用于耗时分析。
@@ -207,10 +201,25 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
         self.zmq_endpoint = config.get_addr()
         self.bind = not config.is_target
         self._running = False
-        self.zmq_communicator = DealerEndpoint(  
-                                self.config.role, 
-                                self.zmq_endpoint, 
-                                bind = self.config.role == "target")
+        self.identity = self.config.role + "-" + self.generate_identity()
+        
+        if self.config.role == "draft":
+            self.zmq_communicator = DealerEndpoint(  
+                                        self.zmq_endpoint, 
+                                        self.identity,
+                                        False)
+        else:
+            self.zmq_communicator = RouterEndpoint(  
+                                        self.zmq_endpoint, 
+                                        True)        
+        
+    def generate_identity(self,bits = 8) -> str:
+        id_string = str(uuid.uuid4().hex[:bits])
+        return id_string
+    
+    def get_all_drafts_identity(self) -> List[str]:
+        assert self.config.role == "target" # 该接口仅支持 target 模型
+        return self.zmq_communicator.get_all_dealers()
         
     def get_endpoint(self) -> str:
         return self.zmq_endpoint
@@ -218,82 +227,94 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
     def start(self) -> None:
         """Start the ZMQ communication workers."""
         if self._running:
-            logger.warning("ZMQCommunicator already started")
+            logger.info("ZMQCommunicator already started")
             return
         
         if not self._running:
             self.zmq_communicator.start()
             self._running = True
-            print(f"ZMQ Communicator Started for {self.config.role}")
+            logger.info(f"ZMQ Communicator Started for {self.config.role} with identity {self.identity}")
 
     def stop(self) -> None:
         if self._running:
             self.zmq_communicator.stop()
             self._running = False
-            print(f"ZMQ Communicator Stoped for {self.config.role}")
+            logger.info(f"ZMQ Communicator Stoped for {self.config.role}")
         
     def _process_data(self, data:Any):
-        if isinstance(data, RemoteSpecRequestFromTargetToDraft) or isinstance(data, RemoteSpecResponseFromDraftToTarget):
+        if isinstance(data, RemoteSpecRequest):
             return data.to_dict()
         return data
             
-    def send_obj(self, request: Union[RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]) -> None:
+    def send_obj(self,  request: RemoteSpecRequest,
+                        identity: str = "DRAFT" ) -> None:
+        if not self._running:
+            logger.warning(f"Cannot send: communicator not running")
+        try:
+            if self.debug:
+                t1 = time.perf_counter()
+
+            if self.config.role == "draft":
+                # ZMQ C++ 端采用 msgpack python 进行打包发送，要求数据格式为 Python 原生数据类型，因此需要将Response 和 Request 转换为 Dict
+                self.zmq_communicator.send_obj(self._process_data(request))
+            else:
+                # target 发送到指定 id 的 draft 端
+                self.zmq_communicator.send_obj(identity,self._process_data(request))
+            
+            if self.debug:
+                t2 = time.perf_counter()
+                logger.info(f"[REMOTE_SPEC_DEBUG Python][SEND] msgs num:1, time_us:{(t2-t1)*1e6:.1f}")
+        except Exception as e:
+            logger.error(f"Failed to send: {e}")
+        
+    def send_objs(self, requests: List[RemoteSpecRequest],
+                        identity: str = "DRAFT" ) -> None:
+        
         if not self._running:
             logger.warning(f"Cannot send: communicator not running")
         try:
             if self.debug:
                 t1 = time.perf_counter()
                 
-            # ZMQ C++ 端采用 msgpack python 进行打包发送，要求数据格式为 Python 原生数据类型，因此需要将Response 和 Request 转换为 Dict
-            self.zmq_communicator.send_obj(self._process_data(request))
+            msgs = [ self._process_data(request) for request in requests ]
+            if self.config.role == "draft":
+                self.zmq_communicator.send_objs(msgs)
+            else:
+                # target 发送到指定 id 的 draft 端
+                self.zmq_communicator.send_objs(identity,msgs)
             
             if self.debug:
                 t2 = time.perf_counter()
-                print(f"[REMOTE_SPEC_DEBUG Python][SEND] msgs num:1, time_us:{(t2-t1)*1e6:.1f}")
+                logger.info(f"[REMOTE_SPEC_DEBUG Python][SEND] msgs nums:{len(msgs)}, time_us:{(t2-t1)*1e6:.1f}")    
         except Exception as e:
             logger.error(f"Failed to send: {e}")
         
-    def send_objs(self, requests: List[Union[RemoteSpecRequestFromTargetToDraft, RemoteSpecResponseFromDraftToTarget]]) -> None:
-        if not self._running:
-            logger.warning(f"Cannot send: communicator not running")
-        try:
-            if self.debug:
-                t1 = time.perf_counter()
-                
-            msgs = [self._process_data(request) for request in requests]
-            self.zmq_communicator.send_objs(msgs)
-            
-            if self.debug:
-                t2 = time.perf_counter()
-                print(f"[REMOTE_SPEC_DEBUG Python][SEND] msgs nums:{len(msgs)}, time_us:{(t2-t1)*1e6:.1f}")    
-        except Exception as e:
-            logger.error(f"Failed to send: {e}")
-        
-    def recv_all_objs(self) -> List[Any]:
+    def recv_all_objs(self) -> List[RemoteSpecRequest]:
         if not self._running:
             return []
         try:
             if self.debug:
                 t1 = time.perf_counter()
-                
-            _msgs = self.zmq_communicator.get_received_objs()
+            
+            received = self.zmq_communicator.get_received_objs()
+            
+            # target 端 收到消息 带有 draft 的 id
+            if self.config.role == 'target':
+                _msgs = [ msg for _, msg in received ]
+            else:
+                _msgs = received
 
             if self.debug and _msgs:
                 t2 = time.perf_counter()
-                print(f"[REMOTE_SPEC_DEBUG Python][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}")
+                logger.info(f"[REMOTE_SPEC_DEBUG Python][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}")
                 
             if not _msgs:
                 return []
             else:
                 msgs = []
                 for _msg in _msgs:
-                    # logger.info(f"************** {_msg=}")
-                    if isinstance(_msg, RemoteSpecRequestFromTargetToDraft):
-                        msgs.append(RemoteSpecRequestFromTargetToDraft.from_dict(_msg))
-                        
-                    elif isinstance(_msg, RemoteSpecResponseFromDraftToTarget):
-                        msgs.append(RemoteSpecResponseFromDraftToTarget.from_dict(_msg))
-                        
+                    if isinstance(_msg, dict):
+                        msgs.append(RemoteSpecRequest.from_dict(_msg))       
                     else:
                         msgs.append(_msg)
                 return msgs
@@ -314,7 +335,7 @@ if __name__ == "__main__":
     from random import randint
     from sglang.srt.sampling.sampling_params import SamplingParams
 
-    PAYLOAD_TOKENS = 20_000
+    PAYLOAD_TOKENS = 20
 
     remote_config_t = RemoteSpecConfig(role="target")
     remote_config_d = RemoteSpecConfig(role="draft")
@@ -323,10 +344,12 @@ if __name__ == "__main__":
     zmq_comm_d = RemoteSpecZMQCommunicator(remote_config_d)
 
     zmq_comm_t.start()
+    time.sleep(1)
     zmq_comm_d.start()
+    time.sleep(1)
 
     def make_req(i: int):
-        return RemoteSpecRequestFromTargetToDraft(
+        return RemoteSpecRequest(
             request_id=str(uuid.uuid4()),
             spec_cnt=i,
             action="draft",
@@ -340,16 +363,21 @@ if __name__ == "__main__":
             target_send_time=time.time(),
         )
         
-    for i in range(10):    
-        zmq_comm_t.send_obj(make_req(0))
-        zmq_comm_t.send_objs([make_req(i) for i in range(30)])
+    for i in range(10):
+        logger.info(f"{i=}")
+        # msgs = zmq_comm_t.recv_all_objs()
+        # logger.info(f"{msgs=}")
+        # msgs = zmq_comm_d.recv_all_objs()
+        # logger.info(f"{msgs=}")     
+        zmq_comm_t.send_obj(make_req(0),zmq_comm_t.get_all_drafts_identity()[0])
+        zmq_comm_t.send_objs([make_req(i) for i in range(100)],zmq_comm_t.get_all_drafts_identity()[0])
+        
         zmq_comm_d.send_obj(make_req(4))
-        zmq_comm_t.send_objs([make_req(i) for i in range(30)])
+        zmq_comm_d.send_objs([make_req(i) for i in range(100)])
+        
+        time.sleep(0.01)
+        
         msgs = zmq_comm_t.recv_all_objs()
-        # print(f"{msgs=}")
+        # logger.info(f"{msgs=}")
         msgs = zmq_comm_d.recv_all_objs()
-        # print(f"{msgs=}")
-
-    zmq_comm_t.stop()
-    zmq_comm_d.stop()
-    
+        # logger.info(f"{msgs=}")

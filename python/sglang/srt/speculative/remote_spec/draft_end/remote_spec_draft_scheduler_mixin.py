@@ -39,8 +39,7 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
-    RemoteSpecRequestFromTargetToDraft as DraftRequest,
-    RemoteSpecResponseFromDraftToTarget as DraftResponse,
+    RemoteSpecRequest,
     RemoteSpecAction,
     SpecType
 )
@@ -234,16 +233,13 @@ class RemoteSpecDraftSchedulerMixin:
         
         self.token_to_kv_pool_allocator.free_group_end()
     
-    def _recv_draft_requests(self) -> List[DraftRequest]:
+    def _recv_draft_requests(self) -> List[RemoteSpecRequest]:
         """Receive draft requests from communication worker."""
         try:
             msgs = []
             if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
-                _msgs = self.zmq_communicator.recv_all_objs()
-            else:
-                _msgs = []
-            for _msg in _msgs:
-                msgs.append(DraftRequest.from_dict(_msg))
+                # recv_all_objs 接口内部已调用from_dict，返回的即使列表，没有则为[]
+                msgs = self.zmq_communicator.recv_all_objs()
             return msgs
         except (ConnectionError, OSError) as e:
             if self.tp_rank == 0:
@@ -256,9 +252,9 @@ class RemoteSpecDraftSchedulerMixin:
     
     def deduplicate_draft_requests(
         self,
-        messages: List[DraftRequest],
+        messages: List[RemoteSpecRequest],
         draft_recv_time: float,
-    ) -> Tuple[List[DraftRequest], Dict[str, DraftRequest]]:
+    ) -> Tuple[List[RemoteSpecRequest], Dict[str, RemoteSpecRequest]]:
         """
         Deduplicate messages, keeping only latest spec_cnt per request.
         
@@ -290,7 +286,7 @@ class RemoteSpecDraftSchedulerMixin:
         
         return control_msgs, latest_msgs
     
-    def _process_control_message(self, control_msgs: List[DraftRequest]) -> None:
+    def _process_control_message(self, control_msgs: List[RemoteSpecRequest]) -> None:
         """Process finish/abort messages."""
         for draft_req in control_msgs:
             req_id = draft_req.request_id
@@ -301,12 +297,12 @@ class RemoteSpecDraftSchedulerMixin:
                     logger.info(f"[Draft] Received {action} for {req_id}")
                 self._finish_draft_request(req_id)
     
-    def _process_draft_requests(self, latest_msgs: Dict[str, DraftRequest]) -> List[Req]:
+    def _process_draft_requests(self, latest_msgs: Dict[str, RemoteSpecRequest]) -> List[Req]:
         """
         Process draft messages, return requests to merge to batch.
         
         Args:
-            latest_msgs: Dictionary of request_id to latest DraftRequest
+            latest_msgs: Dictionary of request_id to latest RemoteSpecRequest
             
         Returns:
             List of requests that need to be merged back to running batch
@@ -391,7 +387,7 @@ class RemoteSpecDraftSchedulerMixin:
     def _handle_identical_tokens(
         self,
         req: Req,
-        draft_req: DraftRequest,
+        draft_req: RemoteSpecRequest,
         state: RemoteSpecDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
@@ -410,7 +406,7 @@ class RemoteSpecDraftSchedulerMixin:
         req: Req,
         target_fill_ids: List[int],
         fork_point: int,
-        draft_req: DraftRequest,
+        draft_req: RemoteSpecRequest,
         state: RemoteSpecDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
@@ -447,7 +443,7 @@ class RemoteSpecDraftSchedulerMixin:
         current_len: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: DraftRequest,
+        draft_req: RemoteSpecRequest,
         state: RemoteSpecDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
@@ -474,7 +470,7 @@ class RemoteSpecDraftSchedulerMixin:
         fork_point: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: DraftRequest,
+        draft_req: RemoteSpecRequest,
         state: RemoteSpecDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
@@ -542,7 +538,7 @@ class RemoteSpecDraftSchedulerMixin:
         current_len: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: DraftRequest,
+        draft_req: RemoteSpecRequest,
         state: RemoteSpecDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
@@ -571,7 +567,7 @@ class RemoteSpecDraftSchedulerMixin:
         fork_point: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: DraftRequest,
+        draft_req: RemoteSpecRequest,
         state: RemoteSpecDraftState,
         reqs_to_merge: List[Req],
         case_name: str,
@@ -612,7 +608,7 @@ class RemoteSpecDraftSchedulerMixin:
         req.output_ids.extend(delta_tokens)
         req.fill_ids = req.origin_input_ids + req.output_ids
     
-    def _update_req_state(self, req: Req, draft_req: DraftRequest, state: RemoteSpecDraftState) -> None:
+    def _update_req_state(self, req: Req, draft_req: RemoteSpecRequest, state: RemoteSpecDraftState) -> None:
         """Update request state for decode continuation."""
         req.spec_cnt = draft_req.spec_cnt
         req.draft_tokens_target = draft_req.num_draft_tokens
@@ -741,7 +737,7 @@ class RemoteSpecDraftSchedulerMixin:
         self,
         req: Req,
         target_fill_ids: List[int],
-        draft_req: DraftRequest,
+        draft_req: RemoteSpecRequest,
         state: RemoteSpecDraftState,
     ) -> None:
         """Prepare for re-prefill when divergence in RadixCache region."""
@@ -784,7 +780,7 @@ class RemoteSpecDraftSchedulerMixin:
     # Request Lifecycle
     # =========================================================================
     
-    def _create_new_draft_req(self, draft_req: DraftRequest) -> None:
+    def _create_new_draft_req(self, draft_req: RemoteSpecRequest) -> None:
         """Create new draft request."""
         req_id = draft_req.request_id
         
@@ -971,7 +967,7 @@ class RemoteSpecDraftSchedulerMixin:
                 draft_logits = req.output_token_logprobs_val[start:end]
         
         from sglang.srt.speculative.remote_spec.remote_spec_protocol import SpecType
-        response = DraftResponse(
+        response = RemoteSpecRequest(
             request_id=req.rid,
             spec_cnt=req.spec_cnt,
             action=RemoteSpecAction.DRAFT,
@@ -1129,7 +1125,7 @@ class RemoteSpecDraftSchedulerMixin:
             return
         
         # Send a reject message to indicate high load
-        reject_msg = DraftResponse(
+        reject_msg = RemoteSpecRequest(
             request_id="system",
             spec_cnt=0,
             action=RemoteSpecAction.REJECT,

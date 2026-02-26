@@ -30,6 +30,6 @@ else:
     if not success:
         build_cpp_zmq()
 
-from .remote_spec_zmq import DealerEndpoint
+from .remote_spec_zmq import DealerEndpoint, RouterEndpoint
 
-__all__ = ["DealerEndpoint"]
+__all__ = ["DealerEndpoint","RouterEndpoint"]
