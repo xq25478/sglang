@@ -2354,9 +2354,20 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        res = get_global_server_args().pp_max_micro_batch_size - running_bs
+        # For Remote Spec Draft: paused_reqs also occupy req_pool_idx
+        # Need to account for them when calculating available slots
+        paused_count = 0
+        if self.server_args.remote_speculative_role == "draft":
+            with self.paused_reqs_lock:
+                if hasattr(self, 'paused_reqs'):
+                    paused_count = len(self.paused_reqs)
+        
+        # Total occupied slots = running + paused
+        total_occupied = running_bs + paused_count
+        
+        res = get_global_server_args().pp_max_micro_batch_size - total_occupied
         if self.pp_size > 1:
-            res = min(res, self.req_to_token_pool.available_size())
+            res = min(res, self.req_to_token_pool.available_size())  
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

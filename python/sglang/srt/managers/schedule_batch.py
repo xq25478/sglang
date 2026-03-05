@@ -946,6 +946,10 @@ class Req(ReqDllmMixin):
     def finished(self) -> bool:
         # Whether request reached finished condition
         if self.spec_type in {SpecType.DRAFT_REQUEST, SpecType.DRAFT_REQUEST.value}:
+            # Exception: prefix caching requests (max_new_tokens=0) should be allowed to finish
+            # These are not real draft requests that need verification from Target
+            if self.sampling_params.max_new_tokens == 0:
+                return self.finished_reason is not None
             return False
         return self.finished_reason is not None
 

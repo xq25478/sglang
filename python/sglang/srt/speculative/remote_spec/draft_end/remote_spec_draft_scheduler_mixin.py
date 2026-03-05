@@ -893,7 +893,8 @@ class RemoteSpecDraftSchedulerMixin:
             req.finished_reason = FINISH_ABORT("Target request finished")
         
         # Strategy 5: Only update RadixCache at finish time
-        if req.req_pool_idx is not None:
+        # Check if KV cache has already been freed (e.g., for prefix caching requests with max_new_tokens=0)
+        if req.req_pool_idx is not None and not getattr(req, 'kv_committed_freed', False):
             self.draft_kv_manager.release_all_kv_for_finished_req(req)
         
         self._delete_draft_state(req_id)
