@@ -4,7 +4,7 @@ import sys
 import warnings
 from pathlib import Path
 
-FORCE_BUILD=True
+FORCE_BUILD=False
 
 def build_cpp_zmq():
     build_script = Path(__file__).parent / "build_cpp_zmq.sh"

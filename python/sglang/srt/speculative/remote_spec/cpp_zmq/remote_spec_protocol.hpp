@@ -130,10 +130,10 @@ struct RemoteSpecRequest {
     std::optional<int> num_draft_tokens;
     std::optional<SamplingParams> sampling_params;
     std::optional<std::string> grammar;
-    std::optional<float> target_send_time;
+    std::optional<double> target_send_time;
     std::optional<std::vector<float>> draft_logprobs;
-    std::optional<float> draft_receive_time;
-    std::optional<float> draft_send_time;
+    std::optional<double> draft_receive_time;
+    std::optional<double> draft_send_time;
 
     MSGPACK_DEFINE(
         request_id, spec_cnt, action, spec_type, draft_token_ids,
