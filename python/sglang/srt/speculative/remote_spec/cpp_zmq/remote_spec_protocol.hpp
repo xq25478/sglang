@@ -199,10 +199,10 @@ inline RemoteSpecRequest from_py_dict(const py::dict& d) {
     }
 
     if (d.contains("grammar")) r.grammar = py::cast<std::string>(d["grammar"]);
-    if (d.contains("target_send_time")) r.target_send_time = py::cast<float>(d["target_send_time"]);
+    if (d.contains("target_send_time")) r.target_send_time = py::cast<double>(d["target_send_time"]);
     if (d.contains("draft_logprobs")) r.draft_logprobs = py::cast<std::vector<float>>(d["draft_logprobs"]);
-    if (d.contains("draft_receive_time")) r.draft_receive_time = py::cast<float>(d["draft_receive_time"]);
-    if (d.contains("draft_send_time")) r.draft_send_time = py::cast<float>(d["draft_send_time"]);
+    if (d.contains("draft_receive_time")) r.draft_receive_time = py::cast<double>(d["draft_receive_time"]);
+    if (d.contains("draft_send_time")) r.draft_send_time = py::cast<double>(d["draft_send_time"]);
 
     return r;
 }
