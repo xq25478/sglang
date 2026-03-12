@@ -227,19 +227,19 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
     def start(self) -> None:
         """Start the ZMQ communication workers."""
         if self._running:
-            logger.info("ZMQCommunicator already started")
+            logger.debug("ZMQCommunicator already started")
             return
         
         if not self._running:
             self.zmq_communicator.start()
             self._running = True
-            logger.info(f"ZMQ Communicator Started for {self.config.role} with identity {self.identity}")
+            logger.debug(f"ZMQ Communicator Started for {self.config.role} with identity {self.identity}")
 
     def stop(self) -> None:
         if self._running:
             self.zmq_communicator.stop()
             self._running = False
-            logger.info(f"ZMQ Communicator Stoped for {self.config.role}")
+            logger.debug(f"ZMQ Communicator Stoped for {self.config.role}")
         
     def _process_data(self, data:Any):
         if isinstance(data, RemoteSpecRequest):
@@ -263,7 +263,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             
             if self.debug:
                 t2 = time.perf_counter()
-                logger.info(f"[REMOTE_SPEC_DEBUG Python][SEND] msgs num:1, time_us:{(t2-t1)*1e6:.1f}")
+                logger.debug(f"[ZMQ LOG Python][SEND] msgs num:1, time_us:{(t2-t1)*1e6:.1f}")
         except Exception as e:
             logger.error(f"Failed to send: {e}")
         
@@ -285,7 +285,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             
             if self.debug:
                 t2 = time.perf_counter()
-                logger.info(f"[REMOTE_SPEC_DEBUG Python][SEND] msgs nums:{len(msgs)}, time_us:{(t2-t1)*1e6:.1f}")    
+                logger.debug(f"[ZMQ LOG Python][SEND] msgs nums:{len(msgs)}, time_us:{(t2-t1)*1e6:.1f}")    
         except Exception as e:
             logger.error(f"Failed to send: {e}")
         
@@ -306,7 +306,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
 
             if self.debug and _msgs:
                 t2 = time.perf_counter()
-                logger.info(f"[REMOTE_SPEC_DEBUG Python][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}")
+                logger.debug(f"[ZMQ LOG Python][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}")
                 
             if not _msgs:
                 return []
@@ -364,11 +364,11 @@ if __name__ == "__main__":
         )
         
     for i in range(10):
-        logger.info(f"{i=}")
+        logger.debug(f"{i=}")
         # msgs = zmq_comm_t.recv_all_objs()
-        # logger.info(f"{msgs=}")
+        # logger.debug(f"{msgs=}")
         # msgs = zmq_comm_d.recv_all_objs()
-        # logger.info(f"{msgs=}")     
+        # logger.debug(f"{msgs=}")     
         zmq_comm_t.send_obj(make_req(0),zmq_comm_t.get_all_drafts_identity()[0])
         zmq_comm_t.send_objs([make_req(i) for i in range(100)],zmq_comm_t.get_all_drafts_identity()[0])
         
@@ -378,6 +378,6 @@ if __name__ == "__main__":
         time.sleep(0.01)
         
         msgs = zmq_comm_t.recv_all_objs()
-        # logger.info(f"{msgs=}")
+        # logger.debug(f"{msgs=}")
         msgs = zmq_comm_d.recv_all_objs()
-        # logger.info(f"{msgs=}")
+        # logger.debug(f"{msgs=}")

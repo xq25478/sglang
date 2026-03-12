@@ -518,6 +518,7 @@ class ServerArgs:
     remote_speculative_max_batch_size: int = 32
     remote_speculative_reject_interval: int = 5000
     remote_speculative_no_draft_ratio: float = 0.5
+    remote_speculative_retry_fail_ratio: float = 0.5
     remote_speculative_zmq_addr: Optional[str] = None
     remote_speculative_zmq_port: Optional[str] = None
 
@@ -4921,6 +4922,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.remote_speculative_no_draft_ratio,
             help="The ratio of requests with no draft tokens to the total batch size. If the ratio is larger than this value, the server will only decode one token.",
+        )
+        parser.add_argument(
+            "--remote-speculative-retry-fail-ratio",
+            type=float,
+            default=ServerArgs.remote_speculative_retry_fail_ratio,
+            help="Minimum ratio of failed (diverged/no-draft) requests to batch size required to trigger a retry. "
+                 "E.g. 0.5 means retry only when more than 50%% of requests have no valid draft. Default 0.0 (always retry).",
         )
         parser.add_argument(
             "--remote-speculative-zmq-addr",

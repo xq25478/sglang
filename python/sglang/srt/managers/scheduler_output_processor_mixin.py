@@ -479,6 +479,12 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.set_completion_time()
                 if self.spec_algorithm.is_remote() and self.server_args.remote_speculative_role == "target":
                     self.notify_draft_request_finished_or_aborted(req, RemoteSpecAction.FINISH)
+                    if self.tp_rank == 0:
+                        logger.debug(
+                            f"\033[34m ########### accept cnt: {req.accept_cnt}, "
+                            f"draft cnt: {req.draft_cnt}, accept rate: "
+                            f"{req.accept_cnt / req.draft_cnt if req.draft_cnt > 0 else 0} \033[0m"
+                        )
 
             self.maybe_collect_customized_info(i, req, logits_output)
 

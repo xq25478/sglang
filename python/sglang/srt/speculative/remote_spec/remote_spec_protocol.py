@@ -37,7 +37,9 @@ class RemoteSpecRequest:
     action: RemoteSpecAction = RemoteSpecAction.FINISH
     spec_type: SpecType = SpecType.NORMAL
     draft_token_ids: Optional[List[int]] = None # draft token ids
-    target_send_time: Optional[float] = None
+    target_send_time : float = -1.0
+    target_recv_time : float = -1.0
+    
             
     # T 独有的属性
     input_ids: Optional[List[int]] = None
@@ -48,8 +50,8 @@ class RemoteSpecRequest:
         
     # D 独有的属性
     draft_logprobs: Optional[List[float]] = None # draft logprobs
-    draft_receive_time: Optional[float] = None
-    draft_send_time: Optional[float] = None
+    draft_recv_time : float = -1.0
+    draft_send_time : float = -1.0
 
     def to_dict(self) -> Dict[str, Any]:
         result = {}

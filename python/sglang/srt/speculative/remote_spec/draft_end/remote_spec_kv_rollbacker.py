@@ -244,7 +244,7 @@ class RemoteSpecKVRollbacker:
             req.kv_allocated_len = fork_point
             
             if self.tp_rank == 0:
-                logger.info(
+                logger.debug(
                     f"[RemoteSpecKVRollbacker] Local rollback for {req.rid}: "
                     f"freed [{fork_point}, {current_kv_len}), "
                     f"kv_committed: {old_committed} -> {req.kv_committed_len}, "

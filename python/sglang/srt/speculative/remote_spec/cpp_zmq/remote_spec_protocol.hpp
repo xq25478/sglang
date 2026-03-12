@@ -130,16 +130,17 @@ struct RemoteSpecRequest {
     std::optional<int> num_draft_tokens;
     std::optional<SamplingParams> sampling_params;
     std::optional<std::string> grammar;
-    std::optional<double> target_send_time;
+    double target_send_time = -1.0;
+    double target_recv_time = -1.0;
     std::optional<std::vector<float>> draft_logprobs;
-    std::optional<double> draft_receive_time;
-    std::optional<double> draft_send_time;
+    double draft_recv_time = -1.0;
+    double draft_send_time = -1.0;
 
     MSGPACK_DEFINE(
         request_id, spec_cnt, action, spec_type, draft_token_ids,
         input_ids, output_ids, num_draft_tokens, sampling_params,
-        grammar, target_send_time, draft_logprobs, draft_receive_time,
-        draft_send_time
+        grammar, target_send_time, target_recv_time, draft_logprobs,
+        draft_recv_time, draft_send_time
     );
 };
 
@@ -198,11 +199,12 @@ inline RemoteSpecRequest from_py_dict(const py::dict& d) {
         r.sampling_params = sampling_params_from_py_dict(d["sampling_params"].cast<py::dict>());
     }
 
-    if (d.contains("grammar")) r.grammar = py::cast<std::string>(d["grammar"]);
-    if (d.contains("target_send_time")) r.target_send_time = py::cast<double>(d["target_send_time"]);
-    if (d.contains("draft_logprobs")) r.draft_logprobs = py::cast<std::vector<float>>(d["draft_logprobs"]);
-    if (d.contains("draft_receive_time")) r.draft_receive_time = py::cast<double>(d["draft_receive_time"]);
-    if (d.contains("draft_send_time")) r.draft_send_time = py::cast<double>(d["draft_send_time"]);
+    if (d.contains("grammar") && !d["grammar"].is_none()) r.grammar = py::cast<std::string>(d["grammar"]);
+    if (d.contains("target_send_time") && !d["target_send_time"].is_none()) r.target_send_time = py::cast<double>(d["target_send_time"]);
+    if (d.contains("target_recv_time") && !d["target_recv_time"].is_none()) r.target_recv_time = py::cast<double>(d["target_recv_time"]);
+    if (d.contains("draft_logprobs") && !d["draft_logprobs"].is_none()) r.draft_logprobs = py::cast<std::vector<float>>(d["draft_logprobs"]);
+    if (d.contains("draft_recv_time") && !d["draft_recv_time"].is_none()) r.draft_recv_time = py::cast<double>(d["draft_recv_time"]);
+    if (d.contains("draft_send_time") && !d["draft_send_time"].is_none()) r.draft_send_time = py::cast<double>(d["draft_send_time"]);
 
     return r;
 }
@@ -258,10 +260,11 @@ inline py::dict to_py_dict(const RemoteSpecRequest& r) {
     }
 
     set_if_present("grammar", r.grammar);
-    set_if_present("target_send_time", r.target_send_time);
+    d["target_send_time"] = r.target_send_time;
+    d["target_recv_time"] = r.target_recv_time;
     set_if_present("draft_logprobs", r.draft_logprobs);
-    set_if_present("draft_receive_time", r.draft_receive_time);
-    set_if_present("draft_send_time", r.draft_send_time);
+    d["draft_recv_time"] = r.draft_recv_time;
+    d["draft_send_time"] = r.draft_send_time;
 
     return d;
 }

@@ -28,6 +28,10 @@ class RemoteSpecDraftState:
         spec_cnt: Current version number
         req_object: Reference to the Req object
         location: Current location ("waiting_queue" | "running_batch" | "paused" | "finished")
+        target_origin_input_ids: Target's original prompt token ids (never changes for a
+            given request). Stored from the first full message so that subsequent
+            incremental messages (input_ids=None) can reconstruct target_fill_ids
+            without retransmitting the prompt.
         last_prefix_length: Previous prefix length
         last_output_length: Previous output length
         last_updated_time: Last update timestamp
@@ -38,6 +42,8 @@ class RemoteSpecDraftState:
     spec_cnt: int
     req_object: Optional["Req"]
     location: str = "waiting_queue"  # "waiting_queue" | "running_batch" | "paused" | "finished"
+    
+    target_origin_input_ids: Optional[List[int]] = None
     
     # For verifying continuity
     last_prefix_length: int = 0

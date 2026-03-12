@@ -3,12 +3,13 @@ import threading
 import uuid
 import argparse
 import remote_spec_zmq as rsz
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, field
 from typing import Optional, List
 from enum import Enum
 from random import randint
 
 ADDR = "tcp://127.0.0.1:9122"
+POLL_IDLE_SLEEP_S = 0.0002
 
 # =====================================================
 # 枚举定义
@@ -39,10 +40,29 @@ class RemoteSpecRequest:
     num_draft_tokens: int = 0
     sampling_params: Optional[dict] = None
     grammar: Optional[str] = None
-    target_send_time: Optional[float] = None
+    target_send_time: float = -1.0
+    target_recv_time: float = -1.0
+    draft_recv_time: float = -1.0
+    draft_send_time: float = -1.0
 
     def to_dict(self):
-        return asdict(self)
+        # 手工构造 dict，避免 asdict 对大 list 做递归深拷贝
+        return {
+            "request_id": self.request_id,
+            "spec_cnt": self.spec_cnt,
+            "action": self.action,
+            "spec_type": self.spec_type,
+            "input_ids": self.input_ids,
+            "output_ids": self.output_ids,
+            "draft_token_ids": self.draft_token_ids,
+            "num_draft_tokens": self.num_draft_tokens,
+            "sampling_params": self.sampling_params,
+            "grammar": self.grammar,
+            "target_send_time": self.target_send_time,
+            "target_recv_time": self.target_recv_time,
+            "draft_recv_time": self.draft_recv_time,
+            "draft_send_time": self.draft_send_time,
+        }
 
 # =====================================================
 # Dealer 逻辑
@@ -52,34 +72,25 @@ def run_dealer(identity: str, infinite_loop: bool = False):
     dealer.start()
     def sender():
         i = 0
-        while True:
+        for i in range(300):
             req = RemoteSpecRequest(
                 request_id=str(uuid.uuid4()),
                 spec_cnt=i,
                 action=RemoteSpecAction.DRAFT.value,
                 spec_type=SpecType.DRAFT_REQUEST.value,
-                input_ids=[randint(0, 1000) for _ in range(10)],
-                output_ids=[randint(0, 1000) for _ in range(10)],
-                draft_token_ids=[randint(0, 1000) for _ in range(20)],
+                input_ids=[randint(0, 1000) for _ in range(200)],
+                output_ids=[randint(0, 1000) for _ in range(200)],
+                draft_token_ids=[randint(0, 1000) for _ in range(200)],
                 num_draft_tokens=20,
                 sampling_params={"top_p": 0.9, "temperature": 1.0},
                 grammar="example_grammar",
-                target_send_time=time.time()
             )
-            dealer.send_objs([req.to_dict()])
-            dealer.send_obj(req.to_dict())
-            # dealer.send_heartbeat()
-            # dealer.reconnect(
-            # dealer.stop()
-            # dealer.start()
-            # time.sleep(1)
-            # dealer = rsz.DealerEndpoint(identity, ADDR, identity=identity, bind=False)
-            # dealer.start()
-            # dealer.send_heartbeat()
-    
-            print(f"DEALER SEND:{i=}")
+            payload = req.to_dict()
+            batch_size = random.randint(32, 33)
+            dealer.send_objs([payload] * batch_size)
+            print(f"DEALER SEND:{i=}-{batch_size=}")
             i += 1
-            time.sleep(0.01)
+            # time.sleep(1)
             if not infinite_loop and i >= 20:  # 默认固定发送 20 条
                 break
 
@@ -88,12 +99,14 @@ def run_dealer(identity: str, infinite_loop: bool = False):
         while True:
             msgs = dealer.get_received_objs()
             if msgs:
-                print(f"DEALER RECV {i=}")
-                i+=1
-            for msg in msgs:
-                # print(f"[{identity}] recv {msg}")
-                pass
-            time.sleep(0.01)
+                print(f"DEALER RECV {i=}-{len(msgs)=}")
+                i += 1
+                msg = msgs[0]
+                d2t_time = (msg['target_recv_time'] - msg['draft_send_time']) / 1000.0
+                t2d_time = (msg['draft_recv_time'] - msg['target_send_time']) / 1000.0
+                print(f"d2t_time={d2t_time:.3f} ms-t2d_time={t2d_time:.3f} ms-count={len(msgs)}")
+            else:
+                time.sleep(POLL_IDLE_SLEEP_S)
             if not infinite_loop:
                 break
 
@@ -120,13 +133,11 @@ def run_router(infinite_loop: bool = False):
             msgs = router.get_received_objs()
             # msgs = []
             if msgs:
-                i +=1
-                for identity, msg in msgs:
-                    router.send_objs(identity, [msg])
-                    router.send_obj(identity, [msg])
-                    print(f"ROUTER LOOP {i=}")
+                i += 1
+                print(f"ROUTER RECV {len(msgs)=} msgs-{i=}")
+                router.send_objs(msgs[0][0], [msg for _, msg in msgs])
             else:
-                time.sleep(0.001)
+                time.sleep(POLL_IDLE_SLEEP_S)
             if not infinite_loop:
                 break
 

@@ -457,13 +457,13 @@ class Scheduler(
             if self.tp_size == 1 or self.tp_rank == 0:
                 self.zmq_communicator = RemoteSpecZMQCommunicator(config=remote_spec_config)
                 self.zmq_communicator.start()
-                logger.info(
+                logger.debug(
                     "\033[33m ================ ZMQ Communicator Started ================\033[0m"
                 )
-                logger.info(
+                logger.debug(
                     f"\033[33m Endpoint: {self.zmq_communicator.get_endpoint()}\033[0m"
                 )
-                logger.info(
+                logger.debug(
                     "\033[33m ================================================================ \033[0m"
                 )
             else:
