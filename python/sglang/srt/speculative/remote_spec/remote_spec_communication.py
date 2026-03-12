@@ -248,27 +248,10 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             
     def send_obj(self,  request: RemoteSpecRequest,
                         identity: str = "DRAFT" ) -> None:
-        if not self._running:
-            logger.warning(f"Cannot send: communicator not running")
-        try:
-            if self.debug:
-                t1 = time.perf_counter()
+        self.send_objs( [ request ] ,identity)
 
-            if self.config.role == "draft":
-                # ZMQ C++ 端采用 msgpack python 进行打包发送，要求数据格式为 Python 原生数据类型，因此需要将Response 和 Request 转换为 Dict
-                self.zmq_communicator.send_obj(self._process_data(request))
-            else:
-                # target 发送到指定 id 的 draft 端
-                self.zmq_communicator.send_obj(identity,self._process_data(request))
-            
-            if self.debug:
-                t2 = time.perf_counter()
-                logger.debug(f"[ZMQ LOG Python][SEND] msgs num:1, time_us:{(t2-t1)*1e6:.1f}")
-        except Exception as e:
-            logger.error(f"Failed to send: {e}")
-        
     def send_objs(self, requests: List[RemoteSpecRequest],
-                        identity: str = "DRAFT" ) -> None:
+                        identity: str = "DRAFT") -> None:
         
         if not self._running:
             logger.warning(f"Cannot send: communicator not running")
@@ -277,15 +260,21 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
                 t1 = time.perf_counter()
                 
             msgs = [ self._process_data(request) for request in requests ]
+            
+            if self.debug:
+                t2 = time.perf_counter()  
+                t_process = t2 - t1
+                
             if self.config.role == "draft":
                 self.zmq_communicator.send_objs(msgs)
             else:
                 # target 发送到指定 id 的 draft 端
                 self.zmq_communicator.send_objs(identity,msgs)
-            
+                
             if self.debug:
-                t2 = time.perf_counter()
-                logger.debug(f"[ZMQ LOG Python][SEND] msgs nums:{len(msgs)}, time_us:{(t2-t1)*1e6:.1f}")    
+                t3 = time.perf_counter()
+                logger.debug(f"[ZMQ LOG Pyt][SEND] msgs nums:{len(msgs)}, time_us:{(t3-t2)*1e6:.1f}-process time {t_process*1e6:.1f} us")    
+
         except Exception as e:
             logger.error(f"Failed to send: {e}")
         
@@ -297,7 +286,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
                 t1 = time.perf_counter()
             
             received = self.zmq_communicator.get_received_objs()
-            
+                
             # target 端 收到消息 带有 draft 的 id
             if self.config.role == 'target':
                 _msgs = [ msg for _, msg in received ]
@@ -306,8 +295,8 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
 
             if self.debug and _msgs:
                 t2 = time.perf_counter()
-                logger.debug(f"[ZMQ LOG Python][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}")
-                
+                logger.debug(f"[ZMQ LOG Pyt][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}")
+
             if not _msgs:
                 return []
             else:

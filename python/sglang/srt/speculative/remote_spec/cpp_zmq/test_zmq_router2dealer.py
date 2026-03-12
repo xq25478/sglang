@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 from enum import Enum
 from random import randint
+import random
 
 ADDR = "tcp://127.0.0.1:9122"
 POLL_IDLE_SLEEP_S = 0.0002
@@ -20,10 +21,12 @@ class RemoteSpecAction(Enum):
     ABORT = 'abort'
     REJECT = 'reject'
 
+
 class SpecType(Enum):
     NORMAL = 'normal'
     DRAFT_REQUEST = 'draft_request'
     DRAFT_RESPONSE = 'draft_response'
+
 
 # =====================================================
 # 测试用结构体
@@ -64,12 +67,14 @@ class RemoteSpecRequest:
             "draft_send_time": self.draft_send_time,
         }
 
+
 # =====================================================
 # Dealer 逻辑
 # =====================================================
 def run_dealer(identity: str, infinite_loop: bool = False):
-    dealer = rsz.DealerEndpoint(ADDR, identity,False)
+    dealer = rsz.DealerEndpoint(ADDR, identity, False)
     dealer.start()
+
     def sender():
         i = 0
         for i in range(300):
@@ -120,18 +125,18 @@ def run_dealer(identity: str, infinite_loop: bool = False):
     dealer.stop()
     print(f"[Dealer {identity}] finished.")
 
+
 # =====================================================
 # Router 逻辑
 # =====================================================
 def run_router(infinite_loop: bool = False):
-    router = rsz.RouterEndpoint(ADDR,True)
+    router = rsz.RouterEndpoint(ADDR, True)
     router.start()
 
     def router_loop():
         i = 0
         while True:
             msgs = router.get_received_objs()
-            # msgs = []
             if msgs:
                 i += 1
                 print(f"ROUTER RECV {len(msgs)=} msgs-{i=}")
@@ -147,6 +152,7 @@ def run_router(infinite_loop: bool = False):
     router.stop()
     print("[Router] finished.")
 
+
 # =====================================================
 # CLI 入口
 # =====================================================
@@ -159,5 +165,5 @@ if __name__ == "__main__":
     if args.role == "r":
         run_router(infinite_loop=args.infinite)
     elif args.role == "d":
-        identity = f"draft-123445"
+        identity = "draft-123445"
         run_dealer(identity, infinite_loop=args.infinite)

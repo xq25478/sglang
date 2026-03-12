@@ -6,6 +6,7 @@
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <queue>
 #include <iostream>
 #include <unordered_map>
@@ -14,8 +15,12 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <cstdio>
+#include <iomanip>
 #include <stdexcept>
 #include <memory>
+#include <sstream>
 #include <tuple>
 #include <msgpack.hpp>
 
@@ -34,12 +39,98 @@ static inline bool remote_spec_debug_enabled() {
     return enabled;
 }
 
+class RemoteSpecAsyncLogger {
+public:
+    static RemoteSpecAsyncLogger& instance() {
+        static RemoteSpecAsyncLogger logger;
+        return logger;
+    }
+
+    void enqueue(std::string msg) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx_);
+            pending_.push_back(std::move(msg));
+        }
+        queue_cv_.notify_one();
+    }
+
+private:
+    RemoteSpecAsyncLogger() : worker_(&RemoteSpecAsyncLogger::run, this) {}
+
+    ~RemoteSpecAsyncLogger() {
+        {
+            std::lock_guard<std::mutex> lock(queue_mtx_);
+            stopping_ = true;
+        }
+        queue_cv_.notify_one();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    void run() {
+        std::deque<std::string> local_queue;
+        std::string batch_output;
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(queue_mtx_);
+                queue_cv_.wait(lock, [this] {
+                    return stopping_ || !pending_.empty();
+                });
+                if (stopping_ && pending_.empty()) break;
+                local_queue.swap(pending_);
+            }
+
+            size_t total_bytes = 0;
+            for (const auto& msg : local_queue) total_bytes += msg.size() + 1;
+            batch_output.clear();
+            batch_output.reserve(total_bytes);
+            for (auto& msg : local_queue) {
+                batch_output.append(msg);
+                batch_output.push_back('\n');
+            }
+            local_queue.clear();
+
+            if (!batch_output.empty()) {
+                std::fwrite(batch_output.data(), 1, batch_output.size(), stdout);
+                std::fflush(stdout);
+            }
+        }
+    }
+
+    std::mutex queue_mtx_;
+    std::condition_variable queue_cv_;
+    std::deque<std::string> pending_;
+    bool stopping_ = false;
+    std::thread worker_;
+};
+
+template <typename... Args>
+static void remote_spec_log(bool enabled, const Args&... args) {
+    if (!enabled) return;
+    auto now = std::chrono::system_clock::now();
+    auto tt = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()) % 1000;
+    std::tm tm_buf;
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &tt);
+#else
+    localtime_r(&tt, &tm_buf);
+#endif
+    std::ostringstream oss;
+    oss << "[" << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
+        << "." << std::setw(3) << std::setfill('0') << ms.count() << "] ";
+    (oss << ... << args);
+    RemoteSpecAsyncLogger::instance().enqueue(oss.str());
+}
+
 template <typename... Args>
 static void remote_spec_debug_log(const Args&... args) {
-    if (!remote_spec_debug_enabled()) return;
-    static std::mutex log_mtx;
-    std::lock_guard<std::mutex> lock(log_mtx);
-    (std::cout << ... << args) << std::endl;
+    remote_spec_log(remote_spec_debug_enabled(), args...);
+}
+
+template <typename... Args>
+static void remote_spec_info_log(const Args&... args) {
+    remote_spec_log(true, args...);
 }
 
 static inline long long remote_spec_duration_us(
@@ -590,7 +681,7 @@ public:
         endpoint_monitor_thread_ = thread(&AsyncZmqEndpointCRTP::endpoint_monitor_loop, this);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-        cout << "[ZMQ " << endpoint_type << " Start!] addr:" << addr_ << endl;
+        remote_spec_info_log("[ZMQ ", endpoint_type, " Start!] addr:", addr_);
     }
 
     void stop() {
@@ -609,7 +700,7 @@ public:
             sock_.close();
             internal_ctx_.close();
         } catch (...) {}
-        cout << "[ZMQ " << endpoint_type << " Stop!] addr:" << addr_ << endl;
+        remote_spec_info_log("[ZMQ ", endpoint_type, " Stop!] addr:", addr_);
     }
 
     void enqueue_send_raw(RawSendT&& obj) {
@@ -714,7 +805,7 @@ protected:
 
     void handle_error(const zmq::error_t& e) {
         if (running_) {
-            cout << "[ZMQ Error] " << addr_ << ": " << e.what() << endl;
+            remote_spec_info_log("[ZMQ Error] ", addr_, ": ", e.what());
             auto err = e.num();
             if (err == ECONNRESET || err == ECONNREFUSED || err == ENETDOWN ||
                 err == ENETUNREACH || err == EHOSTUNREACH || err == ETIMEDOUT) {
@@ -724,7 +815,7 @@ protected:
     }
 
     void reconnect() {
-        cout << "[ZMQ Reconnecting] " << addr_ << endl;
+        remote_spec_info_log("[ZMQ Reconnecting] ", addr_);
         sock_.close();
         sock_ = zmq::socket_t(internal_ctx_, sock_type_tag);
         static_cast<Derived*>(this)->do_setup_socket();
@@ -807,14 +898,14 @@ public:
                 TimestampedObj<RequestBatchHandle> discarded;
                 if (python_ready_queue_.pop(discarded, 0)) {
                     if ( remote_spec_debug_enabled() ) {
-                        cout << "[ZMQ LOG C++][Monitor] " << endpoint_type << " 接收打包数据超时未被处理，已丢弃！" << endl;
+                        remote_spec_debug_log("[ZMQ LOG C++][Monitor] ", endpoint_type, " 接收打包数据超时未被处理，已丢弃！");
                     }
                 }
             }
         }
         send_heartbeat();
         if ( remote_spec_debug_enabled() ) {
-            cout << "[ZMQ LOG C++] " << identity_ << " 发送心跳信号到 " << addr_ << endl;
+            remote_spec_debug_log("[ZMQ LOG C++] ", identity_, " 发送心跳信号到 ", addr_);
         }
     }
 
@@ -843,7 +934,7 @@ public:
             bool ok = unpack_remote_spec_batch_payload(batch_unpacker_, raw.payload.data(), raw.payload.size(), *reqs);
             std::chrono::steady_clock::time_point unpack_end = std::chrono::steady_clock::now();
             if (!ok) {
-                if ( remote_spec_debug_enabled() ) cerr << "[Dealer Unpack Error]: incomplete batch payload" << endl;
+                remote_spec_debug_log("[Dealer Unpack Error]: incomplete batch payload");
                 return;
             }
             remote_spec_debug_log(
@@ -854,7 +945,7 @@ public:
             // recv + unpack
             python_ready_queue_.push({std::move(reqs), chrono::steady_clock::now()});
         } catch (const std::exception& e) {
-            if ( remote_spec_debug_enabled() ) cerr << "[Dealer Unpack Error]: " << e.what() << endl;
+            remote_spec_debug_log("[Dealer Unpack Error]: ", e.what());
         }
     }
 
@@ -914,7 +1005,7 @@ public:
             while (python_ready_queue_.peek_and_check_timeout(PYTHON_READY_QUEUE_TIMEOUT_MS)) {
                 TimestampedObj<pair<string, RequestBatchHandle>> discarded;
                 if (python_ready_queue_.pop(discarded, 0)) {
-                    if ( remote_spec_debug_enabled() ) cout << "[ZMQ LOG C++][Monitor] " << endpoint_type << " 接收打包数据超时未被处理，已丢弃！" << endl;
+                    if ( remote_spec_debug_enabled() ) remote_spec_debug_log("[ZMQ LOG C++][Monitor] ", endpoint_type, " 接收打包数据超时未被处理，已丢弃！");
                 }
             }
         }
@@ -923,7 +1014,7 @@ public:
         auto it = registered_dealers_.begin();
         while (it != registered_dealers_.end()) {
             if (chrono::duration_cast<chrono::milliseconds>(now - it->second).count() > DEALER_HEARTBEAT_TIMEOUT_MS) {
-                if ( remote_spec_debug_enabled() ) cout << "[ZMQ LOG C++] " << it->first << " 心跳信号超时，剔除!" << endl;
+                if ( remote_spec_debug_enabled() ) remote_spec_debug_log("[ZMQ LOG C++] ", it->first, " 心跳信号超时，剔除!");
                 it = registered_dealers_.erase(it);
             } else ++it;
         }
@@ -939,7 +1030,7 @@ public:
         if (is_heartbeat_payload(payload)) {
             lock_guard<mutex> lk(reg_mtx_);
             registered_dealers_[id] = chrono::steady_clock::now();
-            if ( remote_spec_debug_enabled() ) cout << "[ZMQ LOG C++]" << addr_ << " 收到心跳信号，来自 " << id << endl;
+            if ( remote_spec_debug_enabled() ) remote_spec_debug_log("[ZMQ LOG C++] ", addr_, " 收到心跳信号，来自 ", id);
         } else {
             RouterRawBuffer raw;
             raw.id = std::move(id);
@@ -966,7 +1057,7 @@ public:
             bool ok = unpack_remote_spec_batch_payload(batch_unpacker_, raw.payload.data(), raw.payload.size(), *reqs);
             std::chrono::steady_clock::time_point unpack_end = std::chrono::steady_clock::now();
             if (!ok) {
-                if ( remote_spec_debug_enabled() ) cerr << "[Router Unpack Error]: incomplete batch payload" << endl;
+                remote_spec_debug_log("[Router Unpack Error]: incomplete batch payload");
                 return;
             }
             remote_spec_debug_log(
@@ -976,7 +1067,7 @@ public:
             stamp_request_batch(*reqs, &RemoteSpecRequest::target_recv_time);
             python_ready_queue_.push({{std::move(raw.id), std::move(reqs)}, chrono::steady_clock::now()});
         } catch (const std::exception& e) {
-            if ( remote_spec_debug_enabled() ) cerr << "[Router Unpack Error]: " << e.what() << endl;
+            remote_spec_debug_log("[Router Unpack Error]: ", e.what());
         }
     }
 
