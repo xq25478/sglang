@@ -725,15 +725,22 @@ class CudaGraphRunner:
     def _get_actual_ntpb(self, forward_batch: ForwardBatch) -> int:
         """Get the actual num_tokens_per_bs from forward_batch for RemoteSpec.
 
-        For RemoteSpec, this reads ``draft_token_num`` from ``spec_info``.
-        For other algorithms, falls back to ``self.num_tokens_per_bs``.
+        Three cases for RemoteSpec:
+        - spec_info present          → TARGET_VERIFY graph; ntpb = spec_info.draft_token_num
+        - spec_info=None, DECODE     → plain DECODE graph (ntpb=1 slot);
+                                        _forward_normal_decode sets this mode
+        - other algorithms           → self.num_tokens_per_bs
         """
-        if _is_remote_spec(self) and forward_batch.spec_info is not None:
-            return getattr(
-                forward_batch.spec_info,
-                "draft_token_num",
-                self.num_tokens_per_bs,
-            )
+        if _is_remote_spec(self):
+            if forward_batch.spec_info is not None:
+                return getattr(
+                    forward_batch.spec_info,
+                    "draft_token_num",
+                    self.num_tokens_per_bs,
+                )
+            if forward_batch.forward_mode == ForwardMode.DECODE:
+                # _forward_normal_decode fallback: 1 token per request, no spec tree
+                return 1
         return self.num_tokens_per_bs
 
     def can_run(self, forward_batch: ForwardBatch):
@@ -765,14 +772,20 @@ class CudaGraphRunner:
             else cuda_graph_bs <= self.max_bs
         )
 
-        # For RemoteSpec, verify the ntpb is one we captured AND the forward
-        # mode matches the capture mode (TARGET_VERIFY). This prevents the
-        # verify-captured graph from being used for DECODE forward batches.
+        # For RemoteSpec, two valid graph types exist:
+        #   - TARGET_VERIFY (ntpb>1, spec_info present): normal spec-decode path
+        #   - DECODE        (ntpb=1, spec_info=None):    _forward_normal_decode fallback
+        # The forward_mode must match the mode used at capture time.
         if _is_remote_spec(self):
+            expected_forward_mode = (
+                ForwardMode.DECODE
+                if actual_ntpb == 1 and forward_batch.spec_info is None
+                else self.capture_forward_mode
+            )
             is_bs_supported = (
                 is_bs_supported
                 and actual_ntpb in self.remote_ntpb_options
-                and forward_batch.forward_mode == self.capture_forward_mode
+                and forward_batch.forward_mode == expected_forward_mode
             )
 
         if self.require_mlp_sync:
@@ -1052,6 +1065,16 @@ class CudaGraphRunner:
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
             )
 
+        # For RemoteSpec ntpb=1, get_spec_info returns None and we capture in
+        # plain DECODE mode so that _forward_normal_decode (which sets
+        # forward_mode=DECODE / spec_info=None) can reuse this graph.
+        # For ntpb>1, spec_info is an EagleVerifyInput and we use TARGET_VERIFY.
+        effective_forward_mode = (
+            ForwardMode.DECODE
+            if _is_remote_spec(self) and spec_info is None and ntpb == 1
+            else self.capture_forward_mode
+        )
+
         if self.model_runner.server_args.enable_lora:
             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
@@ -1078,7 +1101,7 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
         forward_batch = ForwardBatch(
-            forward_mode=self.capture_forward_mode,
+            forward_mode=effective_forward_mode,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -1106,7 +1129,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
-            global_forward_mode=self.capture_forward_mode,
+            global_forward_mode=effective_forward_mode,
             lora_ids=lora_ids,
         )
 
@@ -1130,8 +1153,8 @@ class CudaGraphRunner:
             req_pool_indices,
             seq_lens,
             encoder_lens,
-            forward_batch.forward_mode,
-            forward_batch.spec_info,
+            effective_forward_mode,
+            spec_info,
         )
 
         # For RemoteSpec multi-ntpb: keep references to the attention metadata
@@ -1237,8 +1260,13 @@ class CudaGraphRunner:
             capture_hidden_mode_required_for_returning_hidden_states,
         )
 
-        # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
-        if self.capture_hidden_mode != required_capture_hidden_mode:
+        # Recapture only when an UPGRADE is needed.
+        # CaptureHiddenMode is an IntEnum: NULL=0 < LAST=1 < FULL=2.
+        # A higher mode already satisfies lower requirements
+        # (FULL ⊇ LAST ⊇ NULL), so never downgrade — this prevents
+        # _forward_normal_decode (required=NULL) from clobbering a FULL
+        # capture that spec-verify still needs.
+        if required_capture_hidden_mode > self.capture_hidden_mode:
             self.capture_hidden_mode = required_capture_hidden_mode
             self.capture()
 
@@ -1302,13 +1330,21 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
+        # For RemoteSpec ntpb=1 (DECODE fallback), the graph was captured in
+        # DECODE mode; replay must use the same mode so attention metadata is
+        # initialised correctly (decode indices, not target-verify indices).
+        effective_replay_mode = (
+            ForwardMode.DECODE
+            if _is_remote_spec(self) and actual_ntpb == 1 and forward_batch.spec_info is None
+            else self.capture_forward_mode
+        )
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
             buffers.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
+            effective_replay_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
@@ -1437,6 +1473,11 @@ class CudaGraphRunner:
                     if ntpb_override is not None
                     else self.num_tokens_per_bs
                 )
+                # ntpb=1 is captured as a plain DECODE forward (no verify tree).
+                # _forward_normal_decode sets forward_mode=DECODE / spec_info=None,
+                # so we must capture in the same mode to allow CUDA-graph reuse.
+                if draft_token_num == 1:
+                    return None
                 spec_steps = max(draft_token_num - 1, 1)
                 spec_info = EagleVerifyInput(
                     draft_token=None,

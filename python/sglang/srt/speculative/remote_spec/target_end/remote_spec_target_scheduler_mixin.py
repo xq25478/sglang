@@ -169,10 +169,10 @@ class RemoteSpecTargetSchedulerMixin:
                     else:
                         time.sleep(0.0005)
                 else:
-                    time.sleep(0.005)
+                    time.sleep(0.0005)
             except Exception as e:
                 logger.error(f"[Target][BgRecv] Error: {e}")
-                time.sleep(0.005)
+                time.sleep(0.0005)
 
     def _drain_msg_buffer(self) -> List[RemoteSpecRequest]:
         """Drain all buffered messages and reset Event."""
@@ -220,7 +220,7 @@ class RemoteSpecTargetSchedulerMixin:
                     batch.recv_draft_fn = self._make_recv_draft_fn()
                     batch.retry_fn = self._make_retry_fn()
                     batch.retry_fail_ratio = self.server_args.remote_speculative_retry_fail_ratio
-
+                
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:

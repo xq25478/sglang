@@ -40,6 +40,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import alloc_for_decode
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -136,6 +137,15 @@ class RemoteSpecWorker:
             draft_num_tokens = getattr(
                 batch, "draft_num_tokens", self.speculative_num_draft_tokens
             )
+
+            # When draft_num_tokens=1, skip speculative verify and use normal decode.
+            # TARGET_VERIFY with a single token cannot use CUDA graphs and runs slower
+            # than a standard DECODE forward pass.
+            if draft_num_tokens == 1 and not batch.forward_mode.is_idle():
+                logger.debug(f"\033[31m [Target][forward] use normal decode \033[0m")
+                return self._forward_normal_decode(batch)
+
+            logger.debug(f"\033[31m [Target][forward] use speculative decode, draft_num_tokens: {draft_num_tokens} \033[0m")
             spec_steps = max(draft_num_tokens - 1, 1)
 
             spec_info = self.construct_draft_input(batch, draft_num_tokens, spec_steps)
@@ -206,7 +216,12 @@ class RemoteSpecWorker:
                 req.cur_drafts = []
 
             req.spec_cnt += 1
-            req.len_output_ids = len(req.output_ids)
+            # +1 because process_batch_result_prefill has not yet appended
+            # next_token_ids[i] (T0) to req.output_ids when this function
+            # runs.  _post_verify_update_drafts slices
+            # output_ids[len_output_ids:] to get "tokens added by the verify
+            # kernel", so we must account for that one pending token here.
+            req.len_output_ids = len(req.output_ids) + 1
 
     # ------------------------------------------------------------------
     # Decode: construct -> target forward -> standard verify -> fork-point
@@ -356,13 +371,13 @@ class RemoteSpecWorker:
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         # torch.cuda.synchronize()
-        start_time = time.perf_counter()
+        # start_time = time.perf_counter()
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
         # torch.cuda.synchronize()
-        end_time = time.perf_counter()
-        logger.debug(f"\033[31m [Target][Verify] Target forward took {(end_time - start_time) * 1000} ms \033[0m")
+        # end_time = time.perf_counter()
+        # logger.debug(f"\033[31m [Target][Verify] Target forward took {(end_time - start_time) * 1000} ms \033[0m")
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -503,6 +518,154 @@ class RemoteSpecWorker:
                                 f"got {len(retry_token_ids)} draft tokens after retry \033[0m"
                             )
                     req.spec_cnt += 1
+
+    # ------------------------------------------------------------------
+    # Normal decode fallback (draft_num_tokens == 1)
+    # ------------------------------------------------------------------
+
+    def _forward_normal_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        """Run a standard decode forward when draft_num_tokens==1.
+
+        prepare_for_decode() returns early for speculative algorithms, so we
+        replicate the relevant steps here to set up input_ids, KV-cache
+        allocation, and seq_lens before calling the target worker in plain
+        DECODE mode (no is_verify=True, CUDA-graph eligible).
+        """
+        bs = batch.batch_size()
+
+        # ---- Replicate the non-spec parts of prepare_for_decode ----
+        #
+        # After a verify round, batch.output_ids == verified_id which has
+        # sum(accept_length + 1) elements – ONE entry per accepted/bonus token
+        # across ALL sequences, NOT one per sequence.  Using it directly as
+        # input_ids would produce a size mismatch (e.g. 37 tokens for 16 seqs).
+        #
+        # The correct next-decode input for each seq is the LAST token in
+        # req.output_ids (the bonus token appended by the verify kernel).
+        # This mirrors what prepare_for_decode does for non-spec batches with
+        # enable_overlap=True (see ScheduleBatch.prepare_for_decode).
+        last_token_ids_cpu = [
+            req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+            for req in batch.reqs
+        ]
+        device = batch.seq_lens.device
+
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                torch.tensor(last_token_ids_cpu, dtype=torch.int64, device=device)
+            )
+
+        batch.input_ids = torch.tensor(
+            last_token_ids_cpu, dtype=torch.int32, device=device
+        )
+        batch.output_ids = None
+        batch.forward_mode = ForwardMode.DECODE
+        # Clear stale spec_info from the previous spec round.  If left in
+        # place it propagates through get_model_worker_batch → ForwardBatch and
+        # causes _get_actual_ntpb to return N (wrong) instead of 1, which
+        # makes raw_num_token = batch_size * N and corrupts replay_prepare.
+        batch.spec_info = None
+
+        # Also reset global_num_tokens so that require_mlp_tp_gather logic in
+        # cuda_graph_runner uses the correct per-rank token count (bs, not bs*ntpb
+        # from the previous verify round).  Reset both fields to satisfy the
+        # ForwardBatch.init_new assertion that both are either None or not-None.
+        if batch.global_num_tokens is not None:
+            batch.global_num_tokens = [bs]
+        if batch.global_num_tokens_for_logprob is not None:
+            batch.global_num_tokens_for_logprob = [bs]
+
+        batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
+
+        for req in batch.reqs:
+            req.kv_committed_len += 1
+            req.kv_allocated_len += 1
+
+        batch.seq_lens.add_(1)
+        batch.seq_lens_cpu.add_(1)
+        if batch.orig_seq_lens is not None:
+            batch.orig_seq_lens.add_(1)
+        batch.seq_lens_sum += bs
+
+        # ---- Target forward (normal DECODE, CUDA-graph eligible) ----
+        model_worker_batch = batch.get_model_worker_batch()
+
+        start_time = time.perf_counter()
+        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        end_time = time.perf_counter()
+        # logger.info(
+        #     f"\033[31m [Target][NormalDecode] Target forward took "
+        #     f"{(end_time - start_time) * 1000:.2f} ms \033[0m"
+        # )
+
+        # ---- Receive drafts if the draft side was asked to generate them ----
+        # There are two cases where draft_num_tokens==1:
+        #   (a) recv_draft_fn is None  – target overloaded / circuit-breaker open;
+        #       no draft requests were sent, nothing to receive.
+        #   (b) recv_draft_fn is set   – requests were already sent via
+        #       send_batch_draft_requests but _decide_verify_num_draft_tokens
+        #       returned 1 (rejected / no-draft-ratio).  We must drain the
+        #       responses to avoid ZMQ buffer build-up and to carry forward
+        #       valid drafts for the next spec round.
+        recv_draft_fn = getattr(batch, "recv_draft_fn", None)
+        new_drafts_per_req: dict = {}
+        if recv_draft_fn is not None:
+            new_drafts_per_req = recv_draft_fn(batch)
+
+        # ---- Update per-request state ----
+        # In the spec verify path, the verify kernel appends accepted tokens to
+        # req.output_ids directly.  We do the same here for consistency so that
+        # process_batch_result_decode (which skips the append for spec algos)
+        # sees the correct output_ids.
+        next_token_ids_list = batch_result.next_token_ids.tolist()
+        for i, req in enumerate(batch.reqs):
+            if _is_health_check(req):
+                continue
+            token = next_token_ids_list[i] if i < len(next_token_ids_list) else None
+            if token is not None:
+                req.output_ids.append(token)
+                # Mirror the grammar update that the EAGLE verify kernel does
+                # (eagle_info.py L407-413) for every accepted token.
+                # process_batch_result_decode skips grammar for non-is_none /
+                # non-is_spec_v2 algorithms, so we must do it here.
+                if req.grammar is not None and not req.finished():
+                    try:
+                        req.grammar.accept_token(token)
+                    except ValueError:
+                        logger.error(
+                            f"[NormalDecode] grammar.accept_token failed "
+                            f"for req {req.rid} token {token}"
+                        )
+
+            # Align received drafts against the decode output token, mirroring
+            # the logic in _recv_drafts_after_extend.  This lets us carry
+            # forward valid draft tokens so the very next spec round can skip
+            # re-requesting them.
+            drafts = new_drafts_per_req.get(req.rid) if new_drafts_per_req else None
+            if drafts is not None and token is not None:
+                draft_token_ids, draft_logprobs = drafts
+                if draft_token_ids and draft_token_ids[0] == token:
+                    req.draft_tokens_and_logits = _make_draft_dict(
+                        draft_token_ids[1:], draft_logprobs[1:]
+                    )
+                    req.cur_drafts = list(draft_token_ids[1:])
+                else:
+                    req.draft_tokens_and_logits = _default_draft()
+                    req.cur_drafts = []
+            else:
+                req.draft_tokens_and_logits = _default_draft()
+                req.cur_drafts = []
+
+            req.spec_cnt += 1
+            req.len_output_ids = len(req.output_ids)
+
+        return GenerationBatchResult(
+            logits_output=batch_result.logits_output,
+            next_token_ids=batch_result.next_token_ids,
+            num_accepted_tokens=0,
+            accept_length_per_req_cpu=[1] * bs,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
