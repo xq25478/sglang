@@ -47,7 +47,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from http import HTTPStatus
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -1440,6 +1440,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # If None, falls back to server_args.speculative_num_draft_tokens
     draft_num_tokens: Optional[int] = None
     is_high_overhead: bool = False # False means not high overhead, True means high overhead
+    recv_draft_fn: Optional[Callable] = None
+    retry_fn: Optional[Callable] = None
+    retry_fail_ratio: Optional[float] = None
+    retry_min_count: Optional[int] = None
 
 
     @classmethod

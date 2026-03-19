@@ -519,6 +519,7 @@ class ServerArgs:
     remote_speculative_reject_interval: int = 5000
     remote_speculative_no_draft_ratio: float = 0.5
     remote_speculative_retry_fail_ratio: float = 0.5
+    remote_speculative_retry_min_count: int = 4
     remote_speculative_zmq_addr: Optional[str] = None
     remote_speculative_zmq_port: Optional[str] = None
 
@@ -4941,6 +4942,12 @@ class ServerArgs:
             type=str,
             help="ZMQ port for remote speculative decoding, e.g., '30009'.",
             default="30009",
+        )
+        parser.add_argument(
+            "--remote-speculative-retry-min-count",
+            type=int,
+            default=ServerArgs.remote_speculative_retry_min_count,
+            help="Minimum number of failed requests required to trigger a retry. Default 4.",
         )
 
         # Expert parallelism

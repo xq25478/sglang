@@ -27,11 +27,24 @@ The tree structure is built using `build_tree_kernel_efficient` which generates:
 
 Draft state update uses post-verify token comparison (fork-point), NOT kernel
 extension.  After the standard EAGLE verify kernel produces accepted tokens +
-bonus, we compare [cur_drafts + d3] against [verified_tokens] to decide
+bonus, we compare [cur_drafts + d0_new] against [verified_tokens] to decide
 whether the new draft path is still valid.
+
+Pipeline semantics
+------------------
+Each decode round:
+  1. send_batch_draft_requests: send (output_ids, cur_drafts) to Draft,
+     cur_drafts = tree for THIS round (positions pos+1 .. pos+k).
+  2. GPU verify with cur_drafts as tree.
+  3. recv_drafts_for_batch: Draft returns [d0_new, d1_new, ...] where
+     d0_new predicts the bonus position (pos+k+1).
+  4. Fork-point: if [cur_drafts + d0_new] fully matches verified_tokens,
+     carry forward [d1_new, ...] for next round (pipelined path).
+     Otherwise clear cur_drafts and call retry_drafts_for_reqs.
 """
 
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -64,7 +77,7 @@ _DEFAULT_DRAFT = {
     "draft_tokens": torch.tensor([0], dtype=torch.int64, device="cpu"),
     "draft_logprobs": torch.tensor([0.0], dtype=torch.float32, device="cpu"),
 }
-import time
+
 
 class RemoteSpecWorker:
     """Remote Speculative Decoding Worker.
@@ -110,22 +123,31 @@ class RemoteSpecWorker:
 
         self._cached_tree_structures: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     @property
     def draft_model_runner(self):
         return None
 
+    
+    # =========================================================================
+    # forward
+    # =========================================================================
     def forward_batch_generation(
         self, batch: ScheduleBatch
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            start_time = time.perf_counter()
+            if logger.isEnabledFor(logging.DEBUG):
+                start_time = time.perf_counter()
+
             logits_output, next_token_ids, _ = self.forward_target_extend(batch)
-            end_time = time.perf_counter()
-            logger.debug(f"\033[31m [Target][Extend] Target forward took {(end_time - start_time) * 1000} ms \033[0m")
+
+            if logger.isEnabledFor(logging.DEBUG):
+                torch.cuda.synchronize()
+                logger.debug(
+                    f"\033[36m [Target][Extend] forward took "
+                    f"{(time.perf_counter() - start_time) * 1000:.1f} ms \033[0m"
+                )
+            
             self._recv_drafts_after_extend(batch, next_token_ids)
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -142,31 +164,64 @@ class RemoteSpecWorker:
             # TARGET_VERIFY with a single token cannot use CUDA graphs and runs slower
             # than a standard DECODE forward pass.
             if draft_num_tokens == 1 and not batch.forward_mode.is_idle():
-                logger.debug(f"\033[31m [Target][forward] use normal decode \033[0m")
-                return self._forward_normal_decode(batch)
+                logger.debug("\033[36m [Target][forward] use normal decode \033[0m")
+                
+                if logger.isEnabledFor(logging.DEBUG):
+                    start_time = time.perf_counter()
 
-            logger.debug(f"\033[31m [Target][forward] use speculative decode, draft_num_tokens: {draft_num_tokens} \033[0m")
+                batch_result = self._forward_normal_decode(batch)
+
+                if logger.isEnabledFor(logging.DEBUG):
+                    torch.cuda.synchronize()
+                    logger.debug(
+                        f"\033[36m [Target][forward] normal decode took "
+                        f"{(time.perf_counter() - start_time) * 1000:.1f} ms \033[0m"
+                    )
+                
+                return batch_result
+
+            logger.debug(
+                f"\033[36m [Target][forward] speculative decode, "
+                f"draft_num_tokens={draft_num_tokens} \033[0m"
+            )
             spec_steps = max(draft_num_tokens - 1, 1)
-
             spec_info = self.construct_draft_input(batch, draft_num_tokens, spec_steps)
+
             recv_draft_fn = getattr(batch, "recv_draft_fn", None)
             retry_fn = getattr(batch, "retry_fn", None)
             retry_fail_ratio = getattr(batch, "retry_fail_ratio", 0.0)
+            retry_min_count = getattr(batch, "retry_min_count", 4)
+
+            if logger.isEnabledFor(logging.DEBUG):
+                start_time = time.perf_counter()
+
             logits_output, verify_output, _, can_run_cuda_graph = self.verify(
-                batch, spec_info, recv_draft_fn=recv_draft_fn, retry_fn=retry_fn,
+                batch,
+                spec_info,
+                recv_draft_fn=recv_draft_fn,
+                retry_fn=retry_fn,
                 retry_fail_ratio=retry_fail_ratio,
+                retry_min_count=retry_min_count,
             )
-            accept_stats = []
-            for req, accept_len in zip(
-                batch.reqs, verify_output.accept_length_per_req_cpu
-            ):
-                if _is_health_check(req):
-                    continue
-                accept_stats.append(f"{req.rid} (accepted_tokens={accept_len})")
-            logger.debug(
-                f"\033[33m [Target][Verify] batch_accept_stats="
-                f"[{', '.join(accept_stats)}] \033[0m"
-            )
+
+            if logger.isEnabledFor(logging.DEBUG):
+                torch.cuda.synchronize()
+                logger.debug(
+                    f"\033[36m [Target][forward] verify took "
+                    f"{(time.perf_counter() - start_time) * 1000:.1f} ms \033[0m"
+                )
+             
+                accept_stats = []
+                for req, accept_len in zip(
+                    batch.reqs, verify_output.accept_length_per_req_cpu
+                ):
+                    if _is_health_check(req):
+                        continue
+                    accept_stats.append(f"{req.rid} (accepted_tokens={accept_len})")
+                logger.debug(
+                    f"\033[36m [Target][Verify] batch_accept_stats="
+                    f"[{', '.join(accept_stats)}] \033[0m"
+                )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
@@ -175,9 +230,9 @@ class RemoteSpecWorker:
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # Extend (prefill)
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def forward_target_extend(
         self, batch: ScheduleBatch
@@ -194,11 +249,11 @@ class RemoteSpecWorker:
     def _recv_drafts_after_extend(
         self, batch: ScheduleBatch, next_token_ids: torch.Tensor
     ):
-        """Receive draft responses after prefill and store for the first decode.
+        """Receive draft responses after prefill and update per-req draft state.
 
         Compare target's T0 vs draft's d0:
-          - Match  -> store [d1, d2, ...] for the next decode iteration.
-          - Mismatch -> discard all (draft path diverged).
+          - Match  -> store [d1, d2, ...] as cur_drafts for the first decode round.
+          - Mismatch -> discard all (draft path diverged at the very first token).
         """
         recv_draft_fn = getattr(batch, "recv_draft_fn", None)
         if recv_draft_fn is None:
@@ -210,33 +265,23 @@ class RemoteSpecWorker:
         for i, req in enumerate(batch.reqs):
             if _is_health_check(req):
                 continue
-
-            drafts = new_drafts.get(req.rid) if new_drafts else None
-            if drafts is not None and i < len(target_tokens):
-                draft_token_ids, draft_logprobs = drafts
-                if draft_token_ids and draft_token_ids[0] == target_tokens[i]:
-                    req.draft_tokens_and_logits = _make_draft_dict(
-                        draft_token_ids[1:], draft_logprobs[1:]
-                    )
-                    req.cur_drafts = list(draft_token_ids[1:])
-                else:
-                    req.draft_tokens_and_logits = _default_draft()
-                    req.cur_drafts = []
+            token = target_tokens[i] if i < len(target_tokens) else None
+            if token is not None:
+                _apply_drafts_to_req(req, token, new_drafts.get(req.rid), skip_d0=True)
             else:
-                req.draft_tokens_and_logits = _default_draft()
                 req.cur_drafts = []
+                req.draft_tokens_and_logits = _default_draft()
 
             req.spec_cnt += 1
-            # +1 because process_batch_result_prefill has not yet appended
-            # next_token_ids[i] (T0) to req.output_ids when this function
-            # runs.  _post_verify_update_drafts slices
-            # output_ids[len_output_ids:] to get "tokens added by the verify
+            # +1 because process_batch_result_prefill has not yet appended T0 to
+            # req.output_ids when this function runs.  _post_verify_update_drafts
+            # slices output_ids[len_output_ids:] to get "tokens added by the verify
             # kernel", so we must account for that one pending token here.
             req.len_output_ids = len(req.output_ids) + 1
 
-    # ------------------------------------------------------------------
-    # Decode: construct -> target forward -> standard verify -> fork-point
-    # ------------------------------------------------------------------
+    # =========================================================================
+    # Decode: construct -> target forward -> verify -> fork-point
+    # =========================================================================
 
     def construct_draft_input(
         self,
@@ -332,7 +377,6 @@ class RemoteSpecWorker:
             spec_steps=spec_steps,
             num_verify_tokens=num_draft_tokens,
         )
-        # logger.info(f"{tree_mask=}")
 
         return EagleVerifyInput(
             draft_token=final_draft_tokens,
@@ -357,6 +401,7 @@ class RemoteSpecWorker:
         recv_draft_fn=None,
         retry_fn=None,
         retry_fail_ratio: float = 0.0,
+        retry_min_count: int = 4,
     ):
         """Target forward -> recv new drafts -> standard verify -> fork-point update.
 
@@ -366,7 +411,7 @@ class RemoteSpecWorker:
         """
 
         # ---------- prepare & target forward ----------
-        seq_lens_pre_verify = batch.seq_lens.clone()
+        # seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_batch = spec_info.spec_steps + 1
         batch.return_hidden_states = False
@@ -382,14 +427,9 @@ class RemoteSpecWorker:
         )
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
-        # torch.cuda.synchronize()
-        # start_time = time.perf_counter()
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True
         )
-        # torch.cuda.synchronize()
-        # end_time = time.perf_counter()
-        # logger.debug(f"\033[31m [Target][Verify] Target forward took {(end_time - start_time) * 1000} ms \033[0m")
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -417,8 +457,12 @@ class RemoteSpecWorker:
 
         # ---------- post-verify: fork-point draft state update ----------
         self._post_verify_update_drafts(
-            batch, res, new_drafts_per_req, retry_fn=retry_fn,
+            batch,
+            res,
+            new_drafts_per_req,
+            retry_fn=retry_fn,
             retry_fail_ratio=retry_fail_ratio,
+            retry_min_count=retry_min_count,
         )
 
         # ---------- post-process ----------
@@ -437,9 +481,9 @@ class RemoteSpecWorker:
 
         return logits_output, res, model_worker_batch, can_run_cuda_graph
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # Post-verify draft state update (fork-point comparison)
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def _post_verify_update_drafts(
         self,
@@ -448,21 +492,29 @@ class RemoteSpecWorker:
         new_drafts_per_req: dict,
         retry_fn=None,
         retry_fail_ratio: float = 0.0,
+        retry_min_count: int = 4,
     ):
-        """Compare verified output tokens with [cur_drafts + d3] to update draft state.
+        """Compare verified output tokens with [cur_drafts + d0_new] to update draft state.
 
         For each request:
-        1. verified_tokens = output_ids[len_output_ids:]  (tokens added by verify kernel)
-        2. cur_draft_tokens = req.cur_drafts              (drafts used in this verify)
-        3. Append d3 = new_draft_token_ids[0] to cur_draft_tokens
-        4. Find fork-point between verified_tokens and cur_draft_tokens
-        5. If fully matched: carry forward new_draft_token_ids[1:]
-           If mismatched: clear drafts, mark as failed for retry
+          1. verified_tokens = output_ids[len_output_ids:]   (tokens added by verify kernel)
+          2. cur_draft_tokens = req.cur_drafts + [d0_new]    (old tree + Draft's bonus prediction)
+          3. Fork-point: if all verified_tokens match cur_draft_tokens -> pipelined path
+                         otherwise -> retry path
 
-        For requests that fail (mismatch or no draft received), if retry_fn is
-        provided, re-send those requests to the draft side and receive fresh drafts.
-        Since cur_drafts=[] for the retry, the draft returns [d0, d1, ...] starting
-        directly from the next position after output_ids[-1]; all tokens are stored.
+        Pipelined path (is_matched=True):
+          d0_new was Draft's prediction for the bonus position and it was correct.
+          Carry forward d1_new, d2_new, ... as cur_drafts for the next verify round.
+
+        Retry path (is_matched=False or no draft received):
+          Clear cur_drafts; if retry_fn is set and failed ratio exceeds threshold,
+          re-request fresh drafts from Draft.  Those drafts are rooted at
+          output_ids[-1] so they are stored directly (skip_d0=False).
+
+        spec_cnt contract:
+          - First  += 1: regular verify round (counts send_batch_draft_requests call)
+          - Second += 1: retry round (counts retry_drafts_for_reqs call)
+          Both are intentional: spec_cnt counts total draft generation requests sent.
         """
         failed_reqs: List = []
 
@@ -477,66 +529,68 @@ class RemoteSpecWorker:
                 verified_tokens = req.output_ids[req.len_output_ids:]
                 cur_draft_tokens = list(getattr(req, "cur_drafts", []))
                 cur_draft_tokens.append(draft_token_ids[0])
-                logger.debug(f"\033[32m [Worker][Verify] req-{req.rid}: "
+
+                logger.debug(f"\033[36m [Worker][Verify] req-{req.rid}: "
                             f"verified={verified_tokens}, cur_drafts={cur_draft_tokens} \033[0m")
 
                 is_matched, matched_idx = _find_fork_point(
                     verified_tokens, cur_draft_tokens
                 )
-                num_draft = len(cur_draft_tokens)
-                req.draft_cnt += num_draft
+                req.draft_cnt += len(cur_draft_tokens)
                 req.accept_cnt += matched_idx
 
                 if is_matched:
+                    # Pipelined path: carry forward d1_new, d2_new, ...
+                    req.cur_drafts = list(draft_token_ids[1:])
                     req.draft_tokens_and_logits = _make_draft_dict(
                         draft_token_ids[1:], draft_logprobs[1:]
                     )
-                    req.cur_drafts = list(draft_token_ids[1:])
                 else:
-                    req.draft_tokens_and_logits = _default_draft()
                     req.cur_drafts = []
+                    req.draft_tokens_and_logits = _default_draft()
                     failed_reqs.append(req)
             else:
-                req.draft_tokens_and_logits = _default_draft()
                 req.cur_drafts = []
+                req.draft_tokens_and_logits = _default_draft()
                 failed_reqs.append(req)
 
+            # First spec_cnt increment: counts the regular send_batch_draft_requests call.
             req.spec_cnt += 1
             req.len_output_ids = len(req.output_ids)
 
-        # Retry: re-request fresh drafts for diverged/no-draft requests.
-        # spec_cnt has already been incremented above, so the retry uses the
-        # next-round spec_cnt and won't conflict with the just-processed round.
-        # The draft returns [d0, d1, ...] rooted at len(output_ids), so all
-        # tokens are stored directly (no [1:] skip, unlike the matched path).
-        # Only retry when failed ratio exceeds retry_fail_ratio threshold.
+        # Retry: re-request fresh drafts for diverged / no-draft requests.
+        # spec_cnt has already been incremented to N+1 above.  retry_drafts_for_reqs
+        # sends another draft generation request using N+1, so we increment again
+        # to N+2 after it returns.  Both increments together count the two separate
+        # draft generation requests issued within this decode step.
         bsz = sum(1 for req in batch.reqs if not _is_health_check(req))
         should_retry = (
             retry_fn is not None
             and failed_reqs
-            and (bsz == 0 or len(failed_reqs) / bsz > retry_fail_ratio)
+            and bsz > 0
+            and bsz > retry_min_count
+            and len(failed_reqs) / bsz > retry_fail_ratio
         )
         if should_retry:
             retry_drafts = retry_fn(failed_reqs)
-            if retry_drafts:
-                for req in failed_reqs:
-                    drafts = retry_drafts.get(req.rid)
-                    if drafts is not None:
-                        retry_token_ids, retry_logprobs = drafts
-                        if retry_token_ids:
-                            req.draft_tokens_and_logits = _make_draft_dict(
-                                retry_token_ids, retry_logprobs
+            for req in failed_reqs:
+                # Retry path: Draft generated from output_ids[-1], store all directly.
+                _apply_drafts_to_req(
+                    req,
+                    verified_token=-1,          # unused when skip_d0=False
+                    drafts=retry_drafts.get(req.rid),
+                    skip_d0=False,
+                )
+                logger.debug(
+                            f"\033[36m [Worker][Retry] req-{req.rid}: "
+                            f"got {retry_drafts.get(req.rid)[0]} tokens after retry \033[0m"
                             )
-                            req.cur_drafts = list(retry_token_ids)
-                            logger.debug(
-                                f"\033[32m [Worker][Retry] req {req.rid}: "
-                                f"got {retry_token_ids=} tokens after retry \033[0m"
-                            )
-                    req.spec_cnt += 1
+                # Second spec_cnt increment: counts the retry_drafts_for_reqs call.
+                req.spec_cnt += 1
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # Normal decode fallback (draft_num_tokens == 1)
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def _forward_normal_decode(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run a standard decode forward when draft_num_tokens==1.
@@ -545,20 +599,20 @@ class RemoteSpecWorker:
         replicate the relevant steps here to set up input_ids, KV-cache
         allocation, and seq_lens before calling the target worker in plain
         DECODE mode (no is_verify=True, CUDA-graph eligible).
+
+        There are two reasons draft_num_tokens==1 may be set while recv_draft_fn
+        is still present:
+          (a) recv_draft_fn is None  – target overloaded / circuit-breaker open;
+              no draft requests were sent, nothing to receive.
+          (b) recv_draft_fn is set   – requests were already sent via
+              send_batch_draft_requests but _decide_verify_num_draft_tokens
+              returned 1 (rejected / no-draft-ratio).  We must drain the
+              responses to avoid ZMQ buffer build-up and to carry forward
+              valid drafts for the next spec round.
         """
         bs = batch.batch_size()
 
         # ---- Replicate the non-spec parts of prepare_for_decode ----
-        #
-        # After a verify round, batch.output_ids == verified_id which has
-        # sum(accept_length + 1) elements – ONE entry per accepted/bonus token
-        # across ALL sequences, NOT one per sequence.  Using it directly as
-        # input_ids would produce a size mismatch (e.g. 37 tokens for 16 seqs).
-        #
-        # The correct next-decode input for each seq is the LAST token in
-        # req.output_ids (the bonus token appended by the verify kernel).
-        # This mirrors what prepare_for_decode does for non-spec batches with
-        # enable_overlap=True (see ScheduleBatch.prepare_for_decode).
         last_token_ids_cpu = [
             req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
             for req in batch.reqs
@@ -575,16 +629,11 @@ class RemoteSpecWorker:
         )
         batch.output_ids = None
         batch.forward_mode = ForwardMode.DECODE
-        # Clear stale spec_info from the previous spec round.  If left in
-        # place it propagates through get_model_worker_batch → ForwardBatch and
-        # causes _get_actual_ntpb to return N (wrong) instead of 1, which
-        # makes raw_num_token = batch_size * N and corrupts replay_prepare.
+        # Clear stale spec_info from the previous spec round.  If left in place
+        # it propagates through get_model_worker_batch -> ForwardBatch and causes
+        # _get_actual_ntpb to return N (wrong) instead of 1.
         batch.spec_info = None
 
-        # Also reset global_num_tokens so that require_mlp_tp_gather logic in
-        # cuda_graph_runner uses the correct per-rank token count (bs, not bs*ntpb
-        # from the previous verify round).  Reset both fields to satisfy the
-        # ForwardBatch.init_new assertion that both are either None or not-None.
         if batch.global_num_tokens is not None:
             batch.global_num_tokens = [bs]
         if batch.global_num_tokens_for_logprob is not None:
@@ -604,34 +653,13 @@ class RemoteSpecWorker:
 
         # ---- Target forward (normal DECODE, CUDA-graph eligible) ----
         model_worker_batch = batch.get_model_worker_batch()
-
-        start_time = time.perf_counter()
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
-        end_time = time.perf_counter()
-        # logger.info(
-        #     f"\033[31m [Target][NormalDecode] Target forward took "
-        #     f"{(end_time - start_time) * 1000:.2f} ms \033[0m"
-        # )
 
-        # ---- Receive drafts if the draft side was asked to generate them ----
-        # There are two cases where draft_num_tokens==1:
-        #   (a) recv_draft_fn is None  – target overloaded / circuit-breaker open;
-        #       no draft requests were sent, nothing to receive.
-        #   (b) recv_draft_fn is set   – requests were already sent via
-        #       send_batch_draft_requests but _decide_verify_num_draft_tokens
-        #       returned 1 (rejected / no-draft-ratio).  We must drain the
-        #       responses to avoid ZMQ buffer build-up and to carry forward
-        #       valid drafts for the next spec round.
+        # ---- Receive drafts if any were requested (case b above) ----
         recv_draft_fn = getattr(batch, "recv_draft_fn", None)
-        new_drafts_per_req: dict = {}
-        if recv_draft_fn is not None:
-            new_drafts_per_req = recv_draft_fn(batch)
+        new_drafts_per_req: dict = recv_draft_fn(batch) if recv_draft_fn is not None else {}
 
         # ---- Update per-request state ----
-        # In the spec verify path, the verify kernel appends accepted tokens to
-        # req.output_ids directly.  We do the same here for consistency so that
-        # process_batch_result_decode (which skips the append for spec algos)
-        # sees the correct output_ids.
         next_token_ids_list = batch_result.next_token_ids.tolist()
         for i, req in enumerate(batch.reqs):
             if _is_health_check(req):
@@ -639,38 +667,23 @@ class RemoteSpecWorker:
             token = next_token_ids_list[i] if i < len(next_token_ids_list) else None
             if token is not None:
                 req.output_ids.append(token)
-                # Mirror the grammar update that the EAGLE verify kernel does
-                # (eagle_info.py L407-413) for every accepted token.
-                # process_batch_result_decode skips grammar for non-is_none /
-                # non-is_spec_v2 algorithms, so we must do it here.
                 if req.grammar is not None and not req.finished():
                     try:
                         req.grammar.accept_token(token)
                     except ValueError:
                         logger.error(
-                            f"[NormalDecode] grammar.accept_token failed "
-                            f"for req {req.rid} token {token}"
+                            f"\033[36m [NormalDecode] grammar.accept_token failed "
+                            f"for req {req.rid} token {token} \033[0m"
                         )
 
-            # Align received drafts against the decode output token, mirroring
-            # the logic in _recv_drafts_after_extend.  This lets us carry
-            # forward valid draft tokens so the very next spec round can skip
-            # re-requesting them.
-            drafts = new_drafts_per_req.get(req.rid) if new_drafts_per_req else None
-            if drafts is not None and token is not None:
-                draft_token_ids, draft_logprobs = drafts
-                if draft_token_ids and draft_token_ids[0] == token:
-                    req.draft_tokens_and_logits = _make_draft_dict(
-                        draft_token_ids[1:], draft_logprobs[1:]
-                    )
-                    req.cur_drafts = list(draft_token_ids[1:])
-                else:
-                    req.draft_tokens_and_logits = _default_draft()
-                    req.cur_drafts = []
-            else:
-                req.draft_tokens_and_logits = _default_draft()
-                req.cur_drafts = []
-
+            # Align received drafts with this decode token (same logic as
+            # _recv_drafts_after_extend: skip_d0=True, check d0 == token).
+            _apply_drafts_to_req(
+                req,
+                verified_token=token if token is not None else -1,
+                drafts=new_drafts_per_req.get(req.rid) if new_drafts_per_req else None,
+                skip_d0=True,
+            )
             req.spec_cnt += 1
             req.len_output_ids = len(req.output_ids)
 
@@ -682,9 +695,9 @@ class RemoteSpecWorker:
             can_run_cuda_graph=batch_result.can_run_cuda_graph,
         )
 
-    # ------------------------------------------------------------------
+    # =========================================================================
     # Internal helpers
-    # ------------------------------------------------------------------
+    # =========================================================================
 
     def _get_cached_tree_structure(
         self, num_draft_tokens: int, spec_steps: int
@@ -746,8 +759,54 @@ class RemoteSpecWorker:
 
 
 # ======================================================================
-# Module-level helpers (stateless, no ``self``)
+# Module-level helpers (stateless)
 # ======================================================================
+
+
+def _apply_drafts_to_req(
+    req,
+    verified_token: int,
+    drafts: Optional[Tuple[List[int], List[float]]],
+    *,
+    skip_d0: bool = True,
+) -> None:
+    """Update req.cur_drafts and req.draft_tokens_and_logits after a decode step.
+
+    Single entry point for all three draft-alignment call sites:
+      - _recv_drafts_after_extend   (after prefill, skip_d0=True)
+      - _forward_normal_decode      (normal decode fallback, skip_d0=True)
+      - _post_verify_update_drafts  (retry path, skip_d0=False)
+
+    Args:
+        req: The request to update.
+        verified_token: Token produced in this step (bonus or normal decode token).
+            Only used when skip_d0=True to check if d0 matches.
+        drafts: (token_ids, logprobs) from Draft, or None if nothing received.
+        skip_d0:
+            True  – normal / pipelined path: draft_token_ids[0] (d0) is Draft's
+                    prediction for the bonus position.  Carry forward [1:] only
+                    if d0 == verified_token (fork-point held).
+            False – retry path: Draft generated starting from output_ids[-1],
+                    so all token_ids are valid future tokens; store directly.
+    """
+    if drafts is not None:
+        token_ids, logprobs = drafts
+        if token_ids:
+            if not skip_d0:
+                # Retry path: all tokens are rooted at current output[-1]
+                req.cur_drafts = list(token_ids)
+                req.draft_tokens_and_logits = _make_draft_dict(token_ids, logprobs)
+                return
+            if token_ids[0] == verified_token:
+                # Normal/pipelined path: d0 matched → carry forward d1, d2, ...
+                req.cur_drafts = list(token_ids[1:])
+                req.draft_tokens_and_logits = _make_draft_dict(
+                    token_ids[1:], logprobs[1:]
+                )
+                return
+    # No draft received, or d0 mismatch (diverged): clear draft state
+    req.cur_drafts = []
+    req.draft_tokens_and_logits = _default_draft()
 
 
 def _is_health_check(req) -> bool:
@@ -774,12 +833,15 @@ def _find_fork_point(
     """Find the first divergence between verified output and draft prediction.
 
     Returns (is_fully_matched, matched_count).
+
+    is_fully_matched=True means every verified token (including the bonus) was
+    correctly predicted by the draft, AND len(draft) <= len(verified).  This is
+    the pipelined-carry-forward condition.
     """
     if not verified_tokens or not draft_tokens:
         return False, 0
 
     min_len = min(len(verified_tokens), len(draft_tokens))
-
     for i in range(min_len):
         if verified_tokens[i] != draft_tokens[i]:
             return False, i
