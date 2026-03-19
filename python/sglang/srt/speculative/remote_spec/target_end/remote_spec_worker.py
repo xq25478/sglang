@@ -156,6 +156,17 @@ class RemoteSpecWorker:
                 batch, spec_info, recv_draft_fn=recv_draft_fn, retry_fn=retry_fn,
                 retry_fail_ratio=retry_fail_ratio,
             )
+            accept_stats = []
+            for req, accept_len in zip(
+                batch.reqs, verify_output.accept_length_per_req_cpu
+            ):
+                if _is_health_check(req):
+                    continue
+                accept_stats.append(f"{req.rid} (accepted_tokens={accept_len})")
+            logger.debug(
+                f"\033[33m [Target][Verify] batch_accept_stats="
+                f"[{', '.join(accept_stats)}] \033[0m"
+            )
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
@@ -321,6 +332,7 @@ class RemoteSpecWorker:
             spec_steps=spec_steps,
             num_verify_tokens=num_draft_tokens,
         )
+        # logger.info(f"{tree_mask=}")
 
         return EagleVerifyInput(
             draft_token=final_draft_tokens,
@@ -387,6 +399,7 @@ class RemoteSpecWorker:
             detect_nan(logits_output)
 
         # ---------- receive new drafts (overlaps with GPU forward) ----------
+        torch.cuda.synchronize()
         new_drafts_per_req: dict = {}
         if recv_draft_fn is not None and not batch.forward_mode.is_idle():
             new_drafts_per_req = recv_draft_fn(batch)
@@ -464,6 +477,8 @@ class RemoteSpecWorker:
                 verified_tokens = req.output_ids[req.len_output_ids:]
                 cur_draft_tokens = list(getattr(req, "cur_drafts", []))
                 cur_draft_tokens.append(draft_token_ids[0])
+                logger.debug(f"\033[32m [Worker][Verify] req-{req.rid}: "
+                            f"verified={verified_tokens}, cur_drafts={cur_draft_tokens} \033[0m")
 
                 is_matched, matched_idx = _find_fork_point(
                     verified_tokens, cur_draft_tokens
@@ -514,8 +529,8 @@ class RemoteSpecWorker:
                             )
                             req.cur_drafts = list(retry_token_ids)
                             logger.debug(
-                                f"\033[33m [Worker][Retry] req {req.rid}: "
-                                f"got {len(retry_token_ids)} draft tokens after retry \033[0m"
+                                f"\033[32m [Worker][Retry] req {req.rid}: "
+                                f"got {retry_token_ids=} tokens after retry \033[0m"
                             )
                     req.spec_cnt += 1
 
