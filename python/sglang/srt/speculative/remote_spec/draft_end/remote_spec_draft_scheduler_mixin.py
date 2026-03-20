@@ -180,7 +180,7 @@ class RemoteSpecDraftSchedulerMixin:
             self.last_batch = batch
 
             # Periodic cleanup
-            if self.draft_forward_cycle % 100 == 0:
+            if self.draft_forward_cycle % 500 == 0:
                 self._cleanup_stale_draft_states()
 
     
@@ -285,8 +285,18 @@ class RemoteSpecDraftSchedulerMixin:
                 control_msgs.append(draft_req)
                 continue
                         
-            # Keep latest spec_cnt
+            # Keep latest spec_cnt.
+            # If the incoming message has a higher spec_cnt but no input_ids,
+            # carry forward input_ids from the earlier message so that
+            # _process_draft_requests can still create a new draft state.
+            # This handles the race where spec_cnt=0 (with input_ids) and
+            # spec_cnt=1 (without input_ids) both accumulate in the ZMQ buffer
+            # while Draft is busy; without this, spec_cnt=0 is discarded and
+            # the new request can never be initialized.
             if req_id not in latest_msgs or draft_req.spec_cnt > latest_msgs[req_id].spec_cnt:
+                if req_id in latest_msgs and draft_req.input_ids is None:
+                    draft_req.input_ids = latest_msgs[req_id].input_ids
+                    draft_req.sampling_params = draft_req.sampling_params or latest_msgs[req_id].sampling_params
                 latest_msgs[req_id] = draft_req
         
         # Log deduplication

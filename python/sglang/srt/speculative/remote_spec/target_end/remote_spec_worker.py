@@ -583,7 +583,7 @@ class RemoteSpecWorker:
                 )
                 logger.debug(
                             f"\033[36m [Worker][Retry] req-{req.rid}: "
-                            f"got {retry_drafts.get(req.rid)[0]} tokens after retry \033[0m"
+                            f"got {retry_drafts.get(req.rid)[0] if retry_drafts.get(req.rid) else []} tokens after retry \033[0m"
                             )
                 # Second spec_cnt increment: counts the retry_drafts_for_reqs call.
                 req.spec_cnt += 1
