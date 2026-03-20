@@ -265,9 +265,19 @@ class RemoteSpecWorker:
 
         new_drafts = recv_draft_fn(batch)
         target_tokens = next_token_ids.tolist()
+        decoding_reqs = getattr(batch, "decoding_reqs", None) or []
+        decoding_req_ids = {id(req) for req in decoding_reqs if not _is_health_check(req)}
 
         for i, req in enumerate(batch.reqs):
             if _is_health_check(req):
+                continue
+            if (
+                id(req) not in decoding_req_ids
+                and getattr(req, "is_chunked", 0) > 0
+            ):
+                # Chunked prefill only uses Draft as an asynchronous warm-up.
+                # There is no real T0 yet, so we cannot align d0 or advance the
+                # speculative state until the last chunk finishes.
                 continue
             token = target_tokens[i] if i < len(target_tokens) else None
             if token is not None:

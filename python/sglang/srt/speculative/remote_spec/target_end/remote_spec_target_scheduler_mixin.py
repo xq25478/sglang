@@ -421,6 +421,36 @@ class RemoteSpecTargetSchedulerMixin:
 
         return result
 
+    def _get_extend_decode_req_ids(self, batch: ScheduleBatch) -> Set[int]:
+        """Return object ids for decode reqs embedded in a mixed extend batch."""
+        decoding_reqs = getattr(batch, "decoding_reqs", None)
+        if not decoding_reqs:
+            return set()
+        return {id(req) for req in decoding_reqs if not _is_health_check(req)}
+
+    def _get_reqs_waiting_for_drafts(self, batch: ScheduleBatch) -> List[Req]:
+        """Return reqs that should block on Draft in the current round.
+
+        For chunked prefill, the first N-1 extend rounds only warm up Draft in
+        the background.  The final chunk (req.is_chunked <= 0 after scheduling)
+        is the first round that needs Draft's d0 alignment result.
+        """
+        forward_mode = getattr(batch, "forward_mode", None)
+        is_extend_batch = (
+            (forward_mode is not None and forward_mode.is_extend())
+            or getattr(batch, "is_extend_in_batch", False)
+        )
+        if not is_extend_batch:
+            return [req for req in batch.reqs if not _is_health_check(req)]
+
+        decoding_req_ids = self._get_extend_decode_req_ids(batch)
+        return [
+            req
+            for req in batch.reqs
+            if not _is_health_check(req)
+            and (id(req) in decoding_req_ids or getattr(req, "is_chunked", 0) <= 0)
+        ]
+
     # =====================================================================
     # High-level Draft Recv API
     # Registered as bound method references on batch (not closures):
@@ -444,26 +474,29 @@ class RemoteSpecTargetSchedulerMixin:
         """
         if logger.isEnabledFor(logging.DEBUG):
             start_time = time.perf_counter()
+        reqs_waiting_for_drafts = self._get_reqs_waiting_for_drafts(batch)
 
         # Phase 1: Collect (rank 0 loops; other ranks skip directly to broadcast)
         if self.tp_size == 1 or self.tp_rank == 0:
             pending_rids = {
                 req.rid
-                for req in batch.reqs
-                if not _is_health_check(req)
-                and req.spec_cnt in self.req_to_draft_token.get(req.rid, {})
+                for req in reqs_waiting_for_drafts
+                if req.spec_cnt in self.req_to_draft_token.get(req.rid, {})
                 and self.req_to_draft_token[req.rid][req.spec_cnt] is None
             }
-            messages = self._collect_draft_messages(
-                pending_rids=pending_rids,
-                pending_spec_cnts={
-                    req.rid: req.spec_cnt
-                    for req in batch.reqs
-                    if not _is_health_check(req)
-                    and req.spec_cnt in self.req_to_draft_token.get(req.rid, {})
-                    and self.req_to_draft_token[req.rid][req.spec_cnt] is None
-                },
-                timeout_s=self._recv_timeout_s,
+            messages = (
+                self._collect_draft_messages(
+                    pending_rids=pending_rids,
+                    pending_spec_cnts={
+                        req.rid: req.spec_cnt
+                        for req in reqs_waiting_for_drafts
+                        if req.spec_cnt in self.req_to_draft_token.get(req.rid, {})
+                        and self.req_to_draft_token[req.rid][req.spec_cnt] is None
+                    },
+                    timeout_s=self._recv_timeout_s,
+                )
+                if pending_rids
+                else []
             )
         else:
             messages = None
@@ -472,16 +505,15 @@ class RemoteSpecTargetSchedulerMixin:
         messages = self._tp_broadcast_messages(messages)
 
         # Phase 3: Store + circuit breaker update
-        has_draft = self._store_messages(messages)
-        if has_draft:
-            self.draft_circuit_breaker.record_success()
-        else:
-            self.draft_circuit_breaker.record_failure()
+        self._store_messages(messages)
 
         # Phase 4: Build result (consume entries from cache)
-        result = self._build_result_from_cache(
-            [req for req in batch.reqs if not _is_health_check(req)]
-        )
+        result = self._build_result_from_cache(reqs_waiting_for_drafts)
+        if reqs_waiting_for_drafts:
+            if result:
+                self.draft_circuit_breaker.record_success()
+            else:
+                self.draft_circuit_breaker.record_failure()
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -579,21 +611,28 @@ class RemoteSpecTargetSchedulerMixin:
 
         self.is_rejected = False
 
+        reqs_to_send: List[Req] = []
+
         # Register pending sentinels on ALL ranks so recv_drafts_for_batch
-        # (which runs on every rank) can correctly build pending_rids.
+        # (which runs on every rank) can correctly build pending_rids.  For
+        # chunked prefill we only send once per (rid, spec_cnt); middle chunks
+        # reuse the same in-flight/cached Draft response and only the last chunk
+        # waits for it.
         for req in batch.reqs:
             if _is_health_check(req):
                 continue
-            self.req_to_draft_token[req.rid][req.spec_cnt] = None
+            rid_cache = self.req_to_draft_token[req.rid]
+            if req.spec_cnt in rid_cache:
+                continue
+            rid_cache[req.spec_cnt] = None
+            reqs_to_send.append(req)
 
         # ZMQ I/O only on rank 0.  Building RemoteSpecRequest objects on other
         # ranks is pure waste since those objects are never used.
         if self.tp_size == 1 or self.tp_rank == 0:
             if hasattr(self, "zmq_communicator") and self.zmq_communicator is not None:
                 draft_reqs = []
-                for req in batch.reqs:
-                    if _is_health_check(req):
-                        continue
+                for req in reqs_to_send:
                     draft_reqs.append(
                         RemoteSpecRequest(
                             request_id=req.rid,
