@@ -3133,7 +3133,12 @@ class Scheduler(
             self.reset_metrics()
 
             if self.draft_worker:
-                self.draft_worker.clear_cache_pool()
+                clear_cache_pool = getattr(self.draft_worker, "clear_cache_pool", None)
+                if clear_cache_pool is not None:
+                    clear_cache_pool()
+
+            if self.spec_algorithm.is_remote():
+                self.reset_remote_spec_target_state()
 
             # TODO: allow optional empty cache
             torch.cuda.empty_cache()

@@ -128,6 +128,10 @@ class RemoteSpecWorker:
     def draft_model_runner(self):
         return None
 
+    def clear_cache_pool(self):
+        # allocator and kv cache pool are shared with target worker
+        self._cached_tree_structures.clear()
+
     
     # =========================================================================
     # forward

@@ -19,6 +19,10 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 logger = logging.getLogger(__name__)
 
 
+def _remote_spec_now_us() -> float:
+    return time.time() * 1e6
+
+
 # =========================================================================
 # Draft Circuit Breaker
 # =========================================================================
@@ -137,6 +141,8 @@ class RemoteSpecTargetSchedulerMixin:
         self._msg_lock = threading.Lock()
         self._data_ready = threading.Event()
         self._bg_running = True
+        self._remote_spec_flush_at_us = 0.0
+        self._accept_reject_messages = True
 
         failure_threshold = int(os.environ.get("REMOTE_SPEC_FAILURE_THRESHOLD", "30"))
         cooldown_rounds = int(os.environ.get("REMOTE_SPEC_COOLDOWN_ROUNDS", "100"))
@@ -182,6 +188,51 @@ class RemoteSpecTargetSchedulerMixin:
             self._msg_buffer.clear()
         self._data_ready.clear()
         return msgs
+
+    def reset_remote_spec_target_state(self) -> None:
+        """Clear remote speculative target-side caches after a flush."""
+        self._remote_spec_flush_at_us = _remote_spec_now_us()
+        self._accept_reject_messages = False
+
+        if hasattr(self, "req_to_draft_token"):
+            self.req_to_draft_token.clear()
+
+        if hasattr(self, "_msg_buffer"):
+            if hasattr(self, "_msg_lock"):
+                with self._msg_lock:
+                    self._msg_buffer.clear()
+            else:
+                self._msg_buffer.clear()
+
+        if hasattr(self, "_data_ready"):
+            self._data_ready.clear()
+
+        if hasattr(self, "draft_circuit_breaker"):
+            self.draft_circuit_breaker.state = DraftCircuitBreaker.CLOSED
+            self.draft_circuit_breaker.consecutive_failures = 0
+            self.draft_circuit_breaker.rounds_in_open = 0
+
+        if hasattr(self, "is_rejected"):
+            self.is_rejected = False
+        if hasattr(self, "rejected_forward_ct"):
+            self.rejected_forward_ct = 0
+
+    def _should_store_draft_message(self, msg: RemoteSpecRequest) -> bool:
+        """Only accept draft responses that still belong to a live target request."""
+        rid_cache = getattr(self, "req_to_draft_token", {}).get(msg.request_id)
+        if rid_cache is None or msg.spec_cnt not in rid_cache:
+            return False
+
+        flush_at_us = getattr(self, "_remote_spec_flush_at_us", 0.0)
+        if (
+            flush_at_us > 0.0
+            and msg.target_send_time is not None
+            and msg.target_send_time >= 0.0
+            and msg.target_send_time < flush_at_us
+        ):
+            return False
+
+        return True
 
     # =====================================================================
     # Main Event Loop
@@ -321,17 +372,21 @@ class RemoteSpecTargetSchedulerMixin:
                 f"Expected RemoteSpecRequest, got {type(msg)}"
             )
             if msg.action == RemoteSpecAction.REJECT:
-                self.process_reject_action()
-                if self.tp_rank == 0:
-                    logger.debug(
-                        "\033[32m [Target] Received REJECT from draft \033[0m"
-                    )
+                if getattr(self, "_accept_reject_messages", True):
+                    self.process_reject_action()
+                    if self.tp_rank == 0:
+                        logger.debug(
+                            "\033[32m [Target] Received REJECT from draft \033[0m"
+                        )
             elif msg.action == RemoteSpecAction.DRAFT:
+                if not self._should_store_draft_message(msg):
+                    continue
                 self.req_to_draft_token[msg.request_id][msg.spec_cnt] = (
                     msg.draft_token_ids,
                     msg.draft_logprobs,
                 )
                 has_draft = True
+                self._accept_reject_messages = True
         return has_draft
 
     def _build_result_from_cache(
@@ -401,8 +456,13 @@ class RemoteSpecTargetSchedulerMixin:
             }
             messages = self._collect_draft_messages(
                 pending_rids=pending_rids,
-                # Empty: Draft always echoes our spec_cnt, accept any.
-                pending_spec_cnts={},
+                pending_spec_cnts={
+                    req.rid: req.spec_cnt
+                    for req in batch.reqs
+                    if not _is_health_check(req)
+                    and req.spec_cnt in self.req_to_draft_token.get(req.rid, {})
+                    and self.req_to_draft_token[req.rid][req.spec_cnt] is None
+                },
                 timeout_s=self._recv_timeout_s,
             )
         else:
