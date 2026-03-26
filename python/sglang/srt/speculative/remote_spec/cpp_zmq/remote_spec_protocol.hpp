@@ -13,7 +13,11 @@
 
 #include <zmq.hpp>
 #include <msgpack.hpp>
+#include <zmq.hpp>
+#include <msgpack.hpp>
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
 
 namespace py = pybind11;
 
@@ -183,17 +187,27 @@ inline SamplingParams sampling_params_from_py_dict(const py::dict& d) {
     return p;
 }
 
+template <typename T>
+inline void assign_optional_from_py_dict(
+    const py::dict& d,
+    const char* key,
+    std::optional<T>& target) {
+    if (d.contains(key) && !d[key].is_none()) {
+        target = py::cast<T>(d[key]);
+    }
+}
+
 inline RemoteSpecRequest from_py_dict(const py::dict& d) {
     RemoteSpecRequest r;
     
-    if (d.contains("request_id")) r.request_id = py::cast<std::string>(d["request_id"]);
-    if (d.contains("spec_cnt")) r.spec_cnt = py::cast<int>(d["spec_cnt"]);
+    assign_optional_from_py_dict(d, "request_id", r.request_id);
+    assign_optional_from_py_dict(d, "spec_cnt", r.spec_cnt);
     if (d.contains("action")) r.action = str_to_remote_action(py::cast<std::string>(d["action"]));
     if (d.contains("spec_type")) r.spec_type = str_to_spec_type(py::cast<std::string>(d["spec_type"]));
-    if (d.contains("draft_token_ids")) r.draft_token_ids = py::cast<std::vector<int>>(d["draft_token_ids"]);
-    if (d.contains("input_ids")) r.input_ids = py::cast<std::vector<int>>(d["input_ids"]);
-    if (d.contains("output_ids")) r.output_ids = py::cast<std::vector<int>>(d["output_ids"]);
-    if (d.contains("num_draft_tokens")) r.num_draft_tokens = py::cast<int>(d["num_draft_tokens"]);
+    assign_optional_from_py_dict(d, "draft_token_ids", r.draft_token_ids);
+    assign_optional_from_py_dict(d, "input_ids", r.input_ids);
+    assign_optional_from_py_dict(d, "output_ids", r.output_ids);
+    assign_optional_from_py_dict(d, "num_draft_tokens", r.num_draft_tokens);
     
     if (d.contains("sampling_params") && !d["sampling_params"].is_none()) {
         r.sampling_params = sampling_params_from_py_dict(d["sampling_params"].cast<py::dict>());
@@ -233,6 +247,9 @@ inline py::dict to_py_dict(const RemoteSpecRequest& r) {
         p_dict["top_p"] = p.top_p;
         p_dict["top_k"] = p.top_k;
         p_dict["min_p"] = p.min_p;
+        p_dict["frequency_penalty"] = p.frequency_penalty;
+        p_dict["presence_penalty"] = p.presence_penalty;
+        p_dict["repetition_penalty"] = p.repetition_penalty;
         p_dict["n"] = p.n;
         p_dict["min_new_tokens"] = p.min_new_tokens;
         p_dict["ignore_eos"] = p.ignore_eos;

@@ -18,7 +18,12 @@ zmq_libs = ["zmq"]                     # 链接 libzmq.so
 ext_modules = [
     Extension(
         "remote_spec_zmq",  # 编译出来的 Python 模块名
-        sources=["remote_spec_zmq.cpp"],  # 你的 cpp 文件
+        sources=[
+            "remote_spec_zmq.cpp",
+            "remote_spec_zmq_logging.cpp",
+            "remote_spec_zmq_serialization.cpp",
+            "remote_spec_zmq_endpoints.cpp",
+        ],
         include_dirs=[
             pybind11.get_include(),      # pybind11 头文件
             zmq_include_dir,

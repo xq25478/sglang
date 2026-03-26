@@ -139,8 +139,24 @@ class RemoteSpecConfig:
         """Check if paged KV cache is in use (page_size > 1)."""
         return self.page_size > 1
     
-    def get_addr(self) -> str:            
-        return f"{self.zmq_transport}://{self.zmq_addr}:{self.zmq_port}"
+    def _get_ipc_base_path(self) -> str:
+        if self.zmq_addr.startswith("ipc://"):
+            return self.zmq_addr[len("ipc://"):]
+
+        if "/" in self.zmq_addr or self.zmq_addr.startswith("."):
+            return self.zmq_addr
+
+        safe_addr = "".join(
+            ch if ch.isalnum() else "_" for ch in self.zmq_addr
+        )
+        return f"/tmp/{safe_addr}_{self.zmq_port}"
+
+    def get_addr(self) -> str:
+        if self.zmq_transport == "tcp":
+            return f"tcp://{self.zmq_addr}:{self.zmq_port}"
+        if self.zmq_transport == "ipc":
+            return f"ipc://{self._get_ipc_base_path()}"
+        raise ValueError(f"Unsupported zmq transport: {self.zmq_transport}")
                 
     def validate(self) -> None:
         """
@@ -151,6 +167,11 @@ class RemoteSpecConfig:
         """
         if self.role not in ("target", "draft"):
             raise ValueError(f"Invalid role: {self.role}. Must be 'target' or 'draft'")
+
+        if self.zmq_transport not in ("tcp", "ipc"):
+            raise ValueError(
+                f"Invalid zmq_transport: {self.zmq_transport}. Must be 'tcp' or 'ipc'"
+            )
         
         if self.num_draft_tokens < 1:
             raise ValueError(f"num_draft_tokens must be >= 1, got {self.num_draft_tokens}")
@@ -255,6 +276,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
         
         if not self._running:
             logger.warning(f"Cannot send: communicator not running")
+            return
         try:
             if self.debug:
                 t1 = time.perf_counter()
