@@ -275,9 +275,17 @@ class SchedulerRuntimeCheckerMixin:
         # check_memory is called during "idle" (batch = None), but Draft may still have
         # paused_reqs waiting for Target's next message. Their KV state is dynamic.
         if self.server_args.remote_speculative_role == "draft":
-            has_paused_reqs = len(getattr(self, 'paused_reqs', [])) > 0
-            if has_paused_reqs:
-                # Skip memory check - state is dynamic with paused requests
+            # v1: paused_reqs; v2: draft_paused_reqs / draft_batch / draft_waiting_queue
+            # Any of these holding reqs means KV is legitimately allocated but not
+            # tracked by the regular running_batch, so the check would false-alarm.
+            has_active_draft_reqs = (
+                len(getattr(self, 'paused_reqs', [])) > 0
+                or len(getattr(self, 'draft_paused_reqs', [])) > 0
+                or len(getattr(getattr(self, 'draft_batch', None), 'reqs', [])) > 0
+                or len(getattr(self, 'draft_waiting_queue', [])) > 0
+            )
+            if has_active_draft_reqs:
+                # Skip memory check - KV is legitimately held by active draft requests
                 return
                 
         if self.is_hybrid_swa:

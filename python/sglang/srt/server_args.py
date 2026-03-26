@@ -522,6 +522,8 @@ class ServerArgs:
     remote_speculative_retry_min_count: int = 4
     remote_speculative_zmq_addr: Optional[str] = None
     remote_speculative_zmq_port: Optional[str] = None
+    remote_speculative_draft_priority: bool = False
+    remote_speculative_max_draft_priority_steps: int = 0
 
     # Expert parallelism
     ep_size: int = 1
@@ -4948,6 +4950,29 @@ class ServerArgs:
             type=int,
             default=ServerArgs.remote_speculative_retry_min_count,
             help="Minimum number of failed requests required to trigger a retry. Default 4.",
+        )
+        parser.add_argument(
+            "--remote-speculative-draft-priority",
+            action="store_true",
+            default=ServerArgs.remote_speculative_draft_priority,
+            help=(
+                "Enable Draft-Priority mode (v2 scheduler). "
+                "When set, the draft server decodes draft requests in a dedicated batch "
+                "for N steps before processing normal requests, preventing Normal-request "
+                "starvation of draft tokens. Default: False (mixed mode)."
+            ),
+        )
+        parser.add_argument(
+            "--remote-speculative-max-draft-priority-steps",
+            type=int,
+            default=ServerArgs.remote_speculative_max_draft_priority_steps,
+            help=(
+                "Maximum number of decode steps to run in Draft-Priority mode per iteration "
+                "(v2 scheduler). 0 means auto-compute from the maximum remaining steps across "
+                "all active draft requests. Positive values cap the steps to prevent Normal-"
+                "request starvation. Only effective when --remote-speculative-draft-priority "
+                "is set. Default: 0."
+            ),
         )
 
         # Expert parallelism
