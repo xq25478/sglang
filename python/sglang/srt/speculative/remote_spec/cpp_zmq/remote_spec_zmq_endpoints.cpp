@@ -4,6 +4,16 @@
 
 #include "remote_spec_zmq_serialization.hpp"
 
+namespace {
+
+bool has_empty_delimiter(
+    const std::vector<zmq::message_t>& frames,
+    size_t delimiter_index) {
+    return frames.size() > delimiter_index && frames[delimiter_index].size() == 0;
+}
+
+}  // namespace
+
 DealerEndpoint::DealerEndpoint(
     const std::string& addr,
     const std::string& identity,
@@ -121,6 +131,10 @@ void DealerEndpoint::on_monitor_tick() {
 }
 
 void DealerEndpoint::dispatch_rx_frames(std::vector<zmq::message_t>&& frames) {
+    if (frames.size() == 2 && has_empty_delimiter(frames, 0)) {
+        frames.erase(frames.begin());
+    }
+
     if (frames.size() != 1) {
         this->record_malformed_frames("dealer-rx", frames.size());
         return;
@@ -291,6 +305,10 @@ void RouterEndpoint::on_monitor_tick() {
 }
 
 void RouterEndpoint::dispatch_rx_frames(std::vector<zmq::message_t>&& frames) {
+    if (frames.size() == 3 && has_empty_delimiter(frames, 1)) {
+        frames.erase(frames.begin() + 1);
+    }
+
     if (frames.size() != 2) {
         this->record_malformed_frames("router-rx", frames.size());
         return;
@@ -308,6 +326,10 @@ void RouterEndpoint::dispatch_rx_frames(std::vector<zmq::message_t>&& frames) {
 }
 
 void RouterEndpoint::dispatch_ctrl_frames(std::vector<zmq::message_t>&& frames) {
+    if (frames.size() == 3 && has_empty_delimiter(frames, 1)) {
+        frames.erase(frames.begin() + 1);
+    }
+
     if (frames.size() != 2) {
         this->record_malformed_frames("router-ctrl", frames.size());
         return;
@@ -334,7 +356,6 @@ void RouterEndpoint::dispatch_ctrl_frames(std::vector<zmq::message_t>&& frames) 
 void RouterEndpoint::handle_tx_send(std::pair<std::string, std::string>& data) {
     auto start = std::chrono::steady_clock::now();
     this->tx_sock_.send(zmq::buffer(data.first), zmq::send_flags::sndmore);
-    this->tx_sock_.send(zmq::message_t{}, zmq::send_flags::sndmore);
     this->tx_sock_.send(zmq::buffer(data.second), zmq::send_flags::none);
     auto end = std::chrono::steady_clock::now();
     remote_spec_debug_log(
