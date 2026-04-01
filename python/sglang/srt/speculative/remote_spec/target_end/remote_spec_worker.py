@@ -69,7 +69,7 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import detect_nan
+from sglang.srt.speculative.spec_utils import maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,8 @@ class RemoteSpecWorker:
         tp_rank: int,
         dp_rank: Optional[int],
         moe_ep_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
@@ -114,8 +116,12 @@ class RemoteSpecWorker:
         )
 
         self.tp_rank = tp_rank
-        self.tp_group = target_worker.get_tp_group()
-        self.tp_size = self.tp_group.world_size if self.tp_group else 1
+        self.dp_rank = dp_rank
+        self.moe_ep_rank = moe_ep_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
+        self.tp_group = getattr(target_worker.model_runner, "tp_group", None)
+        self.tp_size = target_worker.tp_size
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
@@ -127,6 +133,14 @@ class RemoteSpecWorker:
     @property
     def draft_model_runner(self):
         return None
+
+    @property
+    def model_runner(self):
+        return self.target_worker.model_runner
+
+    @property
+    def model_config(self):
+        return self.target_worker.model_config
 
     def clear_cache_pool(self):
         # allocator and kv cache pool are shared with target worker
@@ -427,7 +441,7 @@ class RemoteSpecWorker:
         # ---------- prepare & target forward ----------
         # seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
-        spec_info.num_tokens_per_batch = spec_info.spec_steps + 1
+        spec_info.num_tokens_per_req = spec_info.spec_steps + 1
         batch.return_hidden_states = False
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -450,7 +464,10 @@ class RemoteSpecWorker:
         )
 
         if self.enable_nan_detection:
-            detect_nan(logits_output)
+            maybe_detect_nan(
+                logits_output.next_token_logits,
+                "RemoteSpecWorker verify logits",
+            )
 
         # ---------- receive new drafts (overlaps with GPU forward) ----------
         torch.cuda.synchronize()

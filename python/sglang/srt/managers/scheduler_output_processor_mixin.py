@@ -21,7 +21,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecAction
+from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
+    RemoteSpecAction,
+    SpecType,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
