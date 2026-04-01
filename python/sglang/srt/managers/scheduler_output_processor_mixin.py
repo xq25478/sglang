@@ -331,11 +331,12 @@ class SchedulerOutputProcessorMixin:
         batch.filter_batch()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
-        self.report_prefill_stats(
-            prefill_stats=batch.prefill_stats,
-            can_run_cuda_graph=can_run_cuda_graph,
-            dp_cooperation_info=batch.dp_cooperation_info,
-        )
+        if batch.prefill_stats is not None:
+            self.report_prefill_stats(
+                prefill_stats=batch.prefill_stats,
+                can_run_cuda_graph=can_run_cuda_graph,
+                dp_cooperation_info=batch.dp_cooperation_info,
+            )
 
     def _resolve_spec_overlap_token_ids(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch

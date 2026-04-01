@@ -252,7 +252,7 @@ class RemoteSpecTargetSchedulerMixin:
                 if pending_rids and self.tp_rank == 0:
                     logger.info(
                         f"\033[32m [Target] Recv timeout, {len(pending_rids)} rids still pending: "
-                        f"{list(pending_rids)}"
+                        f"{list(pending_rids)} \033[0m"
                     )
                 break
             self._data_ready.wait(timeout=remaining)
@@ -521,7 +521,7 @@ class RemoteSpecTargetSchedulerMixin:
             if self.tp_rank == 0:
                 logger.error(
                     f"\033[34m [Target][Notify] Failed to cleanup req_to_draft_token "
-                    f"for {req.rid}: {e}"
+                    f"for {req.rid}: {e} \033[0m"
                 )
 
     def _is_self_high_overhead_target(self, batch: ScheduleBatch) -> bool:
