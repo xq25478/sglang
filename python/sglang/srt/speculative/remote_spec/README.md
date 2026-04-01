@@ -210,147 +210,32 @@ http://127.0.0.1:30000
 ```
 
 
-## 6. Parameter Guide
+## 6. Args
 
-This section separates `SPECTRE-specific parameters` from the `general speculative parameters` that are also required in practice.
+To enable SPECTRE, the following parameters are relevant:
 
-### 6.1 SPECTRE-specific parameters
+| Parameter | Description | Default |
+|--------------------|--------------------|--------------------|
+| `--speculative-algorithm` | Speculative algorithm. Use `REMOTE` for SPECTRE / RemoteSpec. | `None` |
+| `--remote-speculative-role` | The role of the server. Use `target` for the large-model verification side and `draft` for the small-model draft side. | `None` |
+| `--remote-speculative-max-batch-size` | The threshold at which the server is considered overloaded. When the running batch size exceeds this value, the draft server may stop processing draft requests and the target server may stop sending them. | `32` |
+| `--remote-speculative-reject-interval` | The interval to resend draft requests to the draft server after draft-side reject or insufficient draft help. `1` means resend every round. | `5000` |
+| `--remote-speculative-no-draft-ratio` | The ratio of requests with no usable draft tokens to the total batch size. If the ratio is larger than this value, the target side only decodes one token. | `0.5` |
+| `--remote-speculative-retry-fail-ratio` | Minimum ratio of failed pre-verify requests to batch size required to trigger retry or fallback behavior. | `0.5` |
+| `--remote-speculative-retry-min-count` | Minimum number of failed requests required to trigger retry or fallback behavior. | `4` |
+| `--remote-speculative-zmq-addr` | ZMQ address for SPECTRE / RemoteSpec communication. For same-machine deployment this is usually `127.0.0.1`; for cross-machine deployment use the draft-side IP. | `None` |
+| `--remote-speculative-zmq-port` | ZMQ port used between target and draft. Both sides must use the same value. | `None` |
+| `--remote-speculative-draft-priority` | Enable draft-side scheduling priority for remote draft requests. | `False` |
+| `--remote-speculative-max-draft-priority-steps` | Maximum number of consecutive priority scheduling steps on the draft side when draft priority is enabled. | `0` |
+| `--speculative-num-steps` | The number of speculative steps sampled from the draft path in one round. This affects the draft tree depth and target verification depth. | `None` |
+| `--speculative-eagle-topk` | Branch width per speculative step. Although SPECTRE is not local EAGLE, it still reuses the tree-based speculative verification structure, so this parameter controls tree width. | `None` |
+| `--speculative-num-draft-tokens` | The number of draft tokens verified in one speculative round. A common single-path setup is `steps=3`, `topk=1`, `draft_tokens=4`. | `None` |
+| `REMOTE_SPEC_RECV_TIMEOUT_MS` | Maximum time in milliseconds that the target waits for the draft response. This is configured through environment variables rather than CLI args. | `200` |
+| `REMOTE_SPEC_FAILURE_THRESHOLD` | Threshold of consecutive rounds without useful draft responses that causes the target to stop sending draft requests temporarily. This is configured through environment variables rather than CLI args. | `30` |
+| `REMOTE_SPEC_COOLDOWN_ROUNDS` | Number of cooldown rounds before the target resumes sending draft requests after entering cooldown. This is configured through environment variables rather than CLI args. | `100` |
+| `REMOTE_SPEC_DEBUG` | Enable ZMQ-related debug logging. This is configured through environment variables rather than CLI args. | `0` |
 
-#### `--remote-speculative-role`
-
-Choices:
-
-- `target`
-- `draft`
-
-Meaning:
-
-- `target`: run the large-model verification side.
-- `draft`: run the small-model draft-generation side.
-
-This is the most important SPECTRE switch because it decides which scheduler path the server enters.
-
-#### `--remote-speculative-max-batch-size`
-
-Meaning:
-
-- The high-overhead threshold for SPECTRE scheduling.
-- If the current batch is larger than this value, the server may consider itself too expensive for SPECTRE behavior.
-
-Typical use:
-
-- lower it when you want the system to back off earlier under load;
-- raise it when your hardware can still handle larger speculative batches well.
-
-#### `--remote-speculative-reject-interval`
-
-Meaning:
-
-- Controls how often the target side resends draft requests after the draft side rejects or cannot effectively provide draft help.
-
-Behavior summary:
-
-- smaller value: retry more aggressively;
-- larger value: retry less often;
-- `1`: retry every time.
-
-Typical use:
-
-- reduce it for more aggressive draft re-engagement;
-- increase it if repeated retries add overhead.
-
-#### `--remote-speculative-no-draft-ratio`
-
-Meaning:
-
-- A target-side fallback threshold.
-- If too many requests in the batch currently have no usable draft tokens, the target side falls back to decoding only one token.
-
-Behavior summary:
-
-- smaller value: fallback is triggered more easily;
-- larger value: keep trying SPECTRE longer.
-
-Typical use:
-
-- use a smaller value when draft responses are unstable or often missing;
-- use a larger value when draft service is stable and you want to preserve speculative behavior longer.
-
-#### `--remote-speculative-retry-fail-ratio`
-
-Meaning:
-
-- A ordinary sepculative decode threshold.
-- If too many requests in the batch currently rollback, the target side falls back to ordinary speculative decode.
-
-Behavior summary:
-
-- smaller value: ordinary speculative decode is triggered more easily;
-- larger value: keep trying parallel speculative decode longer.
-
-Typical use:
-
-- use a smaller value when accept rate is small or often rollback.
-
-#### `--remote-speculative-zmq-addr`
-
-Meaning:
-
-- The address used by SPECTRE ZMQ communication.
-
-#### `--remote-speculative-zmq-port`
-
-Meaning:
-
-- The ZMQ port used between target and draft.
-
-Requirement:
-
-- target and draft must use the same value.
-
-### 6.2 General speculative parameters used by SPECTRE
-
-#### `--speculative-algorithm REMOTE`
-
-Meaning:
-
-- Enables the SPECTRE speculative path.
-
-Without this, the server will not enter the `REMOTE` worker/scheduler logic.
-
-#### `--speculative-num-steps`
-
-Meaning:
-
-- Controls the draft step depth.
-
-In SPECTRE, this contributes to the draft tree depth and affects how many speculative verification steps the target prepares for.
-
-Typical use:
-
-- larger value: potentially more speculative gain, but more draft work and verification complexity;
-- smaller value: simpler and usually more stable.
-
-#### `--speculative-eagle-topk`
-
-Meaning:
-
-- Controls branch width per step.
-
-Although SPECTRE is not local EAGLE, it still reuses the tree-based speculative verification structure, so this parameter still matters for tree shape.
-
-Typical use:
-
-- `1`: single-path draft, simplest and lowest communication overhead;
-- `>1`: tree-shaped speculative candidates, higher complexity and potentially higher gain.
-
-#### `--speculative-num-draft-tokens`
-
-Meaning:
-
-- Controls how many draft tokens are verified in one speculative round.
-
-In current logic, you will often want it to match the expected tree size for your chosen `num_steps` and `topk`. A common simple setup is:
+If you want the simplest practical setup, start with:
 
 ```text
 speculative-num-steps = 3
