@@ -296,7 +296,7 @@ void RouterEndpoint::on_monitor_tick() {
     while (it != registered_dealers_.end()) {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second).count() > Base::DEALER_HEARTBEAT_TIMEOUT_MS) {
-            remote_spec_info_log("[ZMQ Warn] ", it->first, " 心跳信号超时，剔除!");
+            remote_spec_warn_log("[ZMQ Warn] ", it->first, " 心跳信号超时，剔除!");
             it = registered_dealers_.erase(it);
         } else {
             ++it;

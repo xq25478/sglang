@@ -82,12 +82,36 @@ private:
 
 }  // namespace
 
-bool remote_spec_debug_enabled() {
-    static const bool enabled = [] {
+int remote_spec_log_level() {
+    static const int level = [] {
         const char* env = std::getenv("REMOTE_SPEC_DEBUG");
-        return env && std::string(env) == "1";
+        if (env == nullptr) {
+            return 0;
+        }
+
+        char* end = nullptr;
+        long parsed = std::strtol(env, &end, 10);
+        if (end == env || parsed <= 0) {
+            return 0;
+        }
+        if (parsed == 1) {
+            return 1;
+        }
+        return 2;
     }();
-    return enabled;
+    return level;
+}
+
+bool remote_spec_info_enabled() {
+    return remote_spec_log_level() >= 1;
+}
+
+bool remote_spec_warn_enabled() {
+    return remote_spec_log_level() >= 1;
+}
+
+bool remote_spec_debug_enabled() {
+    return remote_spec_log_level() >= 2;
 }
 
 void remote_spec_enqueue_log(std::string msg) {

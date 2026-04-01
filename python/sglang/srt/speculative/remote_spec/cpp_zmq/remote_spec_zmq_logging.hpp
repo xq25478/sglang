@@ -10,6 +10,9 @@
 
 #include "remote_spec_protocol.hpp"
 
+int remote_spec_log_level();
+bool remote_spec_info_enabled();
+bool remote_spec_warn_enabled();
 bool remote_spec_debug_enabled();
 void remote_spec_enqueue_log(std::string msg);
 
@@ -44,7 +47,12 @@ void remote_spec_debug_log(const Args&... args) {
 
 template <typename... Args>
 void remote_spec_info_log(const Args&... args) {
-    remote_spec_log(true, args...);
+    remote_spec_log(remote_spec_info_enabled(), args...);
+}
+
+template <typename... Args>
+void remote_spec_warn_log(const Args&... args) {
+    remote_spec_log(remote_spec_warn_enabled(), args...);
 }
 
 inline long long remote_spec_duration_us(

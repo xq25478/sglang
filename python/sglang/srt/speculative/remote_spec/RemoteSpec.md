@@ -19,7 +19,6 @@ To enable EAGLE speculative decoding the following parameters are relevant:
 | REMOTE_SPEC_RECV_TIMEOUT_MS | The maximum time (ms) the target waits for the draft response. | 200 |
 | REMOTE_SPEC_FAILURE_THRESHOLD | The threshold of consecutive rounds without receiving draft responses that triggers the target to stop sending draft requests. | 30 |
 | REMOTE_SPEC_COOLDOWN_ROUNDS | The number of rounds for the target to resume sending draft requests after a cold start. | 100 |
-| REMOTE_SPEC_DEBUG | Enable ZMQ-related logging. | 0 |
-
+| REMOTE_SPEC_DEBUG | Enable RemoteSpec ZMQ logging. `0`: off, `1`: info+warn, `>=2`: debug (includes timing logs). | 0 |
 
 

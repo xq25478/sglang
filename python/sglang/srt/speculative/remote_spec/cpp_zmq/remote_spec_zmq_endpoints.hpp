@@ -368,7 +368,7 @@ public:
 protected:
     void record_malformed_frames(const char* channel, size_t frame_count) {
         auto total = malformed_event_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        remote_spec_info_log(
+        remote_spec_warn_log(
             "[ZMQ Warn] ",
             endpoint_type,
             " malformed ",
@@ -383,7 +383,7 @@ protected:
 
     void record_unexpected_ctrl_payload(const std::string& id, size_t payload_size) {
         auto total = malformed_event_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        remote_spec_info_log(
+        remote_spec_warn_log(
             "[ZMQ Warn] ",
             endpoint_type,
             " unexpected ctrl payload dropped on ",
@@ -399,7 +399,7 @@ protected:
     void record_incomplete_payload(const char* source, size_t payload_size) {
         auto total =
             incomplete_payload_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        remote_spec_info_log(
+        remote_spec_warn_log(
             "[ZMQ Warn] ",
             endpoint_type,
             " incomplete ",
@@ -417,7 +417,7 @@ protected:
         size_t payload_size,
         const std::string& detail) {
         auto total = unpack_failure_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        remote_spec_info_log(
+        remote_spec_warn_log(
             "[ZMQ Warn] ",
             endpoint_type,
             " failed to unpack ",
@@ -439,7 +439,7 @@ protected:
         auto total_requests = timeout_discard_request_count_.fetch_add(
                                    request_count, std::memory_order_relaxed) +
                                request_count;
-        remote_spec_info_log(
+        remote_spec_warn_log(
             "[ZMQ Warn] ",
             endpoint_type,
             " dropped timed out python_ready_queue items on ",
@@ -464,7 +464,7 @@ protected:
         auto total_requests = shutdown_drop_request_count_.fetch_add(
                                   request_count, std::memory_order_relaxed) +
                               request_count;
-        remote_spec_info_log(
+        remote_spec_warn_log(
             "[ZMQ Warn] ",
             endpoint_type,
             " dropped pending ",
@@ -484,7 +484,7 @@ protected:
     void record_send_after_stop_drop() {
         auto total =
             send_after_stop_drop_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        remote_spec_info_log(
+        remote_spec_warn_log(
             "[ZMQ Warn] ",
             endpoint_type,
             " dropped send after stop on ",
@@ -654,7 +654,7 @@ protected:
 
     void handle_tx_error(const zmq::error_t& e) {
         if (running_) {
-            remote_spec_info_log("[ZMQ Error] ", log_addr_, ": ", e.what());
+            remote_spec_warn_log("[ZMQ Error] ", log_addr_, ": ", e.what());
             auto err = e.num();
             if (err == ECONNRESET || err == ECONNREFUSED || err == ENETDOWN ||
                 err == ENETUNREACH || err == EHOSTUNREACH || err == ETIMEDOUT) {
@@ -665,7 +665,7 @@ protected:
 
     void handle_rx_error(const zmq::error_t& e) {
         if (running_) {
-            remote_spec_info_log("[ZMQ Error] ", log_addr_, ": ", e.what());
+            remote_spec_warn_log("[ZMQ Error] ", log_addr_, ": ", e.what());
             auto err = e.num();
             if (err == ECONNRESET || err == ECONNREFUSED || err == ENETDOWN ||
                 err == ENETUNREACH || err == EHOSTUNREACH || err == ETIMEDOUT) {
@@ -676,7 +676,7 @@ protected:
 
     void handle_ctrl_error(const zmq::error_t& e) {
         if (running_) {
-            remote_spec_info_log("[ZMQ Error] ", log_addr_, ": ", e.what());
+            remote_spec_warn_log("[ZMQ Error] ", log_addr_, ": ", e.what());
             auto err = e.num();
             if (err == ECONNRESET || err == ECONNREFUSED || err == ENETDOWN ||
                 err == ENETUNREACH || err == EHOSTUNREACH || err == ETIMEDOUT) {
@@ -686,7 +686,7 @@ protected:
     }
 
     void reconnect_tx_socket() {
-        remote_spec_info_log("[ZMQ Reconnecting] ", log_addr_);
+        remote_spec_warn_log("[ZMQ Reconnecting] ", log_addr_);
         tx_sock_.close();
         tx_sock_ = zmq::socket_t(internal_ctx_, sock_type_tag);
         static_cast<Derived*>(this)->do_setup_tx_socket();
@@ -695,7 +695,7 @@ protected:
     }
 
     void reconnect_rx_socket() {
-        remote_spec_info_log("[ZMQ Reconnecting] ", log_addr_);
+        remote_spec_warn_log("[ZMQ Reconnecting] ", log_addr_);
         rx_sock_.close();
         rx_sock_ = zmq::socket_t(internal_ctx_, sock_type_tag);
         static_cast<Derived*>(this)->do_setup_rx_socket();
@@ -704,7 +704,7 @@ protected:
     }
 
     void reconnect_ctrl_socket() {
-        remote_spec_info_log("[ZMQ Reconnecting] ", log_addr_);
+        remote_spec_warn_log("[ZMQ Reconnecting] ", log_addr_);
         ctrl_sock_.close();
         ctrl_sock_ = zmq::socket_t(internal_ctx_, sock_type_tag);
         static_cast<Derived*>(this)->do_setup_ctrl_socket();

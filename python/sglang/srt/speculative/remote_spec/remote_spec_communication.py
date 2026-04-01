@@ -17,6 +17,33 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+
+def get_remote_spec_log_level() -> int:
+    try:
+        level = int(os.getenv("REMOTE_SPEC_DEBUG", "0"))
+    except ValueError:
+        return 0
+    if level <= 0:
+        return 0
+    if level == 1:
+        return 1
+    return 2
+
+
+def remote_spec_info(msg: str) -> None:
+    if get_remote_spec_log_level() >= 1:
+        logger.info(msg)
+
+
+def remote_spec_warning(msg: str) -> None:
+    if get_remote_spec_log_level() >= 1:
+        logger.warning(msg)
+
+
+def remote_spec_debug(msg: str) -> None:
+    if get_remote_spec_log_level() >= 2:
+        logger.debug(msg)
+
 class RemoteSpecBaseCommunicator(ABC):
     '''
     RemoteSpecBaseCommunicator is the base class for all remote spec communicators.
@@ -217,7 +244,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
         
         self.config = config
         # 引入 debug 选项，用于耗时分析。
-        self.debug = int(os.getenv("REMOTE_SPEC_DEBUG","0"))
+        self.log_level = get_remote_spec_log_level()
         # Determine addresses based on role
         self.zmq_endpoint = config.get_addr()
         self.bind = not config.is_target
@@ -248,19 +275,21 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
     def start(self) -> None:
         """Start the ZMQ communication workers."""
         if self._running:
-            logger.debug("ZMQCommunicator already started")
+            remote_spec_debug("ZMQCommunicator already started")
             return
         
         if not self._running:
             self.zmq_communicator.start()
             self._running = True
-            logger.debug(f"ZMQ Communicator Started for {self.config.role} with identity {self.identity}")
+            remote_spec_info(
+                f"ZMQ Communicator Started for {self.config.role} with identity {self.identity}"
+            )
 
     def stop(self) -> None:
         if self._running:
             self.zmq_communicator.stop()
             self._running = False
-            logger.debug(f"ZMQ Communicator Stoped for {self.config.role}")
+            remote_spec_info(f"ZMQ Communicator Stoped for {self.config.role}")
         
     def _process_data(self, data:Any):
         if isinstance(data, RemoteSpecRequest):
@@ -275,15 +304,15 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
                         identity: str = "DRAFT") -> None:
         
         if not self._running:
-            logger.warning(f"Cannot send: communicator not running")
+            remote_spec_warning("Cannot send: communicator not running")
             return
         try:
-            if self.debug:
+            if self.log_level >= 2:
                 t1 = time.perf_counter()
                 
             msgs = [ self._process_data(request) for request in requests ]
             
-            if self.debug:
+            if self.log_level >= 2:
                 t2 = time.perf_counter()  
                 t_process = t2 - t1
                 
@@ -293,18 +322,20 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
                 # target 发送到指定 id 的 draft 端
                 self.zmq_communicator.send_objs(identity,msgs)
                 
-            if self.debug:
+            if self.log_level >= 2:
                 t3 = time.perf_counter()
-                logger.debug(f"[ZMQ LOG Pyt][SEND] msgs nums:{len(msgs)}, time_us:{(t3-t2)*1e6:.1f}-process time {t_process*1e6:.1f} us")    
+                remote_spec_debug(
+                    f"[ZMQ LOG Pyt][SEND] msgs nums:{len(msgs)}, time_us:{(t3-t2)*1e6:.1f}-process time {t_process*1e6:.1f} us"
+                )
 
         except Exception as e:
-            logger.error(f"Failed to send: {e}")
+            remote_spec_warning(f"Failed to send: {e}")
         
     def recv_all_objs(self) -> List[RemoteSpecRequest]:
         if not self._running:
             return []
         try:
-            if self.debug:
+            if self.log_level >= 2:
                 t1 = time.perf_counter()
             
             received = self.zmq_communicator.get_received_objs()
@@ -315,9 +346,11 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             else:
                 _msgs = received
 
-            if self.debug and _msgs:
+            if self.log_level >= 2 and _msgs:
                 t2 = time.perf_counter()
-                logger.debug(f"[ZMQ LOG Pyt][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}")
+                remote_spec_debug(
+                    f"[ZMQ LOG Pyt][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}"
+                )
 
             if not _msgs:
                 return []
@@ -331,7 +364,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
                 return msgs
                         
         except Exception as e:
-            logger.error(f"Failed to receive: {e}")
+            remote_spec_warning(f"Failed to receive: {e}")
             return []
     
     def is_running(self) -> bool:
