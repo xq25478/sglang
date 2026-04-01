@@ -1,32 +1,35 @@
-# setup.py
-import os
-import sys
-from setuptools import setup, Extension
-from setuptools.command.build_ext import build_ext
+from pathlib import Path
+
 import pybind11
+from setuptools import Extension, setup
+from setuptools.command.build_ext import build_ext
 
 # ==============================
-# zmq 库路径
+# ZMQ library paths
 # ==============================
-zmq_include_dir = "./"       # 根据你系统 zmq.hpp 所在路径修改
-zmq_lib_dir = "/usr/lib"               # zmq 库路径
-zmq_libs = ["zmq"]                     # 链接 libzmq.so
+BASE_DIR = Path(__file__).resolve().parent
+SRC_DIR = BASE_DIR / "src"
+INCLUDE_DIR = BASE_DIR / "include"
+THIRD_PARTY_DIR = BASE_DIR / "third_party"
+zmq_lib_dir = "/usr/lib"               # ZMQ library path
+zmq_libs = ["zmq"]                     # Link against libzmq.so
 
 # ==============================
-# 扩展模块
+# Extension module
 # ==============================
 ext_modules = [
     Extension(
-        "remote_spec_zmq",  # 编译出来的 Python 模块名
+        "remote_spec_zmq",  # Name of the generated Python module
         sources=[
-            "remote_spec_zmq.cpp",
-            "remote_spec_zmq_logging.cpp",
-            "remote_spec_zmq_serialization.cpp",
-            "remote_spec_zmq_endpoints.cpp",
+            str(SRC_DIR / "remote_spec_zmq.cpp"),
+            str(SRC_DIR / "remote_spec_zmq_logging.cpp"),
+            str(SRC_DIR / "remote_spec_zmq_serialization.cpp"),
+            str(SRC_DIR / "remote_spec_zmq_endpoints.cpp"),
         ],
         include_dirs=[
-            pybind11.get_include(),      # pybind11 头文件
-            zmq_include_dir,
+            pybind11.get_include(),      # pybind11 headers
+            str(INCLUDE_DIR),
+            str(THIRD_PARTY_DIR),
         ],
         library_dirs=[zmq_lib_dir],
         libraries=zmq_libs,

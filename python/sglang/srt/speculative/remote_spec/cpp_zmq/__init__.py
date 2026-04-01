@@ -7,7 +7,7 @@ from pathlib import Path
 FORCE_BUILD=False
 
 def build_cpp_zmq():
-    build_script = Path(__file__).parent / "build_cpp_zmq.sh"
+    build_script = Path(__file__).parent / "scripts" / "build_cpp_zmq.sh"
     if build_script.exists():
         print("[remote_spec_zmq] Compiling C++ extension...")
         ret = subprocess.run(["bash", str(build_script)],capture_output=True,text=True,)

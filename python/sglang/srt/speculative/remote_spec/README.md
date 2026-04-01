@@ -68,7 +68,7 @@ SPECTRE also relies on the C++ ZMQ extension under:
 
 You can build it by directly following:
 
-`python/sglang/srt/speculative/remote_spec/cpp_zmq/build_cpp_zmq.sh`
+`python/sglang/srt/speculative/remote_spec/cpp_zmq/scripts/build_cpp_zmq.sh`
 
 Equivalent steps are:
 

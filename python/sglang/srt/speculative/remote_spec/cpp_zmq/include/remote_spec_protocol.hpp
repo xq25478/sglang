@@ -13,8 +13,6 @@
 
 #include <zmq.hpp>
 #include <msgpack.hpp>
-#include <zmq.hpp>
-#include <msgpack.hpp>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -24,7 +22,7 @@ namespace py = pybind11;
 namespace remote_spec {
 
 // =====================================================
-// Enums 定义
+// Enum definitions
 // =====================================================
 enum class RemoteSpecAction {
     DRAFT  = 0,
@@ -41,7 +39,7 @@ enum class SpecType {
 
 } // namespace remote_spec
 
-// 注册枚举到 Msgpack
+// Register enums with Msgpack
 MSGPACK_ADD_ENUM(remote_spec::RemoteSpecAction);
 MSGPACK_ADD_ENUM(remote_spec::SpecType);
 
@@ -83,7 +81,7 @@ inline RemoteSpecAction str_to_remote_action(const std::string& s) {
 }
 
 // =====================================================
-// 数据结构定义
+// Data structure definitions
 // =====================================================
 
 struct SamplingParams {
@@ -149,7 +147,7 @@ struct RemoteSpecRequest {
 };
 
 // =====================================================
-// Python 互操作转换函数
+// Python interop conversion helpers
 // =====================================================
 
 inline SamplingParams sampling_params_from_py_dict(const py::dict& d) {

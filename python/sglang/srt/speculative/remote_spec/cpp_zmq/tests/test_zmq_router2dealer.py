@@ -1,35 +1,41 @@
-import time
-import threading
-import uuid
 import argparse
-import remote_spec_zmq as rsz
-from dataclasses import dataclass, field
-from typing import Optional, List
-from enum import Enum
-from random import randint
 import random
+import sys
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from random import randint
+from typing import List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import remote_spec_zmq as rsz
 
 ADDR = "tcp://127.0.0.1:9122"
 POLL_IDLE_SLEEP_S = 0.0002
 
+
 # =====================================================
-# 枚举定义
+# Enum definitions
 # =====================================================
 class RemoteSpecAction(Enum):
-    DRAFT = 'draft'
-    FINISH = 'finish'
-    ABORT = 'abort'
-    REJECT = 'reject'
+    DRAFT = "draft"
+    FINISH = "finish"
+    ABORT = "abort"
+    REJECT = "reject"
 
 
 class SpecType(Enum):
-    NORMAL = 'normal'
-    DRAFT_REQUEST = 'draft_request'
-    DRAFT_RESPONSE = 'draft_response'
+    NORMAL = "normal"
+    DRAFT_REQUEST = "draft_request"
+    DRAFT_RESPONSE = "draft_response"
 
 
 # =====================================================
-# 测试用结构体
+# Test-only data structure
 # =====================================================
 @dataclass
 class RemoteSpecRequest:
@@ -49,7 +55,7 @@ class RemoteSpecRequest:
     draft_send_time: float = -1.0
 
     def to_dict(self):
-        # 手工构造 dict，避免 asdict 对大 list 做递归深拷贝
+        # Build the dict manually to avoid recursive deep copies on large lists.
         return {
             "request_id": self.request_id,
             "spec_cnt": self.spec_cnt,
@@ -69,7 +75,7 @@ class RemoteSpecRequest:
 
 
 # =====================================================
-# Dealer 逻辑
+# Dealer logic
 # =====================================================
 def run_dealer(identity: str, infinite_loop: bool = False):
     dealer = rsz.DealerEndpoint(ADDR, identity, False)
@@ -96,7 +102,7 @@ def run_dealer(identity: str, infinite_loop: bool = False):
             print(f"DEALER SEND:{i=}-{batch_size=}")
             i += 1
             # time.sleep(1)
-            if not infinite_loop and i >= 20:  # 默认固定发送 20 条
+            if not infinite_loop and i >= 20:  # Send a fixed 20 batches by default.
                 break
 
     def receiver():
@@ -107,9 +113,11 @@ def run_dealer(identity: str, infinite_loop: bool = False):
                 print(f"DEALER RECV {i=}-{len(msgs)=}")
                 i += 1
                 msg = msgs[0]
-                d2t_time = (msg['target_recv_time'] - msg['draft_send_time']) / 1000.0
-                t2d_time = (msg['draft_recv_time'] - msg['target_send_time']) / 1000.0
-                print(f"d2t_time={d2t_time:.3f} ms-t2d_time={t2d_time:.3f} ms-count={len(msgs)}")
+                d2t_time = (msg["target_recv_time"] - msg["draft_send_time"]) / 1000.0
+                t2d_time = (msg["draft_recv_time"] - msg["target_send_time"]) / 1000.0
+                print(
+                    f"d2t_time={d2t_time:.3f} ms-t2d_time={t2d_time:.3f} ms-count={len(msgs)}"
+                )
             else:
                 time.sleep(POLL_IDLE_SLEEP_S)
             if not infinite_loop:
@@ -127,7 +135,7 @@ def run_dealer(identity: str, infinite_loop: bool = False):
 
 
 # =====================================================
-# Router 逻辑
+# Router logic
 # =====================================================
 def run_router(infinite_loop: bool = False):
     router = rsz.RouterEndpoint(ADDR, True)
@@ -154,11 +162,13 @@ def run_router(infinite_loop: bool = False):
 
 
 # =====================================================
-# CLI 入口
+# CLI entrypoint
 # =====================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZMQ Router/Dealer test")
-    parser.add_argument("--role", choices=["d", "r"], required=True, help="Role: d=dealer, r=router")
+    parser.add_argument(
+        "--role", choices=["d", "r"], required=True, help="Role: d=dealer, r=router"
+    )
     parser.add_argument("--infinite", action="store_true", help="Run in infinite loop mode")
     args = parser.parse_args()
 
