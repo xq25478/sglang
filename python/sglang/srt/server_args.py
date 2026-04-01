@@ -516,7 +516,7 @@ class ServerArgs:
     # Remote speculative decoding
     remote_speculative_role: Optional[Literal["target", "draft"]] = None
     remote_speculative_max_batch_size: int = 32
-    remote_speculative_reject_interval: int = 5000
+    remote_speculative_reject_interval: int = 500
     remote_speculative_no_draft_ratio: float = 0.5
     remote_speculative_retry_fail_ratio: float = 0.5
     remote_speculative_retry_min_count: int = 4
@@ -4905,7 +4905,7 @@ class ServerArgs:
             "--remote-speculative-role",
             type=str,
             choices=["target", "draft"],
-            help="The role of the remote speculative decoding. Can be one of 'target' (default) or 'draft'.",
+            help="The role of the remote speculative decoding. Can be one of 'target' or 'draft'.",
             default=ServerArgs.remote_speculative_role,
         )
         parser.add_argument(
@@ -4918,7 +4918,7 @@ class ServerArgs:
             "--remote-speculative-reject-interval",
             type=int,
             default=ServerArgs.remote_speculative_reject_interval,
-            help="The interval to resend draft requests to draft server. If the interval is 1, the server will resend the draft requests every time.",
+            help="The interval to resend draft requests to draft server.",
         )
         parser.add_argument(
             "--remote-speculative-no-draft-ratio",
@@ -4930,36 +4930,36 @@ class ServerArgs:
             "--remote-speculative-retry-fail-ratio",
             type=float,
             default=ServerArgs.remote_speculative_retry_fail_ratio,
-            help="Minimum ratio of failed (diverged/no-draft) requests to batch size required to trigger a retry. "
-                 "E.g. 0.5 means retry only when more than 50%% of requests have no valid draft. Default 0.0 (always retry).",
+            help="Minimum ratio of failed requests to batch size required to trigger a retry. "
+                 "E.g. 0.5 means retry only when more than 50%% of requests have no valid draft.",
         )
         parser.add_argument(
             "--remote-speculative-zmq-addr",
             type=str,
-            help="ZMQ address for remote speculative decoding, e.g., '127.0.0.1'.",
-            default="127.0.0.1",
+            default=ServerArgs.remote_speculative_zmq_addr,
+            help="ZMQ address for remote speculative decoding.",
         )
         parser.add_argument(
             "--remote-speculative-zmq-port",
             type=str,
-            help="ZMQ port for remote speculative decoding, e.g., '30009'.",
-            default="30009",
+            default=ServerArgs.remote_speculative_zmq_port,
+            help="ZMQ port for remote speculative decoding.",
         )
         parser.add_argument(
             "--remote-speculative-retry-min-count",
             type=int,
             default=ServerArgs.remote_speculative_retry_min_count,
-            help="Minimum number of failed requests required to trigger a retry. Default 4.",
+            help="Minimum number of failed requests required to trigger a retry.",
         )
         parser.add_argument(
             "--remote-speculative-draft-priority",
             action="store_true",
             default=ServerArgs.remote_speculative_draft_priority,
             help=(
-                "Enable Draft-Priority mode (v2 scheduler). "
+                "Enable Draft-Priority mode. "
                 "When set, the draft server decodes draft requests in a dedicated batch "
                 "for N steps before processing normal requests, preventing Normal-request "
-                "starvation of draft tokens. Default: False (mixed mode)."
+                "starvation of draft tokens."
             ),
         )
         parser.add_argument(
@@ -4967,11 +4967,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.remote_speculative_max_draft_priority_steps,
             help=(
-                "Maximum number of decode steps to run in Draft-Priority mode per iteration "
-                "(v2 scheduler). 0 means auto-compute from the maximum remaining steps across "
+                "Maximum number of decode steps to run in Draft-Priority mode per iteration. "
+                "0 means auto-compute from the maximum remaining steps across "
                 "all active draft requests. Positive values cap the steps to prevent Normal-"
                 "request starvation. Only effective when --remote-speculative-draft-priority "
-                "is set. Default: 0."
+                "is set."
             ),
         )
 

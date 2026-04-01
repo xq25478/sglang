@@ -256,6 +256,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
+
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
         predict = torch.empty(predict_shape, dtype=torch.int32, device=batch.device)
@@ -385,6 +386,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
+
         unfinished_index = []
         unfinished_accept_index = []
         accept_index_cpu = accept_index.tolist()
@@ -761,9 +763,6 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
         strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
         
-        # Handle RemoteSpecWorker case where topk_p, topk_index, hidden_states may be None or empty
-        # RemoteSpecWorker doesn't use these fields for draft generation
-        # Also check for empty tensors (e.g., from create_idle_input which creates shape (0, topk))
         has_topk_fields = (
             self.topk_p is not None and len(self.topk_p) > 0 and
             self.topk_index is not None and len(self.topk_index) > 0
@@ -810,13 +809,9 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             )
             return
 
-        # Handle RemoteSpecWorker case where topk_p, topk_index, hidden_states may be None
-        # RemoteSpecWorker doesn't use these fields for draft generation
-
         if spec_info is None:
             return
         
-        # Merge hidden_states
         if self.hidden_states is None:
             self.hidden_states = spec_info.hidden_states
         elif spec_info.hidden_states is not None:
@@ -824,19 +819,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
                 [self.hidden_states, spec_info.hidden_states], axis=0
             )
         
-        # Merge verified_id
         if self.verified_id is None:
             self.verified_id = spec_info.verified_id
         elif spec_info.verified_id is not None:
             self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], axis=0)
         
-        # Merge topk_p (only if both have it - for EagleWorker)
         if self.topk_p is None:
             self.topk_p = spec_info.topk_p
         elif spec_info.topk_p is not None:
             self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         
-        # Merge topk_index (only if both have it - for EagleWorker)
         if self.topk_index is None:
             self.topk_index = spec_info.topk_index
         elif spec_info.topk_index is not None:

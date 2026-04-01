@@ -328,9 +328,6 @@ class SchedulerOutputProcessorMixin:
 
         self.stream_output(batch.reqs, batch.return_logprob, skip_stream_req)
         
-        # Filter out finished requests from the batch to prevent memory leaks
-        # This is especially important for prefill-only requests (max_new_tokens=0)
-        # which complete immediately after prefill
         batch.filter_batch()
 
         can_run_cuda_graph = getattr(result, "can_run_cuda_graph", False)
@@ -482,12 +479,6 @@ class SchedulerOutputProcessorMixin:
                 req.time_stats.set_completion_time()
                 if self.spec_algorithm.is_remote() and self.server_args.remote_speculative_role == "target":
                     self.notify_draft_request_finished_or_aborted(req, RemoteSpecAction.FINISH)
-                    if self.tp_rank == 0:
-                        logger.debug(
-                            f"\033[34m ########### accept cnt: {req.accept_cnt}, "
-                            f"draft cnt: {req.draft_cnt}, accept rate: "
-                            f"{req.accept_cnt / req.draft_cnt if req.draft_cnt > 0 else 0} \033[0m"
-                        )
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -549,9 +540,7 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-            # V3: 检查draft请求是否需要pause
             if self.server_args.remote_speculative_role == "draft" and hasattr(self, '_check_and_pause_draft_req'):
-                # logger.info(f"\033[35m [Draft][Check and Pause] {req.rid} {len(req.origin_input_ids)=}, {len(req.output_ids)=}, {req.stable_boundary=}, {req.output_ids=}, {next_token_id=} \033[0m")
                 self._check_and_pause_draft_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -983,8 +972,6 @@ class SchedulerOutputProcessorMixin:
             if req is skip_req:
                 continue
             
-            # Skip draft spec requests - they should not be sent to detokenizer
-            # Draft requests are only for generating candidate tokens for target model
             if hasattr(req, 'spec_type') and req.spec_type == SpecType.DRAFT_REQUEST:
                 continue
 

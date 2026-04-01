@@ -711,40 +711,26 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
-        #! for speculative decoding
         self.draft_tokens: Optional[Dict[str, List[int]]] = None
-        # self.before_draft_fill_tokens: Optional[List[int]] = None
         self.len_output_ids: Optional[int] = None
         self.spec_cnt: Optional[int] = spec_cnt
         self.spec_type: Optional[SpecType] = spec_type
         self.cur_drafts: Optional[List[int]] = []
-        # ==================== Draft请求时间记录（按生命周期组织） ====================
-        # 1. 网络传输阶段
         self.target_send_time: Optional[float] = None
         self.draft_recv_time: Optional[float] = None
         self.draft_send_time: Optional[float] = None
         self.target_recv_time: Optional[float] = None
-        
-        #! add some draft / accept cnt
         self.draft_cnt: Optional[int] = 0
         self.accept_cnt: Optional[int] = 0
-        # ==================== V3: 分层KV管理（稳定/不稳定分离） ====================
-        # 核心思想：x(input) + y1~yn(稳定output) | yn+1~ylatest(不稳定output)
-        #          稳定部分由RadixCache管理，不稳定部分自主管理
-        self.stable_boundary: int = 0           # 稳定/不稳定的分界点（token数量）
-        self.skip_radix_lookup: bool = False    # 是否跳过RadixCache查找
-        self.promote_interval: int = 10         # 晋升间隔（每N个token晋升一次）
-        self.last_promote_time: float = 0.0     # 上次晋升时间戳
-        
-        # Draft请求生成控制
-        self.draft_tokens_target: int = 0       # 本次目标生成token数
-        self.draft_generation_start_len: int = 0 # 开始生成时的output_ids长度
-        self.draft_is_paused: bool = False      # 是否处于paused状态
-        
-        # KV回滚标记（分歧时使用）
-        self.needs_kv_rollback: bool = False    # 是否需要回滚KV
-        self.rollback_to_len: int = 0           # 回滚到的长度（fork_point）
-        self.rollback_old_len: int = 0          # 旧序列的长度（用于正确释放KV）
+        self.skip_radix_lookup: bool = False
+        self.promote_interval: int = 10
+        self.last_promote_time: float = 0.0
+        self.draft_tokens_target: int = 0
+        self.draft_generation_start_len: int = 0
+        self.draft_is_paused: bool = False
+        self.needs_kv_rollback: bool = False
+        self.rollback_to_len: int = 0
+        self.rollback_old_len: int = 0
         
         if return_logprob:
             # shape: (bs, 1)
@@ -857,28 +843,8 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
-        # For remote speculative decoding
         self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
-        # Expected format:
-        # {
-        #     # Required field:
-        #     "draft_tokens": torch.Tensor,      # shape: (num_steps,) - draft tokens on CPU
-        #     
-        #     # Optional field (reserved for future rejection sampling):
-        #     "draft_probs": torch.Tensor,       # shape: (num_steps,) - logprob of each draft token on CPU
-        # }
-        # 
-        # RemoteSpecWorker will automatically construct:
-        # - parent_list: [-1, 0, 1, ...] for linear chain (topk=1)
-        # - top_scores_index: [0, 1, 2, ...] for linear chain
-        # - verified_id from req.output_ids[-1]
-        # 
-        # TODO: Remove this test code after remote communication is implemented.
         self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
-        # {
-        #     "draft_tokens": torch.tensor([198, 106287, 3837], dtype=torch.int64, device="cpu"),
-        #     # "draft_probs": torch.tensor([0.9396, 0.8859, 0.8858], dtype=torch.float32, device="cpu"),  # optional
-        # }
         self.spec_cnt: int = 0
         self.len_output_ids: int = 0
         self.cur_drafts: Optional[List[int]] = []
@@ -946,8 +912,6 @@ class Req(ReqDllmMixin):
     def finished(self) -> bool:
         # Whether request reached finished condition
         if self.spec_type in {SpecType.DRAFT_REQUEST, SpecType.DRAFT_REQUEST.value}:
-            # Exception: prefix caching requests (max_new_tokens=0) should be allowed to finish
-            # These are not real draft requests that need verification from Target
             if self.sampling_params.max_new_tokens == 0:
                 return self.finished_reason is not None
             return False
@@ -1436,10 +1400,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
-    # For RemoteSpecWorker
-    # If None, falls back to server_args.speculative_num_draft_tokens
+
     draft_num_tokens: Optional[int] = None
-    is_high_overhead: bool = False # False means not high overhead, True means high overhead
+    is_high_overhead: bool = False
     recv_draft_fn: Optional[Callable] = None
     retry_fn: Optional[Callable] = None
     retry_fail_ratio: Optional[float] = None
