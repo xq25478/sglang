@@ -70,7 +70,7 @@ void DealerEndpoint::send_heartbeat() {
     last_heartbeat_send_time_ = std::chrono::steady_clock::now();
     if (remote_spec_debug_enabled()) {
         remote_spec_debug_log(
-            "[ZMQ LOG C++] ", identity_, " 发送心跳信号到 ", this->log_addr_);
+            "[ZMQ LOG C++] ", identity_, " sending heartbeat to ", this->log_addr_);
     }
 }
 
@@ -296,7 +296,7 @@ void RouterEndpoint::on_monitor_tick() {
     while (it != registered_dealers_.end()) {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second).count() > Base::DEALER_HEARTBEAT_TIMEOUT_MS) {
-            remote_spec_warn_log("[ZMQ Warn] ", it->first, " 心跳信号超时，剔除!");
+            remote_spec_warn_log("[ZMQ Warn] ", it->first, " heartbeat timed out, removing!");
             it = registered_dealers_.erase(it);
         } else {
             ++it;
@@ -345,7 +345,7 @@ void RouterEndpoint::dispatch_ctrl_frames(std::vector<zmq::message_t>&& frames) 
         registered_dealers_[id] = std::chrono::steady_clock::now();
         if (remote_spec_debug_enabled()) {
             remote_spec_debug_log(
-                "[ZMQ LOG C++] ", this->log_addr_, " 收到心跳信号，来自 ", id);
+                "[ZMQ LOG C++] ", this->log_addr_, " received heartbeat from ", id);
         }
         return;
     }
