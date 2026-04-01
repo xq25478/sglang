@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.speculative.remote_spec.remote_spec_protocol import SpecType
 
 if TYPE_CHECKING:
@@ -266,11 +267,11 @@ class RemoteSpecKVRollbacker:
         This is the ONLY place where RadixCache is updated during a request's
         lifecycle. Called when the request is finished (Target sends finish signal).
         
-        cache_finished_req will:
-        1. Insert valid tokens into RadixCache (for future prefix sharing)
-        2. Free duplicate KV indices
-        3. Release the req_pool slot
-        4. Release the lock on last_node
+        Same as the main scheduler path: ``release_kv_cache`` runs
+        ``cache_finished_req`` (radix insert / KV frees / lock) and then
+        ``req_to_token_pool.free(req)`` so the request slot re-enters
+        ``free_slots``.  Calling only ``cache_finished_req`` and clearing
+        ``req_pool_idx`` would leak the slot (see ``mem_cache.common``).
         
         Args:
             req: The request object
@@ -280,10 +281,9 @@ class RemoteSpecKVRollbacker:
         
         kv_len = req.kv_committed_len
         req.fill_ids = (req.origin_input_ids + req.output_ids)[:kv_len]
-        
-        self.tree_cache.cache_finished_req(req)
-        req.req_pool_idx = None
-        
+
+        release_kv_cache(req, self.tree_cache)
+
         if self.tp_rank == 0:
             logger.debug(
                 f"[RemoteSpecKVRollbacker] Released all KV for finished request {req.rid}"
@@ -304,10 +304,9 @@ class RemoteSpecKVRollbacker:
         
         kv_len = req.kv_committed_len
         req.fill_ids = (req.origin_input_ids + req.output_ids)[:kv_len]
-        
-        self.tree_cache.cache_finished_req(req)
-        req.req_pool_idx = None
-        
+
+        release_kv_cache(req, self.tree_cache)
+
         if self.tp_rank == 0:
             logger.debug(
                 f"[RemoteSpecKVRollbacker] Released all KV for re-prefill {req.rid}"

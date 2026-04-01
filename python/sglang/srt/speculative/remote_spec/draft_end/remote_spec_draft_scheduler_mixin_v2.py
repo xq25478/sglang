@@ -1460,7 +1460,6 @@ class RemoteSpecDraftSchedulerMixinV2:
             bootstrap_host=None,
             bootstrap_port=8998,
             bootstrap_room=None,
-            data_parallel_rank=None,
             vocab_size=self.model_config.vocab_size,
         )
 
