@@ -77,8 +77,8 @@ class DraftCircuitBreaker:
                 )
         elif self.consecutive_failures >= self.failure_threshold:
             if self.state != self.OPEN and self.tp_rank == 0:
-                logger.debug(
-                    f"\info[34m [CircuitBreaker] CLOSED -> OPEN after "
+                logger.info(
+                    f"\033[34m [CircuitBreaker] CLOSED -> OPEN after "
                     f"{self.consecutive_failures} consecutive timeouts, "
                     f"cooldown {self.cooldown_rounds} rounds \033[0m"
                 )
