@@ -480,32 +480,6 @@ class Scheduler(
 
         self.spec_forward_cycle = 0
 
-    def _find_fork_point(self, *args, **kwargs):
-        role = self.server_args.remote_speculative_role
-        if role == "draft":
-            return SchedulerRemoteSpecDraftMixin._find_fork_point(
-                self, *args, **kwargs
-            )
-        if role == "target":
-            return RemoteSpecTargetSchedulerMixin._find_fork_point(
-                self, *args, **kwargs
-            )
-        raise RuntimeError("_find_fork_point is only valid for remote speculative roles.")
-
-    def _is_self_high_overhead(self, *args, **kwargs):
-        role = self.server_args.remote_speculative_role
-        if role == "draft":
-            return SchedulerRemoteSpecDraftMixin._is_self_high_overhead(
-                self, *args, **kwargs
-            )
-        if role == "target":
-            return RemoteSpecTargetSchedulerMixin._is_self_high_overhead(
-                self, *args, **kwargs
-            )
-        raise RuntimeError(
-            "_is_self_high_overhead is only valid for remote speculative roles."
-        )
-
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
         if _is_npu:

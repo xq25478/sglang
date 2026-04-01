@@ -94,3 +94,7 @@ class RemoteSpecRequest:
             else:
                 init_kwargs[f.name] = val
         return cls(**init_kwargs)
+
+
+def is_health_check_req(req) -> bool:
+    return getattr(req, "rid", "").startswith("HEALTH_CHECK")

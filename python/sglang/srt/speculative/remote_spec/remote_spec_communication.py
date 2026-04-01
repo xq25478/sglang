@@ -1,23 +1,20 @@
 from abc import ABC, abstractmethod
-from typing import List, Any, Optional, Dict, Tuple, Union
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequest
-from sglang.srt.environ import envs, EnvStr
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.remote_spec.cpp_zmq import DealerEndpoint, RouterEndpoint
-
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, List
+import logging
 import os
 import time
-import logging
 import uuid
-import atexit
-import signal
-import sys
-import threading
+
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.remote_spec.cpp_zmq import DealerEndpoint, RouterEndpoint
+from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequest
 
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=None)
 def get_remote_spec_log_level() -> int:
     try:
         level = int(os.getenv("REMOTE_SPEC_DEBUG", "0"))
@@ -45,10 +42,6 @@ def remote_spec_debug(msg: str) -> None:
         logger.debug(msg)
 
 class RemoteSpecBaseCommunicator(ABC):
-    '''
-    RemoteSpecBaseCommunicator is the base class for all remote spec communicators.
-    It is responsible for sending and receiving RemoteSpecRequest.
-    '''
     def __init__(self) -> None:
         self.start()
 
@@ -75,60 +68,20 @@ class RemoteSpecBaseCommunicator(ABC):
 
 @dataclass
 class RemoteSpecConfig:
-    """
-    Configuration for Remote Speculative Decoding.
-    
-    This class encapsulates all configuration needed for remote speculative
-    decoding, including role, network settings, algorithm parameters, and
-    hardware configuration.
-    
-    Attributes:
-        role: Server role ("Target" or "Draft")
-        draft_as_router: IP address of the Draft server
-        zmq_port: Draft and Target Port for send and recv messages.
-        zmq_timeout: ZMQ communication timeout in seconds
-        num_draft_tokens: Number of draft tokens per round
-        topk: Tree width for speculative decoding
-        promote_interval: Interval for promoting stable boundary
-        page_size: KV cache page size
-        tp_size: Tensor parallel size
-        enable_cuda_graph: Whether CUDA graph is enabled
-    """
-    
-    # Role configuration
-    role: str = "target" # "Target" or "Draft"
-    
-    # Network configuration
+    role: str = "target"
     zmq_addr: str = "127.0.0.1"
     zmq_port: str = "30009"
-    
-    # Algorithm configuration
     num_draft_tokens: int = 5
     topk: int = 1
     promote_interval: int = 50
-    
-    # Hardware configuration
     page_size: int = 1
     tp_size: int = 1
     enable_cuda_graph: bool = False
-    
-    # transport
-    zmq_transport: str = "tcp" # 跨机 tcp / 同机 ipc 跳过网卡 性能最优   
+    zmq_transport: str = "tcp"
     
     @classmethod
     def from_server_args(cls, server_args: ServerArgs) -> "RemoteSpecConfig":
-        """
-        Create a RemoteSpecConfig from ServerArgs.
-        
-        Args:
-            server_args: Server arguments from command line
-            
-        Returns:
-            Configured RemoteSpecConfig instance
-        """
         zmq_addr = server_args.remote_speculative_zmq_addr or "127.0.0.1"
-        
-        # 单机最佳 ipc 多机选择 tcp
         if zmq_addr in ["127.0.0.1", "0.0.0.0"]:
             zmq_transport = "ipc"
         else:
@@ -148,22 +101,18 @@ class RemoteSpecConfig:
     
     @property
     def is_target(self) -> bool:
-        """Check if this is the Target server."""
         return self.role == "target"
     
     @property
     def is_draft(self) -> bool:
-        """Check if this is the Draft server."""
         return self.role == "draft"
     
     @property
     def supports_tree_draft(self) -> bool:
-        """Check if tree-structured draft is supported (topk > 1)."""
         return self.topk > 1
     
     @property
     def supports_paged_kv(self) -> bool:
-        """Check if paged KV cache is in use (page_size > 1)."""
         return self.page_size > 1
     
     def _get_ipc_base_path(self) -> str:
@@ -186,12 +135,6 @@ class RemoteSpecConfig:
         raise ValueError(f"Unsupported zmq transport: {self.zmq_transport}")
                 
     def validate(self) -> None:
-        """
-        Validate configuration.
-        
-        Raises:
-            ValueError: If configuration is invalid
-        """
         if self.role not in ("target", "draft"):
             raise ValueError(f"Invalid role: {self.role}. Must be 'target' or 'draft'")
 
@@ -223,29 +166,13 @@ class RemoteSpecConfig:
             f"tp_size={self.tp_size})"
         )
                
-class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
-    """
-    ZMQ-based communication backend.
-    
-    This implementation:
-    - Uses C++ ZMQ backend (DealerEndpoint) for efficient async communication
-    - Supports smart deduplication (keeps only latest spec_cnt per request)
-    - Uses batch serialization for efficiency
-    - Runs receive in a separate process to avoid GIL
-    
-    Args:
-        config: Remote speculative decoding configuration
-        context: Optional ZMQ context (created if not provided)
-    """    
+class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):   
     def __init__(
         self,
         config: RemoteSpecConfig,
     ):
-        
         self.config = config
-        # 引入 debug 选项，用于耗时分析。
         self.log_level = get_remote_spec_log_level()
-        # Determine addresses based on role
         self.zmq_endpoint = config.get_addr()
         self.bind = not config.is_target
         self._running = False
@@ -266,14 +193,13 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
         return id_string
     
     def get_all_drafts_identity(self) -> List[str]:
-        assert self.config.role == "target" # 该接口仅支持 target 模型
+        assert self.config.role == "target"
         return self.zmq_communicator.get_all_dealers()
         
     def get_endpoint(self) -> str:
         return self.zmq_endpoint
         
     def start(self) -> None:
-        """Start the ZMQ communication workers."""
         if self._running:
             remote_spec_debug("ZMQCommunicator already started")
             return
@@ -319,7 +245,6 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             if self.config.role == "draft":
                 self.zmq_communicator.send_objs(msgs)
             else:
-                # target 发送到指定 id 的 draft 端
                 self.zmq_communicator.send_objs(identity,msgs)
                 
             if self.log_level >= 2:
@@ -340,7 +265,6 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             
             received = self.zmq_communicator.get_received_objs()
                 
-            # target 端 收到消息 带有 draft 的 id
             if self.config.role == 'target':
                 _msgs = [ msg for _, msg in received ]
             else:
@@ -368,60 +292,4 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
             return []
     
     def is_running(self) -> bool:
-        """Check if the communicator is running."""
         return self._running
-    
-    
-if __name__ == "__main__":
-    import threading
-    import uuid
-    import time
-    from random import randint
-    from sglang.srt.sampling.sampling_params import SamplingParams
-
-    PAYLOAD_TOKENS = 20
-
-    remote_config_t = RemoteSpecConfig(role="target")
-    remote_config_d = RemoteSpecConfig(role="draft")
-
-    zmq_comm_t = RemoteSpecZMQCommunicator(remote_config_t)
-    zmq_comm_d = RemoteSpecZMQCommunicator(remote_config_d)
-
-    zmq_comm_t.start()
-    time.sleep(1)
-    zmq_comm_d.start()
-    time.sleep(1)
-
-    def make_req(i: int):
-        return RemoteSpecRequest(
-            request_id=str(uuid.uuid4()),
-            spec_cnt=i,
-            action="draft",
-            spec_type="draft_request",
-            input_ids=[randint(0, 32000) for _ in range(PAYLOAD_TOKENS)],
-            output_ids=[],
-            draft_token_ids=[randint(0, 32000) for _ in range(PAYLOAD_TOKENS)],
-            num_draft_tokens=5,
-            sampling_params=SamplingParams(temperature=1.0),
-            grammar=None,
-            target_send_time=time.time(),
-        )
-        
-    for i in range(10):
-        logger.debug(f"{i=}")
-        # msgs = zmq_comm_t.recv_all_objs()
-        # logger.debug(f"{msgs=}")
-        # msgs = zmq_comm_d.recv_all_objs()
-        # logger.debug(f"{msgs=}")     
-        zmq_comm_t.send_obj(make_req(0),zmq_comm_t.get_all_drafts_identity()[0])
-        zmq_comm_t.send_objs([make_req(i) for i in range(100)],zmq_comm_t.get_all_drafts_identity()[0])
-        
-        zmq_comm_d.send_obj(make_req(4))
-        zmq_comm_d.send_objs([make_req(i) for i in range(100)])
-        
-        time.sleep(0.01)
-        
-        msgs = zmq_comm_t.recv_all_objs()
-        # logger.debug(f"{msgs=}")
-        msgs = zmq_comm_d.recv_all_objs()
-        # logger.debug(f"{msgs=}")

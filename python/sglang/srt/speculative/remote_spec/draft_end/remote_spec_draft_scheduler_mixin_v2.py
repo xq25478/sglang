@@ -13,7 +13,7 @@ from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
     RemoteSpecAction,
     SpecType,
 )
-from sglang.srt.speculative.remote_spec.draft_end.remote_spec_state_mamager import (
+from sglang.srt.speculative.remote_spec.draft_end.remote_spec_state_manager import (
     RemoteSpecDraftState,
     RemoteSpecDraftStateManager,
 )
@@ -1045,7 +1045,6 @@ class RemoteSpecDraftSchedulerMixinV2:
             logger.debug(f"[Draft][Finish] {req_id=}")
 
     def _cleanup_stale_draft_states(self) -> None:
-        """Periodic cleanup of timed-out draft states."""
         for req_id in self.draft_state_manager.cleanup_stale_states():
             try:
                 self._finish_draft_request(req_id)
@@ -1098,8 +1097,7 @@ class RemoteSpecDraftSchedulerMixinV2:
         paused_count = len(paused_id_set)
         total_occupied = running_bs + paused_count
 
-        from sglang.srt.server_args import get_global_server_args
-        res = get_global_server_args().pp_max_micro_batch_size - total_occupied
+        res = self.server_args.pp_max_micro_batch_size - total_occupied
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res

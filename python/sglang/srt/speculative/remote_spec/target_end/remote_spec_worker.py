@@ -21,6 +21,9 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
+    is_health_check_req as _is_health_check,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import maybe_detect_nan
 
@@ -584,9 +587,6 @@ def _apply_drafts_to_req(
     req.cur_drafts = []
     req.draft_tokens_and_logits = _default_draft()
 
-
-def _is_health_check(req) -> bool:
-    return getattr(req, "rid", "").startswith("HEALTH_CHECK")
 
 def _default_draft() -> dict:
     return {

@@ -13,6 +13,7 @@ from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
     RemoteSpecAction,
     RemoteSpecRequest,
     SpecType,
+    is_health_check_req as _is_health_check,
 )
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 
@@ -557,5 +558,3 @@ class RemoteSpecTargetSchedulerMixin:
             return 1
         return self.server_args.speculative_num_draft_tokens
 
-def _is_health_check(req) -> bool:
-    return getattr(req, "rid", "").startswith("HEALTH_CHECK")
