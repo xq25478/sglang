@@ -5,7 +5,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 
 class SpectreAction(Enum):
     '''
-    SpectreAction is the action to take for the remote spec request.
+    SpectreAction is the action to take for the Spectre request.
     draft: normal draft request (D->T & T->D)
     finish: when req is finished in target (T->D)
     abort: when req is aborted in target (T->D)
@@ -19,7 +19,7 @@ class SpectreAction(Enum):
 
 class SpecType(Enum):
     '''
-    SpecType is the type of the remote spec request. It is used to distinguish the type of the request.
+    SpecType is the type of the Spectre request. It is used to distinguish the type of the request.
     normal: normal reques
     draft_request: draft request (D->T)
     draft_response: draft response (T->D)

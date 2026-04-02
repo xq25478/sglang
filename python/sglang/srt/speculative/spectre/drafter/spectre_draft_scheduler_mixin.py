@@ -1,5 +1,5 @@
 """
-Draft-side Scheduler Mixin for Remote Speculative Decoding.
+Draft-side Scheduler Mixin for Spectreulative Decoding.
 
 Local Rollback + Delayed Cache
 ==========================================
@@ -60,9 +60,9 @@ logger = logging.getLogger(__name__)
 
 class SpectreDraftSchedulerMixin:
     """
-    Scheduler mixin for Draft-side remote speculative decoding.
+    Scheduler mixin for Draft-side Spectreulative decoding.
     
-    SpectreDraftSchedulerMixin is used in the draft end of remote spec.
+    SpectreDraftSchedulerMixin is used in the draft end of Spectre.
     It is responsible for scheduling the draft requests and normal requests.
     
     Provides:

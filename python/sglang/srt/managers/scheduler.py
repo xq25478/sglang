@@ -444,7 +444,7 @@ class Scheduler(
         self.is_initializing = False
 
     def init_spectre_communication(self):
-        """Initialize remote speculative decoding communication."""
+        """Initialize Spectre communication."""
         role = self.server_args.spectre_role
         if role in ["target", "draft"]:
             from sglang.srt.speculative.spectre.spectre_communication import (
@@ -472,7 +472,7 @@ class Scheduler(
                 self.paused_reqs: List[Req] = []
                 self.paused_reqs_lock = threading.RLock()
         elif role is not None:
-            raise ValueError(f"Invalid remote speculative role: {role}")
+            raise ValueError(f"Invalid Spectre role: {role}")
 
         self.spec_forward_cycle = 0
 
@@ -1032,7 +1032,6 @@ class Scheduler(
                 draft_runner = self.draft_worker.draft_worker.draft_runner
             draft_token_to_kv_pool = draft_runner.token_to_kv_pool
             model_config = draft_runner.model_config
-        #! ToCheck(yw) Remote speculative decoding
         elif self.spec_algorithm.is_spectre():
             draft_token_to_kv_pool = None
         else:
@@ -2327,8 +2326,6 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
-        # For Remote Spec Draft: paused_reqs also occupy req_pool_idx
-        # Need to account for them when calculating available slots
         paused_count = 0
         if self.server_args.spectre_role == "draft":
             with self.paused_reqs_lock:

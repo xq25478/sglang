@@ -513,7 +513,7 @@ class ServerArgs:
     speculative_ngram_capacity: int = 10 * 1000 * 1000
     enable_multi_layer_eagle: bool = False
 
-    # Remote speculative decoding
+    # Spectre speculative decoding
     spectre_role: Optional[Literal["target", "draft"]] = None
     spectre_max_batch_size: int = 32
     spectre_reject_interval: int = 500
@@ -4900,25 +4900,25 @@ class ServerArgs:
             help="Enable multi-layer Eagle speculative decoding.",
         )
 
-        # Remote speculative decoding
+        # Spectre speculative decoding
         parser.add_argument(
             "--spectre-role",
             type=str,
             choices=["target", "draft"],
-            help="The role of the remote speculative decoding. Can be one of 'target' or 'draft'.",
+            help="The role of the Spectre speculative decoding. Can be one of 'target' or 'draft'.",
             default=ServerArgs.spectre_role,
         )
         parser.add_argument(
             "--spectre-max-batch-size",
             type=int,
             default=ServerArgs.spectre_max_batch_size,
-            help="The maximum batch size for remote speculative decoding. If the batch size is larger than this value, the server will be considered as high overhead.",
+            help="The maximum batch size for Spectre speculative decoding. If the batch size is larger than this value, the server will be considered as high overhead.",
         )
         parser.add_argument(
             "--spectre-reject-interval",
             type=int,
             default=ServerArgs.spectre_reject_interval,
-            help="The interval to resend draft requests to draft server.",
+            help="The interval to resend draft requests to Drafter server.",
         )
         parser.add_argument(
             "--spectre-no-draft-ratio",
@@ -4937,13 +4937,13 @@ class ServerArgs:
             "--spectre-zmq-addr",
             type=str,
             default=ServerArgs.spectre_zmq_addr,
-            help="ZMQ address for remote speculative decoding.",
+            help="ZMQ address for Spectre speculative decoding.",
         )
         parser.add_argument(
             "--spectre-zmq-port",
             type=str,
             default=ServerArgs.spectre_zmq_port,
-            help="ZMQ port for remote speculative decoding.",
+            help="ZMQ port for Spectre speculative decoding.",
         )
         parser.add_argument(
             "--spectre-retry-min-count",
@@ -4957,7 +4957,7 @@ class ServerArgs:
             default=ServerArgs.spectre_draft_priority,
             help=(
                 "Enable Draft-Priority mode. "
-                "When set, the draft server decodes draft requests in a dedicated batch "
+                "When set, the Drafter server decodes draft requests in a dedicated batch "
                 "for N steps before processing normal requests, preventing Normal-request "
                 "starvation of draft tokens."
             ),

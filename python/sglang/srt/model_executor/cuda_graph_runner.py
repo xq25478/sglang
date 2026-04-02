@@ -570,11 +570,11 @@ class CudaGraphRunner:
 
         self.is_spectre = model_runner.spec_algorithm.is_spectre()
         if self.is_spectre:
-            self.remote_ntpb_options = sorted(
+            self.spectre_ntpb_options = sorted(
                 set([1, self.num_tokens_per_bs]), reverse=True
             )
         else:
-            self.remote_ntpb_options = None
+            self.spectre_ntpb_options = None
         self.actual_ntpb = self.num_tokens_per_bs
         self._captured_attn_tensors = {}
 
@@ -583,7 +583,7 @@ class CudaGraphRunner:
                 logger,
                 f"[Spectre CudaGraph] is_spectre=True, "
                 f"num_tokens_per_bs={self.num_tokens_per_bs}, "
-                f"remote_ntpb_options={self.remote_ntpb_options}, "
+                f"spectre_ntpb_options={self.spectre_ntpb_options}, "
                 f"capture_forward_mode={self.capture_forward_mode}",
             )
 
@@ -749,7 +749,7 @@ class CudaGraphRunner:
             )
             is_bs_supported = (
                 is_bs_supported
-                and actual_ntpb in self.remote_ntpb_options
+                and actual_ntpb in self.spectre_ntpb_options
                 and forward_batch.forward_mode == expected_forward_mode
             )
 
@@ -865,14 +865,14 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                is_remote = _is_spectre(self)
+                is_spectre = _is_spectre(self)
                 ntpb_list = (
-                    getattr(self, "remote_ntpb_options", None)
-                    if is_remote
+                    getattr(self, "spectre_ntpb_options", None)
+                    if is_spectre
                     else None
                 ) or [self.num_tokens_per_bs]
                 for ntpb in ntpb_list:
-                    if is_remote:
+                    if is_spectre:
                         log_info_on_rank0(
                             logger,
                             f"[Spectre CudaGraph] Capturing: bs={bs}, "
@@ -884,7 +884,7 @@ class CudaGraphRunner:
                         num_tokens=bs * ntpb,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
-                        if is_remote:
+                        if is_spectre:
                             graph, output_buffers = self.capture_one_batch_size(
                                 bs, forward, stream_idx,
                                 ntpb_override=ntpb,
@@ -920,7 +920,7 @@ class CudaGraphRunner:
                         _capture_one_stream(i)
 
         if _is_spectre(self):
-            remote_keys = [
+            spectre_keys = [
                 k for k in self.graphs.keys()
                 if isinstance(k, str) and k.startswith("r")
             ]
@@ -929,7 +929,7 @@ class CudaGraphRunner:
                 logger,
                 f"[Spectre CudaGraph] Capture complete. "
                 f"Total graphs={len(self.graphs)}, "
-                f"Spectre keys (sample)={remote_keys[:10]}, "
+                f"Spectre keys (sample)={spectre_keys[:10]}, "
                 f"preserved_tensors={len(captured_tensors)}",
             )
 

@@ -1,13 +1,13 @@
 # SPECTRE
 
-**SPECTRE** (**Spec**ulative decoding with a **Re**mote drafter) is SGLang's remote speculative decoding mode.
+**SPECTRE** (**Spec**ulative decoding with a **Re**mote drafter) is SGLang's disaggregated speculative decoding mode.
 
 It separates the speculative pipeline into two independently deployed services:
 
 - **Verifier** (`--spectre-role target`): runs the large model, serves user traffic, verifies draft tokens.
 - **Drafter** (`--spectre-role draft`): runs the small model, generates draft tokens on behalf of the Verifier.
 
-Compared with local speculative decoding, SPECTRE offloads draft generation to a separate process or machine. This is useful when:
+Compared with local speculative decoding, SPECTRE offloads draft generation to a separate process or machine. This is useful in the following scenarios:
 
 - the large model is GPU-memory-bound and cannot co-host a draft model;
 - the small model can run on a separate GPU or node;

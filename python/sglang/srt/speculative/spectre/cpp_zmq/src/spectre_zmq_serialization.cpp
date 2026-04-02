@@ -238,7 +238,7 @@ void unpack_spectre_request(
     spectre::SpectreRequest& req) {
     if (obj.type != msgpack::type::ARRAY ||
         obj.via.array.size < kSpectreRequestFieldCount) {
-        throw std::runtime_error("invalid remote spec request payload");
+        throw std::runtime_error("invalid Spectre request payload");
     }
 
     const msgpack::object* fields = obj.via.array.ptr;
@@ -299,7 +299,7 @@ bool unpack_spectre_batch_payload(
 
         const auto& root = oh.get();
         if (root.type != msgpack::type::ARRAY) {
-            throw std::runtime_error("invalid remote spec batch payload");
+            throw std::runtime_error("invalid Spectre batch payload");
         }
 
         objs.reserve(root.via.array.size);
