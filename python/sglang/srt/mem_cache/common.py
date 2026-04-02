@@ -349,9 +349,6 @@ def alloc_for_extend(
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots.
-    # Remote draft requests may resume with an existing req_pool_idx that should
-    # bypass the normal alloc helper, while the remaining requests continue to
-    # use the current pool allocation logic.
     reqs_need_alloc: list[Req] = []
     req_pool_indices: list[Optional[int]] = []
     reqs_need_alloc_pos: list[int] = []

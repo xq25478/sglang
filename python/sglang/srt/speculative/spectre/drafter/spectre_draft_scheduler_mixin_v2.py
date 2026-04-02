@@ -29,7 +29,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 class DraftReqLocation(str, Enum):
-    """Explicit location states for Draft requests (replaces string-based location)."""
     DRAFT_WAITING = "draft_waiting"
     DRAFT_BATCH   = "draft_batch" 
     PAUSED        = "paused"
@@ -565,7 +564,6 @@ class SpectreDraftSchedulerMixinV2:
         state: SpectreDraftState,
     ) -> None:
         state.last_updated_time = time.time()
-        req.skip_radix_lookup = False
 
         current_len = len(req.origin_input_ids) + len(req.output_ids)
         target_len = len(target_fill_ids)
@@ -873,7 +871,6 @@ class SpectreDraftSchedulerMixinV2:
         req.output_ids = []
         req.prefix_indices = []
         req.extend_input_len = len(req.fill_ids)
-        req.skip_radix_lookup = False
 
         req.spec_cnt = draft_req.spec_cnt
         req.draft_tokens_target = draft_req.num_draft_tokens
@@ -1003,7 +1000,6 @@ class SpectreDraftSchedulerMixinV2:
         req.draft_generation_start_len = 0
         req.draft_is_paused = False
         req.len_output_ids = 0
-        req.skip_radix_lookup = False
         req.target_send_time = draft_req.target_send_time
         req.draft_recv_time = draft_req.draft_recv_time
 

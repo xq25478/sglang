@@ -543,8 +543,6 @@ class Req(ReqDllmMixin):
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
-        spec_cnt: Optional[int] = 0,
-        spec_type: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -711,10 +709,11 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val: Optional[List[float]] = None
         self.temp_input_token_ids_logprobs_idx: Optional[List[int]] = None
 
+        # for Spectre speculative decoding
         self.draft_tokens: Optional[Dict[str, List[int]]] = None
         self.len_output_ids: Optional[int] = None
-        self.spec_cnt: Optional[int] = spec_cnt
-        self.spec_type: Optional[SpecType] = spec_type
+        self.spec_cnt: Optional[int] = 0
+        self.spec_type: Optional[SpecType] = None
         self.cur_drafts: Optional[List[int]] = []
         self.target_send_time: Optional[float] = None
         self.draft_recv_time: Optional[float] = None
@@ -722,15 +721,12 @@ class Req(ReqDllmMixin):
         self.target_recv_time: Optional[float] = None
         self.draft_cnt: Optional[int] = 0
         self.accept_cnt: Optional[int] = 0
-        self.skip_radix_lookup: bool = False
         self.promote_interval: int = 10
         self.last_promote_time: float = 0.0
         self.draft_tokens_target: int = 0
         self.draft_generation_start_len: int = 0
         self.draft_is_paused: bool = False
-        self.needs_kv_rollback: bool = False
-        self.rollback_to_len: int = 0
-        self.rollback_old_len: int = 0
+        self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
         
         if return_logprob:
             # shape: (bs, 1)
@@ -843,13 +839,6 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
-        self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
-        self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
-        self.spec_cnt: int = 0
-        self.len_output_ids: int = 0
-        self.cur_drafts: Optional[List[int]] = []
-        self.draft_cnt: int = 0
-        self.accept_cnt: int = 0
 
     @property
     def seqlen(self) -> int:

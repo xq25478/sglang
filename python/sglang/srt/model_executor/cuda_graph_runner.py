@@ -799,18 +799,6 @@ class CudaGraphRunner:
             and is_ngram_supported
         )
 
-        if _is_spectre(self):
-            logger.debug(
-                f"[Spectre CudaGraph] can_run={result}, "
-                f"actual_ntpb={actual_ntpb}, cuda_graph_bs={cuda_graph_bs}, "
-                f"graph_key={graph_key}, "
-                f"is_bs_supported={is_bs_supported}, "
-                f"capture_hidden_mode_matches={capture_hidden_mode_matches}, "
-                f"input_ids.shape={forward_batch.input_ids.shape}, "
-                f"batch_size={forward_batch.batch_size}, "
-                f"forward_mode={forward_batch.forward_mode}"
-            )
-
         return result
 
     def _init_profile_context_and_memory_record(self):
@@ -1305,15 +1293,6 @@ class CudaGraphRunner:
                 get_current_stream_idx() if self.enable_pdmux else None,
                 actual_ntpb,
             )
-            logger.debug(
-                f"[Spectre CudaGraph] replay_prepare: "
-                f"actual_ntpb={actual_ntpb}, raw_bs={raw_bs}, "
-                f"raw_num_token={raw_num_token}, padded_bs={bs}, "
-                f"graph_key={graph_key_preview}, "
-                f"input_ids.shape={forward_batch.input_ids.shape}, "
-                f"spec_info.draft_token_num="
-                f"{getattr(forward_batch.spec_info, 'draft_token_num', 'N/A')}"
-            )
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1339,15 +1318,6 @@ class CudaGraphRunner:
             stream_idx,
             getattr(self, "actual_ntpb", None) if _is_spectre(self) else None,
         )
-
-        if _is_spectre(self):
-            logger.debug(
-                f"[Spectre CudaGraph] replay: "
-                f"graph_key={graph_key}, bs={self.bs}, "
-                f"raw_bs={self.raw_bs}, actual_ntpb={getattr(self, 'actual_ntpb', None)}, "
-                f"raw_num_token={self.raw_num_token}, "
-                f"key_in_graphs={graph_key in self.graphs}"
-            )
 
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]

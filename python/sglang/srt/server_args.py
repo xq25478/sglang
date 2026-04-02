@@ -520,8 +520,8 @@ class ServerArgs:
     spectre_no_draft_ratio: float = 0.5
     spectre_retry_fail_ratio: float = 0.5
     spectre_retry_min_count: int = 4
-    spectre_zmq_addr: Optional[str] = None
-    spectre_zmq_port: Optional[str] = None
+    spectre_zmq_addr: str = "127.0.0.1"
+    spectre_zmq_port: str = "30009"
     spectre_draft_priority: bool = False
     spectre_max_draft_priority_steps: int = 0
 
