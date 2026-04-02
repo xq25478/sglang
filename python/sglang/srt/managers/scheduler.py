@@ -231,10 +231,6 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-# Import from refactored remote speculative decoding module
-# from sglang.srt.speculative.remote_spec.draft_end.remote_spec_draft_scheduler_mixin import (
-#     RemoteSpecDraftSchedulerMixin as SchedulerRemoteSpecDraftMixin,
-# )
 from sglang.srt.speculative.remote_spec.draft_end.remote_spec_draft_scheduler_mixin_v2 import (
     RemoteSpecDraftSchedulerMixinV2 as SchedulerRemoteSpecDraftMixin,
 )
