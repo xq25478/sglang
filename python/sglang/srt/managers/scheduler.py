@@ -234,7 +234,7 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin_v2 import (
     SpectreDraftSchedulerMixinV2 as SchedulerSpectreDraftMixin,
 )
-from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import SpectreTargetSchedulerMixin
+from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import SchedulerSpectreTargetMixin
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -288,7 +288,7 @@ class Scheduler(
     SchedulerDPAttnMixin,
     SchedulerDllmMixin,
     SchedulerSpectreDraftMixin,
-    SpectreTargetSchedulerMixin,
+    SchedulerSpectreTargetMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 

@@ -122,7 +122,7 @@ python/sglang/srt/speculative/spectre/
 ├── spectre_communication.py     # SpectreConfig, SpectreZMQCommunicator
 │
 ├── verifier/                    # Target (large model) side
-│   ├── spectre_target_scheduler_mixin.py   # SpectreTargetSchedulerMixin, DraftCircuitBreaker
+│   ├── spectre_target_scheduler_mixin.py   # SchedulerSpectreTargetMixin, DraftCircuitBreaker
 │   └── spectre_worker.py                  # Worker thread / TP coordination
 │
 ├── drafter/                     # Draft (small model) side
@@ -152,7 +152,7 @@ Integration points in the broader SGLang codebase:
 |---|---|
 | `srt/server_args.py` | Defines all `spectre_*` CLI args and dataclass fields |
 | `srt/speculative/spec_info.py` | Registers `SPECTRE` algorithm type, routes to SPECTRE event loop |
-| `srt/managers/scheduler.py` | Mixes in `SpectreTargetSchedulerMixin` or `SpectreDraftSchedulerMixinV2` based on role |
+| `srt/managers/scheduler.py` | Mixes in `SchedulerSpectreTargetMixin` or `SpectreDraftSchedulerMixinV2` based on role |
 
 ---
 
@@ -222,7 +222,7 @@ The Verifier:
 
 Only the Verifier is exposed to clients. The Drafter is an internal backend service.
 
-Key class: `SpectreTargetSchedulerMixin` in `verifier/spectre_target_scheduler_mixin.py`.
+Key class: `SchedulerSpectreTargetMixin` in `verifier/spectre_target_scheduler_mixin.py`.
 
 ### 4.2 Drafter (draft server)
 

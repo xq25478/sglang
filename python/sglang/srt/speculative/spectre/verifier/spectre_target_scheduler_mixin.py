@@ -86,7 +86,7 @@ class DraftCircuitBreaker:
             self.state = self.OPEN
             self.rounds_in_open = 0
 
-class SpectreTargetSchedulerMixin:
+class SchedulerSpectreTargetMixin:
     def _init_draft_recv_infra(self):
         self._recv_timeout_s = (
             float(os.environ.get("SPECTRE_RECV_TIMEOUT_MS", "200")) / 1000.0
