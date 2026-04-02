@@ -449,18 +449,22 @@ class SchedulerSpectreTargetMixin:
         if self.tp_size == 1 or self.tp_rank == 0:
             if hasattr(self, "zmq_communicator") and self.zmq_communicator is not None:
                 draft_reqs = []
+                is_half_open = (
+                    self.draft_circuit_breaker.state == DraftCircuitBreaker.HALF_OPEN
+                )
                 for req in reqs_to_send:
+                    needs_full_context = req.spec_cnt == 0 or is_half_open
                     draft_reqs.append(
                         SpectreRequest(
                             request_id=req.rid,
                             spec_cnt=req.spec_cnt,
                             action=SpectreAction.DRAFT,
                             spec_type=SpecType.DRAFT_REQUEST,
-                            input_ids=req.origin_input_ids if req.spec_cnt == 0 else None,
+                            input_ids=req.origin_input_ids if needs_full_context else None,
                             output_ids=req.output_ids,
                             draft_token_ids=req.cur_drafts,
                             num_draft_tokens=speculative_num_draft_tokens,
-                            sampling_params=req.sampling_params if req.spec_cnt == 0 else None,
+                            sampling_params=req.sampling_params if needs_full_context else None,
                             grammar=None,
                         )
                     )
