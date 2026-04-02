@@ -1,4 +1,4 @@
-#include "remote_spec_zmq_logging.hpp"
+#include "spectre_zmq_logging.hpp"
 
 #include <condition_variable>
 #include <cstdio>
@@ -9,10 +9,10 @@
 
 namespace {
 
-class RemoteSpecAsyncLogger {
+class SpectreAsyncLogger {
 public:
-    static RemoteSpecAsyncLogger& instance() {
-        static RemoteSpecAsyncLogger logger;
+    static SpectreAsyncLogger& instance() {
+        static SpectreAsyncLogger logger;
         return logger;
     }
 
@@ -25,9 +25,9 @@ public:
     }
 
 private:
-    RemoteSpecAsyncLogger() : worker_(&RemoteSpecAsyncLogger::run, this) {}
+    SpectreAsyncLogger() : worker_(&SpectreAsyncLogger::run, this) {}
 
-    ~RemoteSpecAsyncLogger() {
+    ~SpectreAsyncLogger() {
         {
             std::lock_guard<std::mutex> lock(queue_mtx_);
             stopping_ = true;
@@ -82,9 +82,9 @@ private:
 
 }  // namespace
 
-int remote_spec_log_level() {
+int spectre_log_level() {
     static const int level = [] {
-        const char* env = std::getenv("REMOTE_SPEC_DEBUG");
+        const char* env = std::getenv("SPECTRE_DEBUG");
         if (env == nullptr) {
             return 0;
         }
@@ -102,18 +102,18 @@ int remote_spec_log_level() {
     return level;
 }
 
-bool remote_spec_info_enabled() {
-    return remote_spec_log_level() >= 1;
+bool spectre_info_enabled() {
+    return spectre_log_level() >= 1;
 }
 
-bool remote_spec_warn_enabled() {
-    return remote_spec_log_level() >= 1;
+bool spectre_warn_enabled() {
+    return spectre_log_level() >= 1;
 }
 
-bool remote_spec_debug_enabled() {
-    return remote_spec_log_level() >= 2;
+bool spectre_debug_enabled() {
+    return spectre_log_level() >= 2;
 }
 
-void remote_spec_enqueue_log(std::string msg) {
-    RemoteSpecAsyncLogger::instance().enqueue(std::move(msg));
+void spectre_enqueue_log(std::string msg) {
+    SpectreAsyncLogger::instance().enqueue(std::move(msg));
 }

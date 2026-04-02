@@ -4,7 +4,7 @@ import enum
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import SpecType
+from sglang.srt.speculative.spectre.spectre_protocol import SpecType
 from sglang.srt.utils.common import ceil_align, is_pin_memory_available
 
 # Copyright 2023-2024 SGLang Team

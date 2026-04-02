@@ -21,7 +21,7 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
+from sglang.srt.speculative.spectre.spectre_protocol import (
     is_health_check_req as _is_health_check,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -35,7 +35,7 @@ _DEFAULT_DRAFT = {
 }
 
 
-class RemoteSpecWorker:
+class SpectreWorker:
     def __init__(
         self,
         server_args: ServerArgs,
@@ -324,7 +324,7 @@ class RemoteSpecWorker:
         if self.enable_nan_detection:
             maybe_detect_nan(
                 logits_output.next_token_logits,
-                "RemoteSpecWorker verify logits",
+                "SpectreWorker verify logits",
             )
 
         torch.cuda.synchronize()

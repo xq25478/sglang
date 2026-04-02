@@ -1,8 +1,8 @@
-#include "remote_spec_zmq_endpoints.hpp"
+#include "spectre_zmq_endpoints.hpp"
 
 #include <utility>
 
-#include "remote_spec_zmq_serialization.hpp"
+#include "spectre_zmq_serialization.hpp"
 
 namespace {
 
@@ -68,42 +68,42 @@ void DealerEndpoint::send_heartbeat() {
             std::strlen(Base::DEALER_HEARTBEAT)),
         zmq::send_flags::none);
     last_heartbeat_send_time_ = std::chrono::steady_clock::now();
-    if (remote_spec_debug_enabled()) {
-        remote_spec_debug_log(
+    if (spectre_debug_enabled()) {
+        spectre_debug_log(
             "[ZMQ LOG C++] ", identity_, " sending heartbeat to ", this->log_addr_);
     }
 }
 
 void DealerEndpoint::send_objs(
-    const std::vector<remote_spec::RemoteSpecRequest>& reqs) {
+    const std::vector<spectre::SpectreRequest>& reqs) {
     auto copied_reqs = reqs;
     send_objs(std::move(copied_reqs));
 }
 
 void DealerEndpoint::send_objs(
-    std::vector<remote_spec::RemoteSpecRequest>&& reqs) {
-    stamp_request_batch(reqs, &remote_spec::RemoteSpecRequest::draft_send_time);
+    std::vector<spectre::SpectreRequest>&& reqs) {
+    stamp_request_batch(reqs, &spectre::SpectreRequest::draft_send_time);
     auto pack_start = std::chrono::steady_clock::now();
-    auto packed = pack_remote_spec_batch_payload(reqs);
+    auto packed = pack_spectre_batch_payload(reqs);
     auto pack_end = std::chrono::steady_clock::now();
-    remote_spec_debug_log(
+    spectre_debug_log(
         "[ZMQ LOG C++][PACK] nums=",
         reqs.size(),
         " bytes=",
         packed.size(),
         " time_us=",
-        remote_spec_duration_us(pack_start, pack_end));
+        spectre_duration_us(pack_start, pack_end));
     this->enqueue_send_raw(std::move(packed));
 }
 
-std::vector<remote_spec::RemoteSpecRequest> DealerEndpoint::get_received_objs() {
+std::vector<spectre::SpectreRequest> DealerEndpoint::get_received_objs() {
     auto wrapped_list = python_ready_queue_.pop_all();
     size_t total_size = 0;
     for (auto& wrapped : wrapped_list) {
         total_size += wrapped.data->size();
     }
 
-    std::vector<remote_spec::RemoteSpecRequest> out;
+    std::vector<spectre::SpectreRequest> out;
     out.reserve(total_size);
     for (auto& wrapped : wrapped_list) {
         for (auto& obj : *wrapped.data) {
@@ -155,18 +155,18 @@ void DealerEndpoint::handle_tx_send(std::string& data) {
     auto start = std::chrono::steady_clock::now();
     this->tx_sock_.send(zmq::buffer(data), zmq::send_flags::none);
     auto end = std::chrono::steady_clock::now();
-    remote_spec_debug_log(
+    spectre_debug_log(
         "[ZMQ LOG C++][SEND] bytes=",
         data.size(),
         " time_us=",
-        remote_spec_duration_us(start, end));
+        spectre_duration_us(start, end));
 }
 
 void DealerEndpoint::process_incoming_data(DealerRawBuffer&& raw) {
     try {
         auto reqs = request_batch_pool_.acquire();
         auto unpack_start = std::chrono::steady_clock::now();
-        bool ok = unpack_remote_spec_batch_payload(
+        bool ok = unpack_spectre_batch_payload(
             batch_unpacker_, raw.payload.data(), raw.payload.size(), *reqs);
         auto unpack_end = std::chrono::steady_clock::now();
         if (!ok) {
@@ -174,14 +174,14 @@ void DealerEndpoint::process_incoming_data(DealerRawBuffer&& raw) {
             return;
         }
 
-        remote_spec_debug_log(
+        spectre_debug_log(
             "[ZMQ LOG C++][UNPACK] nums=",
             reqs->size(),
             " bytes=",
             raw.payload.size(),
             " time_us=",
-            remote_spec_duration_us(unpack_start, unpack_end));
-        stamp_request_batch(*reqs, &remote_spec::RemoteSpecRequest::draft_recv_time);
+            spectre_duration_us(unpack_start, unpack_end));
+        stamp_request_batch(*reqs, &spectre::SpectreRequest::draft_recv_time);
         python_ready_queue_.push({std::move(reqs), std::chrono::steady_clock::now()});
     } catch (const std::exception& e) {
         this->record_unpack_failure("dealer", raw.payload.size(), e.what());
@@ -233,29 +233,29 @@ void RouterEndpoint::on_ctrl_loop_tick() {}
 
 void RouterEndpoint::send_objs(
     const std::string& id,
-    const std::vector<remote_spec::RemoteSpecRequest>& reqs) {
+    const std::vector<spectre::SpectreRequest>& reqs) {
     auto copied_reqs = reqs;
     send_objs(id, std::move(copied_reqs));
 }
 
 void RouterEndpoint::send_objs(
     const std::string& id,
-    std::vector<remote_spec::RemoteSpecRequest>&& reqs) {
-    stamp_request_batch(reqs, &remote_spec::RemoteSpecRequest::target_send_time);
+    std::vector<spectre::SpectreRequest>&& reqs) {
+    stamp_request_batch(reqs, &spectre::SpectreRequest::target_send_time);
     auto pack_start = std::chrono::steady_clock::now();
-    auto packed = pack_remote_spec_batch_payload(reqs);
+    auto packed = pack_spectre_batch_payload(reqs);
     auto pack_end = std::chrono::steady_clock::now();
-    remote_spec_debug_log(
+    spectre_debug_log(
         "[ZMQ LOG C++][PACK] nums=",
         reqs.size(),
         " bytes=",
         packed.size(),
         " time_us=",
-        remote_spec_duration_us(pack_start, pack_end));
+        spectre_duration_us(pack_start, pack_end));
     this->enqueue_send_raw({id, std::move(packed)});
 }
 
-std::vector<std::pair<std::string, remote_spec::RemoteSpecRequest>>
+std::vector<std::pair<std::string, spectre::SpectreRequest>>
 RouterEndpoint::get_received_objs() {
     auto wrapped_list = python_ready_queue_.pop_all();
     size_t total_size = 0;
@@ -263,7 +263,7 @@ RouterEndpoint::get_received_objs() {
         total_size += wrapped.data.second->size();
     }
 
-    std::vector<std::pair<std::string, remote_spec::RemoteSpecRequest>> out;
+    std::vector<std::pair<std::string, spectre::SpectreRequest>> out;
     out.reserve(total_size);
     for (auto& wrapped : wrapped_list) {
         const std::string& id = wrapped.data.first;
@@ -296,7 +296,7 @@ void RouterEndpoint::on_monitor_tick() {
     while (it != registered_dealers_.end()) {
         if (std::chrono::duration_cast<std::chrono::milliseconds>(
                 now - it->second).count() > Base::DEALER_HEARTBEAT_TIMEOUT_MS) {
-            remote_spec_warn_log("[ZMQ Warn] ", it->first, " heartbeat timed out, removing!");
+            spectre_warn_log("[ZMQ Warn] ", it->first, " heartbeat timed out, removing!");
             it = registered_dealers_.erase(it);
         } else {
             ++it;
@@ -343,8 +343,8 @@ void RouterEndpoint::dispatch_ctrl_frames(std::vector<zmq::message_t>&& frames) 
     if (is_heartbeat_payload(payload)) {
         std::lock_guard<std::mutex> lk(reg_mtx_);
         registered_dealers_[id] = std::chrono::steady_clock::now();
-        if (remote_spec_debug_enabled()) {
-            remote_spec_debug_log(
+        if (spectre_debug_enabled()) {
+            spectre_debug_log(
                 "[ZMQ LOG C++] ", this->log_addr_, " received heartbeat from ", id);
         }
         return;
@@ -358,18 +358,18 @@ void RouterEndpoint::handle_tx_send(std::pair<std::string, std::string>& data) {
     this->tx_sock_.send(zmq::buffer(data.first), zmq::send_flags::sndmore);
     this->tx_sock_.send(zmq::buffer(data.second), zmq::send_flags::none);
     auto end = std::chrono::steady_clock::now();
-    remote_spec_debug_log(
+    spectre_debug_log(
         "[ZMQ LOG C++][SEND] bytes=",
         data.second.size(),
         " time_us=",
-        remote_spec_duration_us(start, end));
+        spectre_duration_us(start, end));
 }
 
 void RouterEndpoint::process_incoming_data(RouterRawBuffer&& raw) {
     try {
         auto reqs = request_batch_pool_.acquire();
         auto unpack_start = std::chrono::steady_clock::now();
-        bool ok = unpack_remote_spec_batch_payload(
+        bool ok = unpack_spectre_batch_payload(
             batch_unpacker_, raw.payload.data(), raw.payload.size(), *reqs);
         auto unpack_end = std::chrono::steady_clock::now();
         if (!ok) {
@@ -377,14 +377,14 @@ void RouterEndpoint::process_incoming_data(RouterRawBuffer&& raw) {
             return;
         }
 
-        remote_spec_debug_log(
+        spectre_debug_log(
             "[ZMQ LOG C++][UNPACK] nums=",
             reqs->size(),
             " bytes=",
             raw.payload.size(),
             " time_us=",
-            remote_spec_duration_us(unpack_start, unpack_end));
-        stamp_request_batch(*reqs, &remote_spec::RemoteSpecRequest::target_recv_time);
+            spectre_duration_us(unpack_start, unpack_end));
+        stamp_request_batch(*reqs, &spectre::SpectreRequest::target_recv_time);
         python_ready_queue_.push(
             {{std::move(raw.id), std::move(reqs)}, std::chrono::steady_clock::now()});
     } catch (const std::exception& e) {

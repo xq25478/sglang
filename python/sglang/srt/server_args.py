@@ -514,16 +514,16 @@ class ServerArgs:
     enable_multi_layer_eagle: bool = False
 
     # Remote speculative decoding
-    remote_speculative_role: Optional[Literal["target", "draft"]] = None
-    remote_speculative_max_batch_size: int = 32
-    remote_speculative_reject_interval: int = 500
-    remote_speculative_no_draft_ratio: float = 0.5
-    remote_speculative_retry_fail_ratio: float = 0.5
-    remote_speculative_retry_min_count: int = 4
-    remote_speculative_zmq_addr: Optional[str] = None
-    remote_speculative_zmq_port: Optional[str] = None
-    remote_speculative_draft_priority: bool = False
-    remote_speculative_max_draft_priority_steps: int = 0
+    spectre_role: Optional[Literal["target", "draft"]] = None
+    spectre_max_batch_size: int = 32
+    spectre_reject_interval: int = 500
+    spectre_no_draft_ratio: float = 0.5
+    spectre_retry_fail_ratio: float = 0.5
+    spectre_retry_min_count: int = 4
+    spectre_zmq_addr: Optional[str] = None
+    spectre_zmq_port: Optional[str] = None
+    spectre_draft_priority: bool = False
+    spectre_max_draft_priority_steps: int = 0
 
     # Expert parallelism
     ep_size: int = 1
@@ -4763,7 +4763,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "REMOTE"],
+            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM", "SPECTRE"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4902,59 +4902,59 @@ class ServerArgs:
 
         # Remote speculative decoding
         parser.add_argument(
-            "--remote-speculative-role",
+            "--spectre-role",
             type=str,
             choices=["target", "draft"],
             help="The role of the remote speculative decoding. Can be one of 'target' or 'draft'.",
-            default=ServerArgs.remote_speculative_role,
+            default=ServerArgs.spectre_role,
         )
         parser.add_argument(
-            "--remote-speculative-max-batch-size",
+            "--spectre-max-batch-size",
             type=int,
-            default=ServerArgs.remote_speculative_max_batch_size,
+            default=ServerArgs.spectre_max_batch_size,
             help="The maximum batch size for remote speculative decoding. If the batch size is larger than this value, the server will be considered as high overhead.",
         )
         parser.add_argument(
-            "--remote-speculative-reject-interval",
+            "--spectre-reject-interval",
             type=int,
-            default=ServerArgs.remote_speculative_reject_interval,
+            default=ServerArgs.spectre_reject_interval,
             help="The interval to resend draft requests to draft server.",
         )
         parser.add_argument(
-            "--remote-speculative-no-draft-ratio",
+            "--spectre-no-draft-ratio",
             type=float,
-            default=ServerArgs.remote_speculative_no_draft_ratio,
+            default=ServerArgs.spectre_no_draft_ratio,
             help="The ratio of requests with no draft tokens to the total batch size. If the ratio is larger than this value, the server will only decode one token.",
         )
         parser.add_argument(
-            "--remote-speculative-retry-fail-ratio",
+            "--spectre-retry-fail-ratio",
             type=float,
-            default=ServerArgs.remote_speculative_retry_fail_ratio,
+            default=ServerArgs.spectre_retry_fail_ratio,
             help="Minimum ratio of failed requests to batch size required to trigger a retry. "
                  "E.g. 0.5 means retry only when more than 50%% of requests have no valid draft.",
         )
         parser.add_argument(
-            "--remote-speculative-zmq-addr",
+            "--spectre-zmq-addr",
             type=str,
-            default=ServerArgs.remote_speculative_zmq_addr,
+            default=ServerArgs.spectre_zmq_addr,
             help="ZMQ address for remote speculative decoding.",
         )
         parser.add_argument(
-            "--remote-speculative-zmq-port",
+            "--spectre-zmq-port",
             type=str,
-            default=ServerArgs.remote_speculative_zmq_port,
+            default=ServerArgs.spectre_zmq_port,
             help="ZMQ port for remote speculative decoding.",
         )
         parser.add_argument(
-            "--remote-speculative-retry-min-count",
+            "--spectre-retry-min-count",
             type=int,
-            default=ServerArgs.remote_speculative_retry_min_count,
+            default=ServerArgs.spectre_retry_min_count,
             help="Minimum number of failed requests required to trigger a retry.",
         )
         parser.add_argument(
-            "--remote-speculative-draft-priority",
+            "--spectre-draft-priority",
             action="store_true",
-            default=ServerArgs.remote_speculative_draft_priority,
+            default=ServerArgs.spectre_draft_priority,
             help=(
                 "Enable Draft-Priority mode. "
                 "When set, the draft server decodes draft requests in a dedicated batch "
@@ -4963,14 +4963,14 @@ class ServerArgs:
             ),
         )
         parser.add_argument(
-            "--remote-speculative-max-draft-priority-steps",
+            "--spectre-max-draft-priority-steps",
             type=int,
-            default=ServerArgs.remote_speculative_max_draft_priority_steps,
+            default=ServerArgs.spectre_max_draft_priority_steps,
             help=(
                 "Maximum number of decode steps to run in Draft-Priority mode per iteration. "
                 "0 means auto-compute from the maximum remaining steps across "
                 "all active draft requests. Positive values cap the steps to prevent Normal-"
-                "request starvation. Only effective when --remote-speculative-draft-priority "
+                "request starvation. Only effective when --spectre-draft-priority "
                 "is set."
             ),
         )

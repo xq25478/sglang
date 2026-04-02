@@ -3,13 +3,13 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "remote_spec_protocol.hpp"
-#include "remote_spec_zmq_endpoints.hpp"
-#include "remote_spec_zmq_serialization.hpp"
+#include "spectre_protocol.hpp"
+#include "spectre_zmq_endpoints.hpp"
+#include "spectre_zmq_serialization.hpp"
 
 namespace py = pybind11;
 
-PYBIND11_MODULE(remote_spec_zmq, m) {
+PYBIND11_MODULE(spectre_zmq, m) {
     py::class_<DealerEndpoint>(m, "DealerEndpoint")
         .def(py::init<const std::string&, const std::string&, bool>())
         .def("start", &DealerEndpoint::start)
@@ -28,7 +28,7 @@ PYBIND11_MODULE(remote_spec_zmq, m) {
                 return self.get_received_objs();
             }();
             for (auto& obj : datas) {
-                out.append(remote_spec::to_py_dict(obj));
+                out.append(spectre::to_py_dict(obj));
             }
             return out;
         });
@@ -52,7 +52,7 @@ PYBIND11_MODULE(remote_spec_zmq, m) {
                 return self.get_received_objs();
             }();
             for (auto& p : datas) {
-                out.append(py::make_tuple(p.first, remote_spec::to_py_dict(p.second)));
+                out.append(py::make_tuple(p.first, spectre::to_py_dict(p.second)));
             }
             return out;
         });

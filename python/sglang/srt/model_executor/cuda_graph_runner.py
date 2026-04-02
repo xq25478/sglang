@@ -501,8 +501,8 @@ def set_global_graph_memory_pool(val):
     global_graph_memory_pool = val
 
 
-def _is_remote_spec(runner) -> bool:
-    return getattr(runner, "is_remote_spec", False)
+def _is_spectre(runner) -> bool:
+    return getattr(runner, "is_spectre", False)
 
 
 class CudaGraphRunner:
@@ -555,7 +555,7 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
-            or model_runner.spec_algorithm.is_remote()
+            or model_runner.spec_algorithm.is_spectre()
         ):
             if self.model_runner.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -568,8 +568,8 @@ class CudaGraphRunner:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
 
-        self.is_remote_spec = model_runner.spec_algorithm.is_remote()
-        if self.is_remote_spec:
+        self.is_spectre = model_runner.spec_algorithm.is_spectre()
+        if self.is_spectre:
             self.remote_ntpb_options = sorted(
                 set([1, self.num_tokens_per_bs]), reverse=True
             )
@@ -578,10 +578,10 @@ class CudaGraphRunner:
         self.actual_ntpb = self.num_tokens_per_bs
         self._captured_attn_tensors = {}
 
-        if self.is_remote_spec:
+        if self.is_spectre:
             log_info_on_rank0(
                 logger,
-                f"[RemoteSpec CudaGraph] is_remote_spec=True, "
+                f"[Spectre CudaGraph] is_spectre=True, "
                 f"num_tokens_per_bs={self.num_tokens_per_bs}, "
                 f"remote_ntpb_options={self.remote_ntpb_options}, "
                 f"capture_forward_mode={self.capture_forward_mode}",
@@ -692,7 +692,7 @@ class CudaGraphRunner:
         stream_idx: Optional[int] = None,
         ntpb: Optional[int] = None,
     ):
-        if _is_remote_spec(self) and ntpb is not None:
+        if _is_spectre(self) and ntpb is not None:
             base_key = f"r{ntpb}_{bs}"
         else:
             base_key = bs
@@ -701,7 +701,7 @@ class CudaGraphRunner:
         return base_key
 
     def _get_actual_ntpb(self, forward_batch: ForwardBatch) -> int:
-        if _is_remote_spec(self):
+        if _is_spectre(self):
             if forward_batch.spec_info is not None:
                 return getattr(
                     forward_batch.spec_info,
@@ -721,7 +721,7 @@ class CudaGraphRunner:
                 if (
                     self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
-                    or _is_remote_spec(self)
+                    or _is_spectre(self)
                 )
                 else max(forward_batch.global_num_tokens_cpu)
             )
@@ -732,7 +732,7 @@ class CudaGraphRunner:
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx,
-            actual_ntpb if _is_remote_spec(self) else None,
+            actual_ntpb if _is_spectre(self) else None,
         )
 
         is_bs_supported = (
@@ -741,7 +741,7 @@ class CudaGraphRunner:
             else cuda_graph_bs <= self.max_bs
         )
 
-        if _is_remote_spec(self):
+        if _is_spectre(self):
             expected_forward_mode = (
                 ForwardMode.DECODE
                 if actual_ntpb == 1 and forward_batch.spec_info is None
@@ -799,9 +799,9 @@ class CudaGraphRunner:
             and is_ngram_supported
         )
 
-        if _is_remote_spec(self):
+        if _is_spectre(self):
             logger.debug(
-                f"[RemoteSpec CudaGraph] can_run={result}, "
+                f"[Spectre CudaGraph] can_run={result}, "
                 f"actual_ntpb={actual_ntpb}, cuda_graph_bs={cuda_graph_bs}, "
                 f"graph_key={graph_key}, "
                 f"is_bs_supported={is_bs_supported}, "
@@ -865,7 +865,7 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                is_remote = _is_remote_spec(self)
+                is_remote = _is_spectre(self)
                 ntpb_list = (
                     getattr(self, "remote_ntpb_options", None)
                     if is_remote
@@ -875,7 +875,7 @@ class CudaGraphRunner:
                     if is_remote:
                         log_info_on_rank0(
                             logger,
-                            f"[RemoteSpec CudaGraph] Capturing: bs={bs}, "
+                            f"[Spectre CudaGraph] Capturing: bs={bs}, "
                             f"ntpb={ntpb}, num_tokens={bs * ntpb}",
                         )
                     with patch_model(
@@ -919,7 +919,7 @@ class CudaGraphRunner:
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
 
-        if _is_remote_spec(self):
+        if _is_spectre(self):
             remote_keys = [
                 k for k in self.graphs.keys()
                 if isinstance(k, str) and k.startswith("r")
@@ -927,9 +927,9 @@ class CudaGraphRunner:
             captured_tensors = getattr(self, "_captured_attn_tensors", {})
             log_info_on_rank0(
                 logger,
-                f"[RemoteSpec CudaGraph] Capture complete. "
+                f"[Spectre CudaGraph] Capture complete. "
                 f"Total graphs={len(self.graphs)}, "
-                f"RemoteSpec keys (sample)={remote_keys[:10]}, "
+                f"Spectre keys (sample)={remote_keys[:10]}, "
                 f"preserved_tensors={len(captured_tensors)}",
             )
 
@@ -1030,7 +1030,7 @@ class CudaGraphRunner:
 
         effective_forward_mode = (
             ForwardMode.DECODE
-            if _is_remote_spec(self) and spec_info is None and ntpb == 1
+            if _is_spectre(self) and spec_info is None and ntpb == 1
             else self.capture_forward_mode
         )
 
@@ -1116,7 +1116,7 @@ class CudaGraphRunner:
             spec_info,
         )
 
-        if _is_remote_spec(self) and ntpb_override is not None:
+        if _is_spectre(self) and ntpb_override is not None:
             capture_key = self._make_graph_key(bs, stream_idx, ntpb_override)
             fwd_meta = attn_backend.forward_metadata
             captured = getattr(self, "_captured_attn_tensors", None)
@@ -1238,7 +1238,7 @@ class CudaGraphRunner:
                 if (
                     self.model_runner.spec_algorithm.is_eagle()
                     or self.model_runner.spec_algorithm.is_standalone()
-                    or _is_remote_spec(self)
+                    or _is_spectre(self)
                 )
                 else max_num_tokens
             )
@@ -1279,7 +1279,7 @@ class CudaGraphRunner:
 
         effective_replay_mode = (
             ForwardMode.DECODE
-            if _is_remote_spec(self) and actual_ntpb == 1 and forward_batch.spec_info is None
+            if _is_spectre(self) and actual_ntpb == 1 and forward_batch.spec_info is None
             else self.capture_forward_mode
         )
         attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -1299,14 +1299,14 @@ class CudaGraphRunner:
         self.bs = bs
         self.actual_ntpb = actual_ntpb
 
-        if _is_remote_spec(self):
+        if _is_spectre(self):
             graph_key_preview = self._make_graph_key(
                 bs,
                 get_current_stream_idx() if self.enable_pdmux else None,
                 actual_ntpb,
             )
             logger.debug(
-                f"[RemoteSpec CudaGraph] replay_prepare: "
+                f"[Spectre CudaGraph] replay_prepare: "
                 f"actual_ntpb={actual_ntpb}, raw_bs={raw_bs}, "
                 f"raw_num_token={raw_num_token}, padded_bs={bs}, "
                 f"graph_key={graph_key_preview}, "
@@ -1337,12 +1337,12 @@ class CudaGraphRunner:
         graph_key = self._make_graph_key(
             self.bs,
             stream_idx,
-            getattr(self, "actual_ntpb", None) if _is_remote_spec(self) else None,
+            getattr(self, "actual_ntpb", None) if _is_spectre(self) else None,
         )
 
-        if _is_remote_spec(self):
+        if _is_spectre(self):
             logger.debug(
-                f"[RemoteSpec CudaGraph] replay: "
+                f"[Spectre CudaGraph] replay: "
                 f"graph_key={graph_key}, bs={self.bs}, "
                 f"raw_bs={self.raw_bs}, actual_ntpb={getattr(self, 'actual_ntpb', None)}, "
                 f"raw_num_token={self.raw_num_token}, "
@@ -1403,7 +1403,7 @@ class CudaGraphRunner:
                     seq_lens_cpu=None,
                 )
 
-        elif self.model_runner.spec_algorithm.is_remote():
+        elif self.model_runner.spec_algorithm.is_spectre():
             from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
             if self.model_runner.is_draft_worker:

@@ -1,4 +1,4 @@
-#include "remote_spec_zmq_serialization.hpp"
+#include "spectre_zmq_serialization.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -26,7 +26,7 @@ constexpr bool kNativeLittleEndian = false;
 constexpr bool kNativeLittleEndian = true;
 #endif
 
-constexpr uint32_t kRemoteSpecRequestFieldCount = 15;
+constexpr uint32_t kSpectreRequestFieldCount = 15;
 
 template <typename T>
 inline void pack_optional_value(
@@ -39,7 +39,7 @@ inline void pack_optional_value(
     }
 }
 
-inline uint32_t remote_spec_load_le_u32(const char* src) {
+inline uint32_t spectre_load_le_u32(const char* src) {
     return static_cast<uint32_t>(static_cast<unsigned char>(src[0])) |
            (static_cast<uint32_t>(static_cast<unsigned char>(src[1])) << 8) |
            (static_cast<uint32_t>(static_cast<unsigned char>(src[2])) << 16) |
@@ -123,10 +123,10 @@ void pack_optional_float_vector_bin(
     pk.pack_bin_body(scratch.data(), byte_size);
 }
 
-void pack_remote_spec_request(
+void pack_spectre_request(
     msgpack::packer<StringStream>& pk,
-    const remote_spec::RemoteSpecRequest& req) {
-    pk.pack_array(kRemoteSpecRequestFieldCount);
+    const spectre::SpectreRequest& req) {
+    pk.pack_array(kSpectreRequestFieldCount);
     pack_optional_value(pk, req.request_id);
     pack_optional_value(pk, req.spec_cnt);
     pk.pack(req.action);
@@ -190,7 +190,7 @@ void unpack_optional_int_vector_bin(
 
     for (size_t i = 0; i < vec.size(); ++i) {
         vec[i] = static_cast<int>(static_cast<int32_t>(
-            remote_spec_load_le_u32(bin.ptr + i * sizeof(int32_t))));
+            spectre_load_le_u32(bin.ptr + i * sizeof(int32_t))));
     }
 }
 
@@ -228,24 +228,24 @@ void unpack_optional_float_vector_bin(
     }
 
     for (size_t i = 0; i < vec.size(); ++i) {
-        uint32_t bits = remote_spec_load_le_u32(bin.ptr + i * sizeof(float));
+        uint32_t bits = spectre_load_le_u32(bin.ptr + i * sizeof(float));
         std::memcpy(&vec[i], &bits, sizeof(bits));
     }
 }
 
-void unpack_remote_spec_request(
+void unpack_spectre_request(
     const msgpack::object& obj,
-    remote_spec::RemoteSpecRequest& req) {
+    spectre::SpectreRequest& req) {
     if (obj.type != msgpack::type::ARRAY ||
-        obj.via.array.size < kRemoteSpecRequestFieldCount) {
+        obj.via.array.size < kSpectreRequestFieldCount) {
         throw std::runtime_error("invalid remote spec request payload");
     }
 
     const msgpack::object* fields = obj.via.array.ptr;
     unpack_optional_value(fields[0], req.request_id);
     unpack_optional_value(fields[1], req.spec_cnt);
-    req.action = fields[2].as<remote_spec::RemoteSpecAction>();
-    req.spec_type = fields[3].as<remote_spec::SpecType>();
+    req.action = fields[2].as<spectre::SpectreAction>();
+    req.spec_type = fields[3].as<spectre::SpecType>();
     unpack_optional_int_vector_bin(fields[4], req.draft_token_ids);
     unpack_optional_int_vector_bin(fields[5], req.input_ids);
     unpack_optional_int_vector_bin(fields[6], req.output_ids);
@@ -261,8 +261,8 @@ void unpack_remote_spec_request(
 
 }  // namespace
 
-std::string pack_remote_spec_batch_payload(
-    const std::vector<remote_spec::RemoteSpecRequest>& objs) {
+std::string pack_spectre_batch_payload(
+    const std::vector<spectre::SpectreRequest>& objs) {
     thread_local size_t cached_capacity = 4096;
     std::string raw_data;
     raw_data.reserve(cached_capacity);
@@ -270,7 +270,7 @@ std::string pack_remote_spec_batch_payload(
     msgpack::packer<StringStream> pk(ss);
     pk.pack_array(objs.size());
     for (const auto& obj : objs) {
-        pack_remote_spec_request(pk, obj);
+        pack_spectre_request(pk, obj);
     }
     if (raw_data.capacity() > cached_capacity) {
         cached_capacity = raw_data.capacity();
@@ -278,11 +278,11 @@ std::string pack_remote_spec_batch_payload(
     return raw_data;
 }
 
-bool unpack_remote_spec_batch_payload(
+bool unpack_spectre_batch_payload(
     msgpack::unpacker& unpacker,
     const void* data,
     size_t len,
-    std::vector<remote_spec::RemoteSpecRequest>& objs) {
+    std::vector<spectre::SpectreRequest>& objs) {
     try {
         objs.clear();
         unpacker.reserve_buffer(len);
@@ -305,7 +305,7 @@ bool unpack_remote_spec_batch_payload(
         objs.reserve(root.via.array.size);
         for (uint32_t i = 0; i < root.via.array.size; ++i) {
             objs.emplace_back();
-            unpack_remote_spec_request(root.via.array.ptr[i], objs.back());
+            unpack_spectre_request(root.via.array.ptr[i], objs.back());
         }
         unpacker.remove_nonparsed_buffer();
         unpacker.reset_zone();
@@ -318,12 +318,12 @@ bool unpack_remote_spec_batch_payload(
     }
 }
 
-std::vector<remote_spec::RemoteSpecRequest> from_py_list(
+std::vector<spectre::SpectreRequest> from_py_list(
     const pybind11::list& objs) {
-    std::vector<remote_spec::RemoteSpecRequest> out;
+    std::vector<spectre::SpectreRequest> out;
     out.reserve(static_cast<size_t>(pybind11::len(objs)));
     for (auto item : objs) {
-        out.push_back(remote_spec::from_py_dict(item.cast<pybind11::dict>()));
+        out.push_back(spectre::from_py_dict(item.cast<pybind11::dict>()));
     }
     return out;
 }

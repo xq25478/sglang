@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class RemoteSpecDraftState:
+class SpectreDraftState:
     req_id: str
     spec_cnt: int
     req_object: Optional["Req"]
@@ -24,18 +24,18 @@ class RemoteSpecDraftState:
     timeout_threshold: float = 30.0  # seconds
 
 
-class RemoteSpecDraftStateManager:
+class SpectreDraftStateManager:
     def __init__(self, timeout_threshold: float = 60.0):
-        self.active_draft_states: Dict[str, RemoteSpecDraftState] = {}
+        self.active_draft_states: Dict[str, SpectreDraftState] = {}
         self._lock = threading.Lock()
         self.time_out_cycle = 200
         self.timeout_threshold = timeout_threshold
 
-    def get_state(self, req_id: str) -> Optional[RemoteSpecDraftState]:
+    def get_state(self, req_id: str) -> Optional[SpectreDraftState]:
         with self._lock:
             return self.active_draft_states.get(req_id)
         
-    def set_state(self, req_id: str, state: RemoteSpecDraftState):
+    def set_state(self, req_id: str, state: SpectreDraftState):
         with self._lock:
             self.active_draft_states[req_id] = state
     
@@ -48,10 +48,10 @@ class RemoteSpecDraftStateManager:
         with self._lock:
             return req_id in self.active_draft_states
         
-    def get(self, req_id: str) -> Optional[RemoteSpecDraftState]:
+    def get(self, req_id: str) -> Optional[SpectreDraftState]:
         return self.get_state(req_id)
     
-    def set(self, req_id: str, state: RemoteSpecDraftState) -> None:
+    def set(self, req_id: str, state: SpectreDraftState) -> None:
         self.set_state(req_id, state)
     
     def delete(self, req_id: str) -> bool:
@@ -92,9 +92,9 @@ class RemoteSpecDraftStateManager:
         location: str = "waiting_queue",
         prefix_length: int = 0,
         output_length: int = 0,
-    ) -> RemoteSpecDraftState:
+    ) -> SpectreDraftState:
         now = time.time()
-        state = RemoteSpecDraftState(
+        state = SpectreDraftState(
             req_id=req_id,
             spec_cnt=spec_cnt,
             req_object=req_object,

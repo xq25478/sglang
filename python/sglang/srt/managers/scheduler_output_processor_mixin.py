@@ -21,8 +21,8 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
-    RemoteSpecAction,
+from sglang.srt.speculative.spectre.spectre_protocol import (
+    SpectreAction,
     SpecType,
 )
 
@@ -192,8 +192,8 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                        if self.spec_algorithm.is_remote() and self.server_args.remote_speculative_role == "target":
-                            self.notify_draft_request_finished_or_aborted(req, RemoteSpecAction.FINISH)
+                        if self.spec_algorithm.is_spectre() and self.server_args.spectre_role == "target":
+                            self.notify_draft_request_finished_or_aborted(req, SpectreAction.FINISH)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
@@ -478,8 +478,8 @@ class SchedulerOutputProcessorMixin:
                     release_kv_cache(req, self.tree_cache)
 
                 req.time_stats.set_completion_time()
-                if self.spec_algorithm.is_remote() and self.server_args.remote_speculative_role == "target":
-                    self.notify_draft_request_finished_or_aborted(req, RemoteSpecAction.FINISH)
+                if self.spec_algorithm.is_spectre() and self.server_args.spectre_role == "target":
+                    self.notify_draft_request_finished_or_aborted(req, SpectreAction.FINISH)
 
             self.maybe_collect_customized_info(i, req, logits_output)
 
@@ -541,7 +541,7 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-            if self.server_args.remote_speculative_role == "draft" and hasattr(self, '_check_and_pause_draft_req'):
+            if self.server_args.spectre_role == "draft" and hasattr(self, '_check_and_pause_draft_req'):
                 self._check_and_pause_draft_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)

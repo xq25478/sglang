@@ -19,12 +19,12 @@ zmq_libs = ["zmq"]                     # Link against libzmq.so
 # ==============================
 ext_modules = [
     Extension(
-        "remote_spec_zmq",  # Name of the generated Python module
+        "spectre_zmq",  # Name of the generated Python module
         sources=[
-            str(SRC_DIR / "remote_spec_zmq.cpp"),
-            str(SRC_DIR / "remote_spec_zmq_logging.cpp"),
-            str(SRC_DIR / "remote_spec_zmq_serialization.cpp"),
-            str(SRC_DIR / "remote_spec_zmq_endpoints.cpp"),
+            str(SRC_DIR / "spectre_zmq.cpp"),
+            str(SRC_DIR / "spectre_zmq_logging.cpp"),
+            str(SRC_DIR / "spectre_zmq_serialization.cpp"),
+            str(SRC_DIR / "spectre_zmq_endpoints.cpp"),
         ],
         include_dirs=[
             pybind11.get_include(),      # pybind11 headers
@@ -43,7 +43,7 @@ ext_modules = [
 # setup
 # ==============================
 setup(
-    name="remote_spec_zmq",
+    name="spectre_zmq",
     version="0.1.0",
     author="zhangyu",
     description="Full duplex ZMQ C++ module for Python",

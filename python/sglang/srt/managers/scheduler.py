@@ -231,10 +231,10 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-from sglang.srt.speculative.remote_spec.draft_end.remote_spec_draft_scheduler_mixin_v2 import (
-    RemoteSpecDraftSchedulerMixinV2 as SchedulerRemoteSpecDraftMixin,
+from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin_v2 import (
+    SpectreDraftSchedulerMixinV2 as SchedulerSpectreDraftMixin,
 )
-from sglang.srt.speculative.remote_spec.target_end.remote_spec_target_scheduler_mixin import RemoteSpecTargetSchedulerMixin
+from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import SpectreTargetSchedulerMixin
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -287,8 +287,8 @@ class Scheduler(
     SchedulerPPMixin,
     SchedulerDPAttnMixin,
     SchedulerDllmMixin,
-    SchedulerRemoteSpecDraftMixin,
-    RemoteSpecTargetSchedulerMixin,
+    SchedulerSpectreDraftMixin,
+    SpectreTargetSchedulerMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
@@ -430,7 +430,7 @@ class Scheduler(
         # Init request dispatcher
         self.init_request_dispatcher()
 
-        self.init_remote_spec_communication()
+        self.init_spectre_communication()
 
         # Init LoRA overlap loader
         if self.enable_lora_overlap_loading:
@@ -443,18 +443,18 @@ class Scheduler(
 
         self.is_initializing = False
 
-    def init_remote_spec_communication(self):
+    def init_spectre_communication(self):
         """Initialize remote speculative decoding communication."""
-        role = self.server_args.remote_speculative_role
+        role = self.server_args.spectre_role
         if role in ["target", "draft"]:
-            from sglang.srt.speculative.remote_spec.remote_spec_communication import (
-                RemoteSpecConfig,
-                RemoteSpecZMQCommunicator,
+            from sglang.srt.speculative.spectre.spectre_communication import (
+                SpectreConfig,
+                SpectreZMQCommunicator,
             )
 
-            remote_spec_config = RemoteSpecConfig.from_server_args(self.server_args)
+            spectre_config = SpectreConfig.from_server_args(self.server_args)
             if self.tp_size == 1 or self.tp_rank == 0:
-                self.zmq_communicator = RemoteSpecZMQCommunicator(config=remote_spec_config)
+                self.zmq_communicator = SpectreZMQCommunicator(config=spectre_config)
                 self.zmq_communicator.start()
                 logger.debug(
                     "\033[33m ================ ZMQ Communicator Started ================\033[0m"
@@ -1033,7 +1033,7 @@ class Scheduler(
             draft_token_to_kv_pool = draft_runner.token_to_kv_pool
             model_config = draft_runner.model_config
         #! ToCheck(yw) Remote speculative decoding
-        elif self.spec_algorithm.is_remote():
+        elif self.spec_algorithm.is_spectre():
             draft_token_to_kv_pool = None
         else:
             # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
@@ -2330,7 +2330,7 @@ class Scheduler(
         # For Remote Spec Draft: paused_reqs also occupy req_pool_idx
         # Need to account for them when calculating available slots
         paused_count = 0
-        if self.server_args.remote_speculative_role == "draft":
+        if self.server_args.spectre_role == "draft":
             with self.paused_reqs_lock:
                 if hasattr(self, 'paused_reqs'):
                     paused_count = len(self.paused_reqs)
@@ -3110,8 +3110,8 @@ class Scheduler(
                 if clear_cache_pool is not None:
                     clear_cache_pool()
 
-            if self.spec_algorithm.is_remote():
-                self.reset_remote_spec_target_state()
+            if self.spec_algorithm.is_spectre():
+                self.reset_spectre_target_state()
 
             # TODO: allow optional empty cache
             torch.cuda.empty_cache()
@@ -3545,13 +3545,13 @@ def dispatch_event_loop(scheduler: Scheduler):
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
-        elif server_args.remote_speculative_role == "draft":
-            scheduler.event_loop_normal_remote_spec_draft()
+        elif server_args.spectre_role == "draft":
+            scheduler.event_loop_normal_spectre_draft()
         elif (
-            scheduler.spec_algorithm.is_remote()
-            and scheduler.server_args.remote_speculative_role == "target"
+            scheduler.spec_algorithm.is_spectre()
+            and scheduler.server_args.spectre_role == "target"
         ):
-            scheduler.event_loop_normal_remote_spec_target()
+            scheduler.event_loop_normal_spectre_target()
         elif server_args.pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap:

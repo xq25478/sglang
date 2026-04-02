@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import SpecType
+from sglang.srt.speculative.spectre.spectre_protocol import SpecType
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class RemoteSpecKVRollbacker:
+class SpectreKVRollbacker:
     def __init__(
         self,
         token_to_kv_pool_allocator: "TokenToKVPoolAllocator",
@@ -71,7 +71,7 @@ class RemoteSpecKVRollbacker:
         if self.page_size > 1:
             if self.tp_rank == 0:
                 logger.warning(
-                    f"[RemoteSpecKVRollbacker] local_rollback called with page_size={self.page_size}, "
+                    f"[SpectreKVRollbacker] local_rollback called with page_size={self.page_size}, "
                     "this is not safe! Use re-prefill instead."
                 )
             return False
@@ -86,7 +86,7 @@ class RemoteSpecKVRollbacker:
         if fork_point < prefix_len:
             if self.tp_rank == 0:
                 logger.error(
-                    f"[RemoteSpecKVRollbacker] local_rollback called with fork_point={fork_point} < "
+                    f"[SpectreKVRollbacker] local_rollback called with fork_point={fork_point} < "
                     f"prefix_len={prefix_len}, this would free RadixCache indices! Aborting."
                 )
             return False
@@ -99,7 +99,7 @@ class RemoteSpecKVRollbacker:
             if start >= end:
                 if self.tp_rank == 0:
                     logger.warning(
-                        f"[RemoteSpecKVRollbacker] Invalid rollback range for {req.rid}: "
+                        f"[SpectreKVRollbacker] Invalid rollback range for {req.rid}: "
                         f"start={start}, end={end}, max_len={max_len}"
                     )
                 return False
@@ -117,7 +117,7 @@ class RemoteSpecKVRollbacker:
             
             if self.tp_rank == 0:
                 logger.debug(
-                    f"[RemoteSpecKVRollbacker] Local rollback for {req.rid}: "
+                    f"[SpectreKVRollbacker] Local rollback for {req.rid}: "
                     f"freed [{fork_point}, {current_kv_len}), "
                     f"kv_committed: {old_committed} -> {req.kv_committed_len}, "
                     f"kv_allocated: {old_allocated} -> {req.kv_allocated_len}, "
@@ -127,7 +127,7 @@ class RemoteSpecKVRollbacker:
         except Exception as e:
             if self.tp_rank == 0:
                 logger.warning(
-                    f"[RemoteSpecKVRollbacker] Failed to local_rollback for {req.rid}: {e}"
+                    f"[SpectreKVRollbacker] Failed to local_rollback for {req.rid}: {e}"
                 )
             return False
     
@@ -142,7 +142,7 @@ class RemoteSpecKVRollbacker:
 
         if self.tp_rank == 0:
             logger.debug(
-                f"[RemoteSpecKVRollbacker] Released all KV for finished request {req.rid}"
+                f"[SpectreKVRollbacker] Released all KV for finished request {req.rid}"
             )
     
     def release_all_kv_for_reprefill_req(self, req: "Req") -> None:
@@ -156,7 +156,7 @@ class RemoteSpecKVRollbacker:
 
         if self.tp_rank == 0:
             logger.debug(
-                f"[RemoteSpecKVRollbacker] Released all KV for re-prefill {req.rid}"
+                f"[SpectreKVRollbacker] Released all KV for re-prefill {req.rid}"
             )
     
     def release_all_kv_for_finish(self, req: "Req") -> None:

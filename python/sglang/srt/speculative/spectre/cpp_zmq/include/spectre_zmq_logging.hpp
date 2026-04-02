@@ -8,16 +8,16 @@
 #include <string>
 #include <vector>
 
-#include "remote_spec_protocol.hpp"
+#include "spectre_protocol.hpp"
 
-int remote_spec_log_level();
-bool remote_spec_info_enabled();
-bool remote_spec_warn_enabled();
-bool remote_spec_debug_enabled();
-void remote_spec_enqueue_log(std::string msg);
+int spectre_log_level();
+bool spectre_info_enabled();
+bool spectre_warn_enabled();
+bool spectre_debug_enabled();
+void spectre_enqueue_log(std::string msg);
 
 template <typename... Args>
-void remote_spec_log(bool enabled, const Args&... args) {
+void spectre_log(bool enabled, const Args&... args) {
     if (!enabled) {
         return;
     }
@@ -37,40 +37,40 @@ void remote_spec_log(bool enabled, const Args&... args) {
     oss << "[" << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S")
         << "." << std::setw(3) << std::setfill('0') << ms.count() << "] ";
     (oss << ... << args);
-    remote_spec_enqueue_log(oss.str());
+    spectre_enqueue_log(oss.str());
 }
 
 template <typename... Args>
-void remote_spec_debug_log(const Args&... args) {
-    remote_spec_log(remote_spec_debug_enabled(), args...);
+void spectre_debug_log(const Args&... args) {
+    spectre_log(spectre_debug_enabled(), args...);
 }
 
 template <typename... Args>
-void remote_spec_info_log(const Args&... args) {
-    remote_spec_log(remote_spec_info_enabled(), args...);
+void spectre_info_log(const Args&... args) {
+    spectre_log(spectre_info_enabled(), args...);
 }
 
 template <typename... Args>
-void remote_spec_warn_log(const Args&... args) {
-    remote_spec_log(remote_spec_warn_enabled(), args...);
+void spectre_warn_log(const Args&... args) {
+    spectre_log(spectre_warn_enabled(), args...);
 }
 
-inline long long remote_spec_duration_us(
+inline long long spectre_duration_us(
     const std::chrono::steady_clock::time_point& start,
     const std::chrono::steady_clock::time_point& end) {
     return std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 }
 
-inline double remote_spec_now_us() {
+inline double spectre_now_us() {
     return static_cast<double>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
 inline void stamp_request_batch(
-    std::vector<remote_spec::RemoteSpecRequest>& reqs,
-    double remote_spec::RemoteSpecRequest::* field,
-    double timestamp_us = remote_spec_now_us()) {
+    std::vector<spectre::SpectreRequest>& reqs,
+    double spectre::SpectreRequest::* field,
+    double timestamp_us = spectre_now_us()) {
     for (auto& req : reqs) {
         req.*field = timestamp_us;
     }

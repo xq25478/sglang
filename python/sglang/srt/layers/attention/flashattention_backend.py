@@ -498,7 +498,7 @@ class FlashAttentionBackend(AttentionBackend):
             self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
         elif forward_batch.forward_mode.is_target_verify():
             # Get dynamic draft_token_num from spec_info for flexible speculative decoding
-            # This allows different draft_num_tokens per verify call (e.g., RemoteSpecWorker)
+            # This allows different draft_num_tokens per verify call (e.g., SpectreWorker)
             spec_info = forward_batch.spec_info
             num_draft_tokens = spec_info.draft_token_num
             

@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import SpecType
+from sglang.srt.speculative.spectre.spectre_protocol import SpecType
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
 

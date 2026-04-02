@@ -8,16 +8,16 @@ import time
 import uuid
 
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.remote_spec.cpp_zmq import DealerEndpoint, RouterEndpoint
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import RemoteSpecRequest
+from sglang.srt.speculative.spectre.cpp_zmq import DealerEndpoint, RouterEndpoint
+from sglang.srt.speculative.spectre.spectre_protocol import SpectreRequest
 
 logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=None)
-def get_remote_spec_log_level() -> int:
+def get_spectre_log_level() -> int:
     try:
-        level = int(os.getenv("REMOTE_SPEC_DEBUG", "0"))
+        level = int(os.getenv("SPECTRE_DEBUG", "0"))
     except ValueError:
         return 0
     if level <= 0:
@@ -27,21 +27,21 @@ def get_remote_spec_log_level() -> int:
     return 2
 
 
-def remote_spec_info(msg: str) -> None:
-    if get_remote_spec_log_level() >= 1:
+def spectre_info(msg: str) -> None:
+    if get_spectre_log_level() >= 1:
         logger.info(msg)
 
 
-def remote_spec_warning(msg: str) -> None:
-    if get_remote_spec_log_level() >= 1:
+def spectre_warning(msg: str) -> None:
+    if get_spectre_log_level() >= 1:
         logger.warning(msg)
 
 
-def remote_spec_debug(msg: str) -> None:
-    if get_remote_spec_log_level() >= 2:
+def spectre_debug(msg: str) -> None:
+    if get_spectre_log_level() >= 2:
         logger.debug(msg)
 
-class RemoteSpecBaseCommunicator(ABC):
+class SpectreBaseCommunicator(ABC):
     def __init__(self) -> None:
         self.start()
 
@@ -54,20 +54,20 @@ class RemoteSpecBaseCommunicator(ABC):
         pass
 
     @abstractmethod
-    def send_objs(self, requests: List[RemoteSpecRequest]) -> None:
+    def send_objs(self, requests: List[SpectreRequest]) -> None:
         pass
 
     @abstractmethod
-    def send_obj(self, request:RemoteSpecRequest) -> None:
+    def send_obj(self, request:SpectreRequest) -> None:
         pass
 
     @abstractmethod
-    def recv_all_objs(self) -> List[RemoteSpecRequest]:
+    def recv_all_objs(self) -> List[SpectreRequest]:
         pass
 
 
 @dataclass
-class RemoteSpecConfig:
+class SpectreConfig:
     role: str = "target"
     zmq_addr: str = "127.0.0.1"
     zmq_port: str = "30009"
@@ -80,17 +80,17 @@ class RemoteSpecConfig:
     zmq_transport: str = "tcp"
     
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> "RemoteSpecConfig":
-        zmq_addr = server_args.remote_speculative_zmq_addr or "127.0.0.1"
+    def from_server_args(cls, server_args: ServerArgs) -> "SpectreConfig":
+        zmq_addr = server_args.spectre_zmq_addr or "127.0.0.1"
         if zmq_addr in ["127.0.0.1", "0.0.0.0"]:
             zmq_transport = "ipc"
         else:
             zmq_transport = "tcp"
         
         return cls(
-            role=server_args.remote_speculative_role,
+            role=server_args.spectre_role,
             zmq_addr=zmq_addr,
-            zmq_port=server_args.remote_speculative_zmq_port or "30009",
+            zmq_port=server_args.spectre_zmq_port or "30009",
             num_draft_tokens=server_args.speculative_num_steps or 5,
             topk=server_args.speculative_eagle_topk or 1,
             page_size=server_args.page_size,
@@ -157,7 +157,7 @@ class RemoteSpecConfig:
     
     def __repr__(self) -> str:
         return (
-            f"RemoteSpecConfig("
+            f"SpectreConfig("
             f"role={self.role}, "
             f"zmq_addr={self.zmq_addr}, "
             f"num_draft_tokens={self.num_draft_tokens}, "
@@ -166,13 +166,13 @@ class RemoteSpecConfig:
             f"tp_size={self.tp_size})"
         )
                
-class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):   
+class SpectreZMQCommunicator(SpectreBaseCommunicator):   
     def __init__(
         self,
-        config: RemoteSpecConfig,
+        config: SpectreConfig,
     ):
         self.config = config
-        self.log_level = get_remote_spec_log_level()
+        self.log_level = get_spectre_log_level()
         self.zmq_endpoint = config.get_addr()
         self.bind = not config.is_target
         self._running = False
@@ -201,13 +201,13 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
         
     def start(self) -> None:
         if self._running:
-            remote_spec_debug("ZMQCommunicator already started")
+            spectre_debug("ZMQCommunicator already started")
             return
         
         if not self._running:
             self.zmq_communicator.start()
             self._running = True
-            remote_spec_info(
+            spectre_info(
                 f"ZMQ Communicator Started for {self.config.role} with identity {self.identity}"
             )
 
@@ -215,22 +215,22 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
         if self._running:
             self.zmq_communicator.stop()
             self._running = False
-            remote_spec_info(f"ZMQ Communicator Stoped for {self.config.role}")
+            spectre_info(f"ZMQ Communicator Stoped for {self.config.role}")
         
     def _process_data(self, data:Any):
-        if isinstance(data, RemoteSpecRequest):
+        if isinstance(data, SpectreRequest):
             return data.to_dict()
         return data
             
-    def send_obj(self,  request: RemoteSpecRequest,
+    def send_obj(self,  request: SpectreRequest,
                         identity: str = "DRAFT" ) -> None:
         self.send_objs( [ request ] ,identity)
 
-    def send_objs(self, requests: List[RemoteSpecRequest],
+    def send_objs(self, requests: List[SpectreRequest],
                         identity: str = "DRAFT") -> None:
         
         if not self._running:
-            remote_spec_warning("Cannot send: communicator not running")
+            spectre_warning("Cannot send: communicator not running")
             return
         try:
             if self.log_level >= 2:
@@ -249,14 +249,14 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
                 
             if self.log_level >= 2:
                 t3 = time.perf_counter()
-                remote_spec_debug(
+                spectre_debug(
                     f"[ZMQ LOG Pyt][SEND] msgs nums:{len(msgs)}, time_us:{(t3-t2)*1e6:.1f}-process time {t_process*1e6:.1f} us"
                 )
 
         except Exception as e:
-            remote_spec_warning(f"Failed to send: {e}")
+            spectre_warning(f"Failed to send: {e}")
         
-    def recv_all_objs(self) -> List[RemoteSpecRequest]:
+    def recv_all_objs(self) -> List[SpectreRequest]:
         if not self._running:
             return []
         try:
@@ -272,7 +272,7 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
 
             if self.log_level >= 2 and _msgs:
                 t2 = time.perf_counter()
-                remote_spec_debug(
+                spectre_debug(
                     f"[ZMQ LOG Pyt][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}"
                 )
 
@@ -282,13 +282,13 @@ class RemoteSpecZMQCommunicator(RemoteSpecBaseCommunicator):
                 msgs = []
                 for _msg in _msgs:
                     if isinstance(_msg, dict):
-                        msgs.append(RemoteSpecRequest.from_dict(_msg))       
+                        msgs.append(SpectreRequest.from_dict(_msg))       
                     else:
                         msgs.append(_msg)
                 return msgs
                         
         except Exception as e:
-            remote_spec_warning(f"Failed to receive: {e}")
+            spectre_warning(f"Failed to receive: {e}")
             return []
     
     def is_running(self) -> bool:

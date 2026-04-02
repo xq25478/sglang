@@ -9,9 +9,9 @@ from typing import Dict, List, Optional, Set, Tuple
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
-    RemoteSpecAction,
-    RemoteSpecRequest,
+from sglang.srt.speculative.spectre.spectre_protocol import (
+    SpectreAction,
+    SpectreRequest,
     SpecType,
     is_health_check_req as _is_health_check,
 )
@@ -20,7 +20,7 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 logger = logging.getLogger(__name__)
 
 
-def _remote_spec_now_us() -> float:
+def _spectre_now_us() -> float:
     return time.time() * 1e6
 
 class DraftCircuitBreaker:
@@ -86,20 +86,20 @@ class DraftCircuitBreaker:
             self.state = self.OPEN
             self.rounds_in_open = 0
 
-class RemoteSpecTargetSchedulerMixin:
+class SpectreTargetSchedulerMixin:
     def _init_draft_recv_infra(self):
         self._recv_timeout_s = (
-            float(os.environ.get("REMOTE_SPEC_RECV_TIMEOUT_MS", "200")) / 1000.0
+            float(os.environ.get("SPECTRE_RECV_TIMEOUT_MS", "200")) / 1000.0
         )
-        self._msg_buffer: List[RemoteSpecRequest] = []
+        self._msg_buffer: List[SpectreRequest] = []
         self._msg_lock = threading.Lock()
         self._data_ready = threading.Event()
         self._bg_running = True
-        self._remote_spec_flush_at_us = 0.0
+        self._spectre_flush_at_us = 0.0
         self._accept_reject_messages = True
 
-        failure_threshold = int(os.environ.get("REMOTE_SPEC_FAILURE_THRESHOLD", "30"))
-        cooldown_rounds = int(os.environ.get("REMOTE_SPEC_COOLDOWN_ROUNDS", "100"))
+        failure_threshold = int(os.environ.get("SPECTRE_FAILURE_THRESHOLD", "30"))
+        cooldown_rounds = int(os.environ.get("SPECTRE_COOLDOWN_ROUNDS", "100"))
         self.draft_circuit_breaker = DraftCircuitBreaker(
             failure_threshold=failure_threshold,
             cooldown_rounds=cooldown_rounds,
@@ -129,15 +129,15 @@ class RemoteSpecTargetSchedulerMixin:
                 logger.error(f"\033[34m [Target][BgRecv] Error: {e} \033[0m")
                 time.sleep(0.0005)
 
-    def _drain_msg_buffer(self) -> List[RemoteSpecRequest]:
+    def _drain_msg_buffer(self) -> List[SpectreRequest]:
         with self._msg_lock:
             msgs = list(self._msg_buffer)
             self._msg_buffer.clear()
         self._data_ready.clear()
         return msgs
 
-    def reset_remote_spec_target_state(self) -> None:
-        self._remote_spec_flush_at_us = _remote_spec_now_us()
+    def reset_spectre_target_state(self) -> None:
+        self._spectre_flush_at_us = _spectre_now_us()
         self._accept_reject_messages = False
 
         if hasattr(self, "req_to_draft_token"):
@@ -163,12 +163,12 @@ class RemoteSpecTargetSchedulerMixin:
         if hasattr(self, "rejected_forward_ct"):
             self.rejected_forward_ct = 0
 
-    def _should_store_draft_message(self, msg: RemoteSpecRequest) -> bool:
+    def _should_store_draft_message(self, msg: SpectreRequest) -> bool:
         rid_cache = getattr(self, "req_to_draft_token", {}).get(msg.request_id)
         if rid_cache is None or msg.spec_cnt not in rid_cache:
             return False
 
-        flush_at_us = getattr(self, "_remote_spec_flush_at_us", 0.0)
+        flush_at_us = getattr(self, "_spectre_flush_at_us", 0.0)
         if (
             flush_at_us > 0.0
             and msg.target_send_time is not None
@@ -181,7 +181,7 @@ class RemoteSpecTargetSchedulerMixin:
 
 
     @DynamicGradMode()
-    def event_loop_normal_remote_spec_target(self):
+    def event_loop_normal_spectre_target(self):
         self.req_to_draft_token: Dict[
             str, Dict[int, Optional[Tuple[List[int], List[float]]]]
         ] = defaultdict(dict)
@@ -212,8 +212,8 @@ class RemoteSpecTargetSchedulerMixin:
                     batch.draft_num_tokens = self._decide_verify_num_draft_tokens(batch)
                     batch.recv_draft_fn = self.recv_drafts_for_batch
                     batch.retry_fn = self.retry_drafts_for_reqs
-                    batch.retry_fail_ratio = self.server_args.remote_speculative_retry_fail_ratio
-                    batch.retry_min_count = self.server_args.remote_speculative_retry_min_count
+                    batch.retry_fail_ratio = self.server_args.spectre_retry_fail_ratio
+                    batch.retry_min_count = self.server_args.spectre_retry_min_count
 
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
@@ -229,8 +229,8 @@ class RemoteSpecTargetSchedulerMixin:
         pending_rids: Set[str],
         pending_spec_cnts: Dict[str, int],
         timeout_s: float,
-    ) -> List[RemoteSpecRequest]:
-        all_messages: List[RemoteSpecRequest] = []
+    ) -> List[SpectreRequest]:
+        all_messages: List[SpectreRequest] = []
         deadline = time.perf_counter() + timeout_s
 
         while pending_rids:
@@ -238,7 +238,7 @@ class RemoteSpecTargetSchedulerMixin:
             if msgs:
                 all_messages.extend(msgs)
                 for msg in msgs:
-                    if msg.action != RemoteSpecAction.DRAFT:
+                    if msg.action != SpectreAction.DRAFT:
                         continue
                     if msg.request_id not in pending_rids:
                         continue
@@ -261,8 +261,8 @@ class RemoteSpecTargetSchedulerMixin:
         return all_messages
 
     def _tp_broadcast_messages(
-        self, messages: Optional[List[RemoteSpecRequest]]
-    ) -> List[RemoteSpecRequest]:
+        self, messages: Optional[List[SpectreRequest]]
+    ) -> List[SpectreRequest]:
         if self.tp_size > 1:
             return broadcast_pyobj(
                 messages if messages else [],
@@ -272,20 +272,20 @@ class RemoteSpecTargetSchedulerMixin:
             )
         return messages or []
 
-    def _store_messages(self, messages: List[RemoteSpecRequest]) -> bool:
+    def _store_messages(self, messages: List[SpectreRequest]) -> bool:
         has_draft = False
         for msg in messages:
-            assert isinstance(msg, RemoteSpecRequest), (
-                f"Expected RemoteSpecRequest, got {type(msg)}"
+            assert isinstance(msg, SpectreRequest), (
+                f"Expected SpectreRequest, got {type(msg)}"
             )
-            if msg.action == RemoteSpecAction.REJECT:
+            if msg.action == SpectreAction.REJECT:
                 if getattr(self, "_accept_reject_messages", True):
                     self.process_reject_action()
                     if self.tp_rank == 0:
                         logger.info(
                             "\033[32m [Target] Received REJECT from draft \033[0m"
                         )
-            elif msg.action == RemoteSpecAction.DRAFT:
+            elif msg.action == SpectreAction.DRAFT:
                 if not self._should_store_draft_message(msg):
                     continue
                 self.req_to_draft_token[msg.request_id][msg.spec_cnt] = (
@@ -424,10 +424,10 @@ class RemoteSpecTargetSchedulerMixin:
     ) -> None:
         if (
             self.is_rejected
-            and self.server_args.remote_speculative_reject_interval > 0
+            and self.server_args.spectre_reject_interval > 0
             and (
                 (self.forward_ct - self.rejected_forward_ct + 1)
-                % self.server_args.remote_speculative_reject_interval
+                % self.server_args.spectre_reject_interval
                 != 0
             )
         ):
@@ -451,10 +451,10 @@ class RemoteSpecTargetSchedulerMixin:
                 draft_reqs = []
                 for req in reqs_to_send:
                     draft_reqs.append(
-                        RemoteSpecRequest(
+                        SpectreRequest(
                             request_id=req.rid,
                             spec_cnt=req.spec_cnt,
-                            action=RemoteSpecAction.DRAFT,
+                            action=SpectreAction.DRAFT,
                             spec_type=SpecType.DRAFT_REQUEST,
                             input_ids=req.origin_input_ids if req.spec_cnt == 0 else None,
                             output_ids=req.output_ids,
@@ -471,10 +471,10 @@ class RemoteSpecTargetSchedulerMixin:
             return
         retry_send_time = time.perf_counter()
         reqs_to_send = [
-            RemoteSpecRequest(
+            SpectreRequest(
                 request_id=req.rid,
                 spec_cnt=req.spec_cnt,
-                action=RemoteSpecAction.DRAFT,
+                action=SpectreAction.DRAFT,
                 spec_type=SpecType.DRAFT_REQUEST,
                 output_ids=req.output_ids,
                 draft_token_ids=[],
@@ -487,7 +487,7 @@ class RemoteSpecTargetSchedulerMixin:
         if reqs_to_send:
             self._zmq_send(reqs_to_send)
 
-    def _zmq_send(self, reqs: List[RemoteSpecRequest]) -> None:
+    def _zmq_send(self, reqs: List[SpectreRequest]) -> None:
         all_drafts_identity = self.zmq_communicator.get_all_drafts_identity()
         if not all_drafts_identity:
             logger.warning("\033[32m [Target] No draft available, check draft status! \033[0m")
@@ -495,12 +495,12 @@ class RemoteSpecTargetSchedulerMixin:
         self.zmq_communicator.send_objs(reqs, all_drafts_identity[0])
 
     def notify_draft_request_finished_or_aborted(
-        self, req: Req, action: RemoteSpecAction
+        self, req: Req, action: SpectreAction
     ) -> None:
         if _is_health_check(req):
             return
 
-        msg = RemoteSpecRequest(
+        msg = SpectreRequest(
             request_id=req.rid,
             spec_cnt=req.spec_cnt,
             action=action,
@@ -527,7 +527,7 @@ class RemoteSpecTargetSchedulerMixin:
 
     def _is_self_high_overhead_target(self, batch: ScheduleBatch) -> bool:
         current_bsz = max(batch.batch_size(), self.running_batch.batch_size())
-        if current_bsz > self.server_args.remote_speculative_max_batch_size:
+        if current_bsz > self.server_args.spectre_max_batch_size:
             batch.is_high_overhead = True
             return True
         batch.is_high_overhead = False
@@ -554,7 +554,7 @@ class RemoteSpecTargetSchedulerMixin:
             if not _is_health_check(req) and not req.cur_drafts
         )
         bs = batch.batch_size()
-        if bs > 0 and no_draft_reqs / bs > self.server_args.remote_speculative_no_draft_ratio:
+        if bs > 0 and no_draft_reqs / bs > self.server_args.spectre_no_draft_ratio:
             return 1
         return self.server_args.speculative_num_draft_tokens
 

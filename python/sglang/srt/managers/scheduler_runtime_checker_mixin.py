@@ -274,7 +274,7 @@ class SchedulerRuntimeCheckerMixin:
         # For Draft mode: skip check when there are paused requests with dynamic KV state
         # check_memory is called during "idle" (batch = None), but Draft may still have
         # paused_reqs waiting for Target's next message. Their KV state is dynamic.
-        if self.server_args.remote_speculative_role == "draft":
+        if self.server_args.spectre_role == "draft":
             # v1: paused_reqs; v2: draft_paused_reqs / draft_batch / draft_waiting_queue
             # Any of these holding reqs means KV is legitimately allocated but not
             # tracked by the regular running_batch, so the check would false-alarm.

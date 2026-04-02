@@ -38,17 +38,17 @@ from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.speculative.remote_spec.remote_spec_protocol import (
-    RemoteSpecRequest,
-    RemoteSpecAction,
+from sglang.srt.speculative.spectre.spectre_protocol import (
+    SpectreRequest,
+    SpectreAction,
     SpecType
 )
-from sglang.srt.speculative.remote_spec.draft_end.remote_spec_state_mamager import (
-    RemoteSpecDraftState,
-    RemoteSpecDraftStateManager,
+from sglang.srt.speculative.spectre.drafter.spectre_state_mamager import (
+    SpectreDraftState,
+    SpectreDraftStateManager,
 )
-from sglang.srt.speculative.remote_spec.draft_end.remote_spec_kv_rollbacker import (
-    RemoteSpecKVRollbacker,
+from sglang.srt.speculative.spectre.drafter.spectre_kv_rollbacker import (
+    SpectreKVRollbacker,
 )
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 
@@ -58,15 +58,15 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class RemoteSpecDraftSchedulerMixin:
+class SpectreDraftSchedulerMixin:
     """
     Scheduler mixin for Draft-side remote speculative decoding.
     
-    RemoteSpecDraftSchedulerMixin is used in the draft end of remote spec.
+    SpectreDraftSchedulerMixin is used in the draft end of remote spec.
     It is responsible for scheduling the draft requests and normal requests.
     
     Provides:
-        - event_loop_normal_remote_spec_draft: Main event loop
+        - event_loop_normal_spectre_draft: Main event loop
         - Local rollback KV management (Strategy 5)
         - Draft request state management
         - Token divergence handling
@@ -86,11 +86,11 @@ class RemoteSpecDraftSchedulerMixin:
     
     def _init_draft_components(self):
         """Initialize Draft-specific components."""
-        # Initialize RemoteSpecDraftStateManager (the single source of truth for draft states)
-        self.draft_state_manager = RemoteSpecDraftStateManager(timeout_threshold=60.0)
+        # Initialize SpectreDraftStateManager (the single source of truth for draft states)
+        self.draft_state_manager = SpectreDraftStateManager(timeout_threshold=60.0)
         
-        # Initialize RemoteSpecKVRollbacker
-        self.draft_kv_manager = RemoteSpecKVRollbacker(
+        # Initialize SpectreKVRollbacker
+        self.draft_kv_manager = SpectreKVRollbacker(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             tree_cache=self.tree_cache,
@@ -104,11 +104,11 @@ class RemoteSpecDraftSchedulerMixin:
     # State Management
     # =========================================================================
     
-    def _get_draft_state(self, req_id: str) -> Optional[RemoteSpecDraftState]:
+    def _get_draft_state(self, req_id: str) -> Optional[SpectreDraftState]:
         """Get draft state by request ID."""
         return self.draft_state_manager.get_state(req_id)
     
-    def _set_draft_state(self, req_id: str, state: RemoteSpecDraftState) -> None:
+    def _set_draft_state(self, req_id: str, state: SpectreDraftState) -> None:
         """Set draft state for request ID."""
         self.draft_state_manager.set_state(req_id, state)
     
@@ -146,7 +146,7 @@ class RemoteSpecDraftSchedulerMixin:
     # =========================================================================
     
     @DynamicGradMode()
-    def event_loop_normal_remote_spec_draft(self):
+    def event_loop_normal_spectre_draft(self):
         """Main event loop for Draft server."""
         self.last_batch = None
         self._init_draft_components()
@@ -239,7 +239,7 @@ class RemoteSpecDraftSchedulerMixin:
         
         self.token_to_kv_pool_allocator.free_group_end()
     
-    def _recv_draft_requests(self) -> List[RemoteSpecRequest]:
+    def _recv_draft_requests(self) -> List[SpectreRequest]:
         """Receive draft requests from communication worker."""
         try:
             msgs = []
@@ -265,8 +265,8 @@ class RemoteSpecDraftSchedulerMixin:
     
     def deduplicate_draft_requests(
         self,
-        messages: List[RemoteSpecRequest],
-    ) -> Tuple[List[RemoteSpecRequest], Dict[str, RemoteSpecRequest]]:
+        messages: List[SpectreRequest],
+    ) -> Tuple[List[SpectreRequest], Dict[str, SpectreRequest]]:
         """
         Deduplicate messages, keeping only latest spec_cnt per request.
         
@@ -278,10 +278,10 @@ class RemoteSpecDraftSchedulerMixin:
         
         for draft_req in messages:
             req_id = draft_req.request_id
-            action = getattr(draft_req, 'action', RemoteSpecAction.DRAFT)
+            action = getattr(draft_req, 'action', SpectreAction.DRAFT)
             
             # Classify control vs draft messages
-            if action in [RemoteSpecAction.FINISH, RemoteSpecAction.ABORT]:
+            if action in [SpectreAction.FINISH, SpectreAction.ABORT]:
                 control_msgs.append(draft_req)
                 continue
                         
@@ -306,18 +306,18 @@ class RemoteSpecDraftSchedulerMixin:
         
         return control_msgs, latest_msgs
     
-    def _process_control_message(self, control_msgs: List[RemoteSpecRequest]) -> None:
+    def _process_control_message(self, control_msgs: List[SpectreRequest]) -> None:
         """Process finish/abort messages."""
         for draft_req in control_msgs:
             req_id = draft_req.request_id
             action = draft_req.action
             
-            if action in [RemoteSpecAction.FINISH, RemoteSpecAction.ABORT]:
+            if action in [SpectreAction.FINISH, SpectreAction.ABORT]:
                 if self.tp_rank == 0:
                     logger.debug(f"[Draft] Received {action} for {req_id}")
                 self._finish_draft_request(req_id)
     
-    def _process_draft_requests(self, latest_msgs: Dict[str, RemoteSpecRequest]) -> List[Req]:
+    def _process_draft_requests(self, latest_msgs: Dict[str, SpectreRequest]) -> List[Req]:
         """
         Process draft messages, return requests to merge to batch.
         
@@ -425,8 +425,8 @@ class RemoteSpecDraftSchedulerMixin:
     def _handle_identical_tokens(
         self,
         req: Req,
-        draft_req: RemoteSpecRequest,
-        state: RemoteSpecDraftState,
+        draft_req: SpectreRequest,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """Handle case where tokens are identical."""
@@ -444,8 +444,8 @@ class RemoteSpecDraftSchedulerMixin:
         req: Req,
         target_fill_ids: List[int],
         fork_point: int,
-        draft_req: RemoteSpecRequest,
-        state: RemoteSpecDraftState,
+        draft_req: SpectreRequest,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """Handle token divergence with local rollback or re-prefill."""
@@ -481,8 +481,8 @@ class RemoteSpecDraftSchedulerMixin:
         current_len: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: RemoteSpecRequest,
-        state: RemoteSpecDraftState,
+        draft_req: SpectreRequest,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """Handle Case 1: Equal length sequences."""
@@ -508,8 +508,8 @@ class RemoteSpecDraftSchedulerMixin:
         fork_point: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: RemoteSpecRequest,
-        state: RemoteSpecDraftState,
+        draft_req: SpectreRequest,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """Handle Case 2: Draft ahead of Target."""
@@ -576,8 +576,8 @@ class RemoteSpecDraftSchedulerMixin:
         current_len: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: RemoteSpecRequest,
-        state: RemoteSpecDraftState,
+        draft_req: SpectreRequest,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """
@@ -605,8 +605,8 @@ class RemoteSpecDraftSchedulerMixin:
         fork_point: int,
         current_kv_len: int,
         needs_kv_release: bool,
-        draft_req: RemoteSpecRequest,
-        state: RemoteSpecDraftState,
+        draft_req: SpectreRequest,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
         case_name: str,
     ) -> None:
@@ -646,7 +646,7 @@ class RemoteSpecDraftSchedulerMixin:
         req.output_ids.extend(delta_tokens)
         req.fill_ids = req.origin_input_ids + req.output_ids
     
-    def _update_req_state(self, req: Req, draft_req: RemoteSpecRequest, state: RemoteSpecDraftState) -> None:
+    def _update_req_state(self, req: Req, draft_req: SpectreRequest, state: SpectreDraftState) -> None:
         """Update request state for decode continuation."""
         req.spec_cnt = draft_req.spec_cnt
         req.draft_tokens_target = draft_req.num_draft_tokens
@@ -680,7 +680,7 @@ class RemoteSpecDraftSchedulerMixin:
     def _resume_or_update(
         self,
         req: Req,
-        state: RemoteSpecDraftState,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """Resume paused request or update running request."""
@@ -695,7 +695,7 @@ class RemoteSpecDraftSchedulerMixin:
     def _resume_from_paused(
         self,
         req: Req,
-        state: RemoteSpecDraftState,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """
@@ -728,7 +728,7 @@ class RemoteSpecDraftSchedulerMixin:
     def _update_in_running_batch(
         self,
         req: Req,
-        state: RemoteSpecDraftState,
+        state: SpectreDraftState,
         reqs_to_merge: List[Req],
     ) -> None:
         """
@@ -775,8 +775,8 @@ class RemoteSpecDraftSchedulerMixin:
         self,
         req: Req,
         target_fill_ids: List[int],
-        draft_req: RemoteSpecRequest,
-        state: RemoteSpecDraftState,
+        draft_req: SpectreRequest,
+        state: SpectreDraftState,
     ) -> None:
         """Prepare for re-prefill when divergence in RadixCache region."""
         if self.tp_rank == 0:
@@ -818,7 +818,7 @@ class RemoteSpecDraftSchedulerMixin:
     # Request Lifecycle
     # =========================================================================
     
-    def _create_new_draft_req(self, draft_req: RemoteSpecRequest) -> None:
+    def _create_new_draft_req(self, draft_req: SpectreRequest) -> None:
         """Create new draft request."""
         req_id = draft_req.request_id
         
@@ -903,7 +903,7 @@ class RemoteSpecDraftSchedulerMixin:
         
         self._add_request_to_queue(req)
         
-        self._set_draft_state(req_id, RemoteSpecDraftState(
+        self._set_draft_state(req_id, SpectreDraftState(
             req_id=req_id,
             spec_cnt=draft_req.spec_cnt,
             req_object=req,
@@ -1006,11 +1006,11 @@ class RemoteSpecDraftSchedulerMixin:
             if len(req.output_token_logprobs_val) >= end:
                 draft_logits = req.output_token_logprobs_val[start:end]
         
-        from sglang.srt.speculative.remote_spec.remote_spec_protocol import SpecType
-        response = RemoteSpecRequest(
+        from sglang.srt.speculative.spectre.spectre_protocol import SpecType
+        response = SpectreRequest(
             request_id=req.rid,
             spec_cnt=req.spec_cnt,
-            action=RemoteSpecAction.DRAFT,
+            action=SpectreAction.DRAFT,
             spec_type=SpecType.DRAFT_RESPONSE,
             draft_token_ids=draft_tokens,
             draft_logprobs=draft_logits or [],
@@ -1149,7 +1149,7 @@ class RemoteSpecDraftSchedulerMixin:
             return False
         
         current_bsz = self.running_batch.batch_size()
-        if current_bsz > self.server_args.remote_speculative_max_batch_size:
+        if current_bsz > self.server_args.spectre_max_batch_size:
             return True
         return False
 
@@ -1164,10 +1164,10 @@ class RemoteSpecDraftSchedulerMixin:
             return
         
         # Send a reject message to indicate high load
-        reject_msg = RemoteSpecRequest(
+        reject_msg = SpectreRequest(
             request_id="system",
             spec_cnt=0,
-            action=RemoteSpecAction.REJECT,
+            action=SpectreAction.REJECT,
             spec_type=SpecType.DRAFT_RESPONSE,
             draft_token_ids=[],
             draft_logprobs=[],

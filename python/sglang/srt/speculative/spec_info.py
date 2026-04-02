@@ -10,8 +10,8 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
-    from sglang.srt.speculative.remote_spec.target_end.remote_spec_worker import (
-        RemoteSpecWorker,
+    from sglang.srt.speculative.spectre.verifier.spectre_worker import (
+        SpectreWorker,
     )
 
 
@@ -22,7 +22,7 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
-    REMOTE = auto()
+    SPECTRE = auto()
     NONE = auto()
 
     @classmethod
@@ -50,8 +50,8 @@ class SpeculativeAlgorithm(Enum):
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
 
-    def is_remote(self) -> bool:
-        return self == SpeculativeAlgorithm.REMOTE
+    def is_spectre(self) -> bool:
+        return self == SpeculativeAlgorithm.SPECTRE
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -63,7 +63,7 @@ class SpeculativeAlgorithm(Enum):
             Type[BaseSpecWorker],
             Type[TpModelWorker],
             Type[NGRAMWorker],
-            Type[RemoteSpecWorker],
+            Type[SpectreWorker],
         ]
     ]:
         assert (
@@ -115,17 +115,17 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
-        elif self.is_remote():
+        elif self.is_spectre():
             if enable_overlap:
                 raise ValueError(
                     f"Speculative algorithm {self.name} does not support overlap worker creation."
                 )
 
-            from sglang.srt.speculative.remote_spec.target_end.remote_spec_worker import (
-                RemoteSpecWorker,
+            from sglang.srt.speculative.spectre.verifier.spectre_worker import (
+                SpectreWorker,
             )
 
-            return RemoteSpecWorker
+            return SpectreWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

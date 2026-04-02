@@ -3,9 +3,9 @@ from typing import Optional, List, Dict, Any
 from enum import Enum
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-class RemoteSpecAction(Enum):
+class SpectreAction(Enum):
     '''
-    RemoteSpecAction is the action to take for the remote spec request.
+    SpectreAction is the action to take for the remote spec request.
     draft: normal draft request (D->T & T->D)
     finish: when req is finished in target (T->D)
     abort: when req is aborted in target (T->D)
@@ -30,10 +30,10 @@ class SpecType(Enum):
 
 
 @dataclass
-class RemoteSpecRequest:
+class SpectreRequest:
     request_id: Optional[str] = None
     spec_cnt: Optional[int] = None
-    action: RemoteSpecAction = RemoteSpecAction.FINISH
+    action: SpectreAction = SpectreAction.FINISH
     spec_type: SpecType = SpecType.NORMAL
     draft_token_ids: Optional[List[int]] = None
     target_send_time : float = -1.0

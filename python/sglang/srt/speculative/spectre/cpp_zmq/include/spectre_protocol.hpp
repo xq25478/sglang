@@ -1,5 +1,5 @@
-#ifndef __REMOTE_SPEC_PROTOCOL_HPP_INCLUDED_
-#define __REMOTE_SPEC_PROTOCOL_HPP_INCLUDED_
+#ifndef __SPECTRE_PROTOCOL_HPP_INCLUDED_
+#define __SPECTRE_PROTOCOL_HPP_INCLUDED_
 
 #include <iostream>
 #include <string>
@@ -19,12 +19,12 @@
 
 namespace py = pybind11;
 
-namespace remote_spec {
+namespace spectre {
 
 // =====================================================
 // Enum definitions
 // =====================================================
-enum class RemoteSpecAction {
+enum class SpectreAction {
     DRAFT  = 0,
     FINISH = 1,
     ABORT  = 2,
@@ -37,13 +37,13 @@ enum class SpecType {
     DRAFT_RESPONSE = 2
 };
 
-} // namespace remote_spec
+} // namespace spectre
 
 // Register enums with Msgpack
-MSGPACK_ADD_ENUM(remote_spec::RemoteSpecAction);
-MSGPACK_ADD_ENUM(remote_spec::SpecType);
+MSGPACK_ADD_ENUM(spectre::SpectreAction);
+MSGPACK_ADD_ENUM(spectre::SpecType);
 
-namespace remote_spec {
+namespace spectre {
 
 // =====================================================
 // Helper functions for Enum-String conversion
@@ -56,12 +56,12 @@ inline std::string to_string(SpecType t) {
     return m.at(t);
 }
 
-inline std::string to_string(RemoteSpecAction t) {
-    static const std::map<RemoteSpecAction, std::string> m = {
-        {RemoteSpecAction::DRAFT, "draft"},
-        {RemoteSpecAction::FINISH, "finish"},
-        {RemoteSpecAction::ABORT, "abort"},
-        {RemoteSpecAction::REJECT, "reject"}};
+inline std::string to_string(SpectreAction t) {
+    static const std::map<SpectreAction, std::string> m = {
+        {SpectreAction::DRAFT, "draft"},
+        {SpectreAction::FINISH, "finish"},
+        {SpectreAction::ABORT, "abort"},
+        {SpectreAction::REJECT, "reject"}};
     return m.at(t);
 }
 
@@ -72,12 +72,12 @@ inline SpecType str_to_spec_type(const std::string& s) {
     throw std::invalid_argument("Invalid SpecType: " + s);
 }
 
-inline RemoteSpecAction str_to_remote_action(const std::string& s) {
-    if (s == "draft") return RemoteSpecAction::DRAFT;
-    if (s == "finish") return RemoteSpecAction::FINISH;
-    if (s == "abort") return RemoteSpecAction::ABORT;
-    if (s == "reject") return RemoteSpecAction::REJECT;
-    throw std::invalid_argument("Invalid RemoteSpecAction: " + s);
+inline SpectreAction str_to_remote_action(const std::string& s) {
+    if (s == "draft") return SpectreAction::DRAFT;
+    if (s == "finish") return SpectreAction::FINISH;
+    if (s == "abort") return SpectreAction::ABORT;
+    if (s == "reject") return SpectreAction::REJECT;
+    throw std::invalid_argument("Invalid SpectreAction: " + s);
 }
 
 // =====================================================
@@ -121,10 +121,10 @@ struct SamplingParams {
     );
 };
 
-struct RemoteSpecRequest {
+struct SpectreRequest {
     std::optional<std::string> request_id;
     std::optional<int> spec_cnt;
-    RemoteSpecAction action   = RemoteSpecAction::FINISH;
+    SpectreAction action   = SpectreAction::FINISH;
     SpecType         spec_type = SpecType::NORMAL;
     std::optional<std::vector<int>> draft_token_ids;
     std::optional<std::vector<int>> input_ids;
@@ -195,8 +195,8 @@ inline void assign_optional_from_py_dict(
     }
 }
 
-inline RemoteSpecRequest from_py_dict(const py::dict& d) {
-    RemoteSpecRequest r;
+inline SpectreRequest from_py_dict(const py::dict& d) {
+    SpectreRequest r;
     
     assign_optional_from_py_dict(d, "request_id", r.request_id);
     assign_optional_from_py_dict(d, "spec_cnt", r.spec_cnt);
@@ -221,7 +221,7 @@ inline RemoteSpecRequest from_py_dict(const py::dict& d) {
     return r;
 }
 
-inline py::dict to_py_dict(const RemoteSpecRequest& r) {
+inline py::dict to_py_dict(const SpectreRequest& r) {
     py::dict d;
 
     auto set_if_present = [&](const char* key, const auto& optional_val) {
@@ -284,7 +284,7 @@ inline py::dict to_py_dict(const RemoteSpecRequest& r) {
     return d;
 }
 
-} // namespace remote_spec
+} // namespace spectre
 
 
 #endif
