@@ -977,8 +977,6 @@ class SpectreDraftSchedulerMixinV2:
             origin_input_text="",
             origin_input_ids=input_ids,
             sampling_params=sampling_params,
-            spec_cnt=draft_req.spec_cnt,
-            spec_type=SpecType.DRAFT_REQUEST,
             return_logprob=True,
             top_logprobs_num=1,
             token_ids_logprob=None,
@@ -993,7 +991,9 @@ class SpectreDraftSchedulerMixinV2:
             bootstrap_room=None,
             vocab_size=self.model_config.vocab_size,
         )
-
+        
+        req.spec_cnt=draft_req.spec_cnt,
+        req.spec_type=SpecType.DRAFT_REQUEST
         req.tokenizer = self.tokenizer
         req.logprob_start_len = len(req.origin_input_ids) - 1
         req.draft_tokens_target = draft_req.num_draft_tokens

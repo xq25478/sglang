@@ -259,7 +259,7 @@ void unpack_spectre_request(
     req.draft_send_time = fields[14].as<double>();
 }
 
-}  // namespace
+}
 
 std::string pack_spectre_batch_payload(
     const std::vector<spectre::SpectreRequest>& objs) {

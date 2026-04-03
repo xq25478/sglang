@@ -12,7 +12,7 @@ bool has_empty_delimiter(
     return frames.size() > delimiter_index && frames[delimiter_index].size() == 0;
 }
 
-}  // namespace
+}
 
 DealerEndpoint::DealerEndpoint(
     const std::string& addr,

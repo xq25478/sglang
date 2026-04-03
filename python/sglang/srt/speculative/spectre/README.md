@@ -140,7 +140,7 @@ python/sglang/srt/speculative/spectre/
     ├── src/
     │   ├── spectre_zmq.cpp              # RouterEndpoint, DealerEndpoint
     │   ├── spectre_zmq_endpoints.cpp
-    │   ├── spectre_zmq_logging.cpp      # Reads SPECTRE_DEBUG env var
+    │   ├── spectre_zmq_logging.cpp      # Async ZMQ logging helpers
     │   └── spectre_zmq_serialization.cpp
     ├── scripts/build_cpp_zmq.sh
     └── setup.py
@@ -182,7 +182,10 @@ SPECTRE's ZMQ communication relies on a C++ pybind11 extension. Build it once be
 ```bash
 cd python/sglang/srt/speculative/spectre/cpp_zmq
 pip install pybind11 msgpack
-apt-get update && apt-get install -y libmsgpack-dev
+apt-get update && apt-get install -y libmsgpack-dev libzmq3-dev
+
+# Download zmq.hpp from https://github.com/zeromq/cppzmq/blob/master/zmq.hpp
+# and place it at /usr/include/zmq.hpp before building.
 python3 setup.py build_ext --inplace
 ```
 
@@ -191,6 +194,10 @@ Or use the provided script:
 ```bash
 bash python/sglang/srt/speculative/spectre/cpp_zmq/scripts/build_cpp_zmq.sh
 ```
+
+If `/usr/include/zmq.hpp` is missing, download it from
+`https://github.com/zeromq/cppzmq/blob/master/zmq.hpp`
+and place it under `/usr/include/zmq.hpp` first.
 
 ### 3.3 Verify basic serving first
 
@@ -394,6 +401,7 @@ When Drafter and Verifier run on different machines:
 ### 6.2 Environment Variables
 
 Set before launching the process. They are for low-level tuning that does not belong in CLI arguments.
+Spectre ZMQ logs follow SGLang's `--log-level` setting.
 
 | Environment Variable | Side | Default | Description |
 |---|---|---|---|
@@ -401,7 +409,6 @@ Set before launching the process. They are for low-level tuning that does not be
 | `SPECTRE_FAILURE_THRESHOLD` | Verifier | `30` | Consecutive rounds with no useful draft response before the circuit breaker trips to `OPEN` state. |
 | `SPECTRE_COOLDOWN_ROUNDS` | Verifier | `100` | Decode rounds the circuit breaker stays `OPEN` before transitioning to `HALF_OPEN` and probing the Drafter again. |
 | `SGLANG_DRAFT_CLEANUP_INTERVAL` | Drafter | `500` | Number of Drafter forward cycles between stale-state cleanup sweeps. States inactive for > 60 s are removed. Lower values increase cleanup frequency at a small overhead. |
-| `SPECTRE_DEBUG` | Both | `0` | Set to `1` for info-level ZMQ logging; `2` for debug-level (includes per-message timing). Applied in both Python (`spectre_communication.py`) and C++ (`spectre_zmq_logging.cpp`). |
 
 ---
 
@@ -447,7 +454,7 @@ If you do not see speculative speedup, check:
 - ZMQ address and port match on both sides.
 - `--speculative-algorithm SPECTRE` is set on the **Verifier** only (not the Drafter).
 - `--spectre-max-batch-size` is not set too low, causing constant `REJECT` messages.
-- `SPECTRE_DEBUG=1` on both sides to see ZMQ-level message counts and timing.
+- Use `--log-level debug` on both sides to see ZMQ-level message counts and timing.
 
 ---
 

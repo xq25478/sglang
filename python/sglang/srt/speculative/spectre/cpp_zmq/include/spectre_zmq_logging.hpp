@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <ctime>
-#include <cstdlib>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -10,6 +9,7 @@
 
 #include "spectre_protocol.hpp"
 
+void spectre_set_log_level(int level);
 int spectre_log_level();
 bool spectre_info_enabled();
 bool spectre_warn_enabled();

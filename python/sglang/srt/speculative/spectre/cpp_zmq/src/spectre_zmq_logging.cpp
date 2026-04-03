@@ -1,5 +1,6 @@
 #include "spectre_zmq_logging.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <deque>
@@ -8,6 +9,12 @@
 #include <utility>
 
 namespace {
+
+constexpr int kPythonDebugLogLevel = 10;
+constexpr int kPythonInfoLogLevel = 20;
+constexpr int kPythonWarningLogLevel = 30;
+
+std::atomic<int> g_spectre_log_level{kPythonWarningLogLevel};
 
 class SpectreAsyncLogger {
 public:
@@ -80,38 +87,26 @@ private:
     std::thread worker_;
 };
 
-}  // namespace
+}
+
+void spectre_set_log_level(int level) {
+    g_spectre_log_level.store(level, std::memory_order_release);
+}
 
 int spectre_log_level() {
-    static const int level = [] {
-        const char* env = std::getenv("SPECTRE_DEBUG");
-        if (env == nullptr) {
-            return 0;
-        }
-
-        char* end = nullptr;
-        long parsed = std::strtol(env, &end, 10);
-        if (end == env || parsed <= 0) {
-            return 0;
-        }
-        if (parsed == 1) {
-            return 1;
-        }
-        return 2;
-    }();
-    return level;
+    return g_spectre_log_level.load(std::memory_order_acquire);
 }
 
 bool spectre_info_enabled() {
-    return spectre_log_level() >= 1;
+    return spectre_log_level() <= kPythonInfoLogLevel;
 }
 
 bool spectre_warn_enabled() {
-    return spectre_log_level() >= 1;
+    return spectre_log_level() <= kPythonWarningLogLevel;
 }
 
 bool spectre_debug_enabled() {
-    return spectre_log_level() >= 2;
+    return spectre_log_level() <= kPythonDebugLogLevel;
 }
 
 void spectre_enqueue_log(std::string msg) {

@@ -20,10 +20,6 @@
 namespace py = pybind11;
 
 namespace spectre {
-
-// =====================================================
-// Enum definitions
-// =====================================================
 enum class SpectreAction {
     DRAFT  = 0,
     FINISH = 1,
@@ -37,17 +33,12 @@ enum class SpecType {
     DRAFT_RESPONSE = 2
 };
 
-} // namespace spectre
+}
 
-// Register enums with Msgpack
 MSGPACK_ADD_ENUM(spectre::SpectreAction);
 MSGPACK_ADD_ENUM(spectre::SpecType);
 
 namespace spectre {
-
-// =====================================================
-// Helper functions for Enum-String conversion
-// =====================================================
 inline std::string to_string(SpecType t) {
     static const std::map<SpecType, std::string> m = {
         {SpecType::NORMAL, "normal"},
@@ -79,10 +70,6 @@ inline SpectreAction str_to_remote_action(const std::string& s) {
     if (s == "reject") return SpectreAction::REJECT;
     throw std::invalid_argument("Invalid SpectreAction: " + s);
 }
-
-// =====================================================
-// Data structure definitions
-// =====================================================
 
 struct SamplingParams {
     int max_new_tokens = 128;
@@ -145,10 +132,6 @@ struct SpectreRequest {
         draft_recv_time, draft_send_time
     );
 };
-
-// =====================================================
-// Python interop conversion helpers
-// =====================================================
 
 inline SamplingParams sampling_params_from_py_dict(const py::dict& d) {
     SamplingParams p;
@@ -284,7 +267,7 @@ inline py::dict to_py_dict(const SpectreRequest& r) {
     return d;
 }
 
-} // namespace spectre
+}
 
 
 #endif

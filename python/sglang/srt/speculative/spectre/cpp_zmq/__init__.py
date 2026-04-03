@@ -38,4 +38,10 @@ else:
 
 from .spectre_zmq import DealerEndpoint, RouterEndpoint
 
-__all__ = ["DealerEndpoint", "RouterEndpoint"]
+try:
+    from .spectre_zmq import set_spectre_log_level
+except ImportError:
+    def set_spectre_log_level(level: int) -> None:
+        return None
+
+__all__ = ["DealerEndpoint", "RouterEndpoint", "set_spectre_log_level"]

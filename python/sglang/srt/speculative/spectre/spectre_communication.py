@@ -1,69 +1,38 @@
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any, List
 import logging
-import os
 import time
 import uuid
+from typing import Any, List
 
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spectre.cpp_zmq import DealerEndpoint, RouterEndpoint
+from sglang.srt.speculative.spectre.cpp_zmq import (
+    DealerEndpoint,
+    RouterEndpoint,
+    set_spectre_log_level,
+)
 from sglang.srt.speculative.spectre.spectre_protocol import SpectreRequest
 
 logger = logging.getLogger(__name__)
 
 
-@lru_cache(maxsize=None)
 def get_spectre_log_level() -> int:
-    try:
-        level = int(os.getenv("SPECTRE_DEBUG", "0"))
-    except ValueError:
-        return 0
-    if level <= 0:
-        return 0
-    if level == 1:
-        return 1
-    return 2
+    return logger.getEffectiveLevel()
+
+
+def sync_spectre_log_level() -> None:
+    set_spectre_log_level(get_spectre_log_level())
 
 
 def spectre_info(msg: str) -> None:
-    if get_spectre_log_level() >= 1:
-        logger.info(msg)
+    logger.info(msg)
 
 
 def spectre_warning(msg: str) -> None:
-    if get_spectre_log_level() >= 1:
-        logger.warning(msg)
+    logger.warning(msg)
 
 
 def spectre_debug(msg: str) -> None:
-    if get_spectre_log_level() >= 2:
-        logger.debug(msg)
-
-class SpectreBaseCommunicator(ABC):
-    def __init__(self) -> None:
-        self.start()
-
-    @abstractmethod
-    def start(self) -> None:
-        pass
-
-    @abstractmethod
-    def stop(self) -> None:
-        pass
-
-    @abstractmethod
-    def send_objs(self, requests: List[SpectreRequest]) -> None:
-        pass
-
-    @abstractmethod
-    def send_obj(self, request:SpectreRequest) -> None:
-        pass
-
-    @abstractmethod
-    def recv_all_objs(self) -> List[SpectreRequest]:
-        pass
+    logger.debug(msg)
 
 
 @dataclass
@@ -166,13 +135,14 @@ class SpectreConfig:
             f"tp_size={self.tp_size})"
         )
                
-class SpectreZMQCommunicator(SpectreBaseCommunicator):   
+class SpectreZMQCommunicator:
     def __init__(
         self,
         config: SpectreConfig,
     ):
+        sync_spectre_log_level()
         self.config = config
-        self.log_level = get_spectre_log_level()
+        self.debug_log_enabled = logger.isEnabledFor(logging.DEBUG)
         self.zmq_endpoint = config.get_addr()
         self.bind = not config.is_target
         self._running = False
@@ -200,6 +170,8 @@ class SpectreZMQCommunicator(SpectreBaseCommunicator):
         return self.zmq_endpoint
         
     def start(self) -> None:
+        sync_spectre_log_level()
+        self.debug_log_enabled = logger.isEnabledFor(logging.DEBUG)
         if self._running:
             spectre_debug("ZMQCommunicator already started")
             return
@@ -233,12 +205,12 @@ class SpectreZMQCommunicator(SpectreBaseCommunicator):
             spectre_warning("Cannot send: communicator not running")
             return
         try:
-            if self.log_level >= 2:
+            if self.debug_log_enabled:
                 t1 = time.perf_counter()
                 
             msgs = [ self._process_data(request) for request in requests ]
             
-            if self.log_level >= 2:
+            if self.debug_log_enabled:
                 t2 = time.perf_counter()  
                 t_process = t2 - t1
                 
@@ -247,7 +219,7 @@ class SpectreZMQCommunicator(SpectreBaseCommunicator):
             else:
                 self.zmq_communicator.send_objs(identity,msgs)
                 
-            if self.log_level >= 2:
+            if self.debug_log_enabled:
                 t3 = time.perf_counter()
                 spectre_debug(
                     f"[ZMQ LOG Pyt][SEND] msgs nums:{len(msgs)}, time_us:{(t3-t2)*1e6:.1f}-process time {t_process*1e6:.1f} us"
@@ -260,7 +232,7 @@ class SpectreZMQCommunicator(SpectreBaseCommunicator):
         if not self._running:
             return []
         try:
-            if self.log_level >= 2:
+            if self.debug_log_enabled:
                 t1 = time.perf_counter()
             
             received = self.zmq_communicator.get_received_objs()
@@ -270,7 +242,7 @@ class SpectreZMQCommunicator(SpectreBaseCommunicator):
             else:
                 _msgs = received
 
-            if self.log_level >= 2 and _msgs:
+            if self.debug_log_enabled and _msgs:
                 t2 = time.perf_counter()
                 spectre_debug(
                     f"[ZMQ LOG Pyt][RECV] msgs nums:{len(_msgs)}, time_us:{(t2-t1)*1e6:.1f}"

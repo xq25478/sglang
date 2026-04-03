@@ -5,11 +5,14 @@
 
 #include "spectre_protocol.hpp"
 #include "spectre_zmq_endpoints.hpp"
+#include "spectre_zmq_logging.hpp"
 #include "spectre_zmq_serialization.hpp"
 
 namespace py = pybind11;
 
 PYBIND11_MODULE(spectre_zmq, m) {
+    m.def("set_spectre_log_level", &spectre_set_log_level);
+
     py::class_<DealerEndpoint>(m, "DealerEndpoint")
         .def(py::init<const std::string&, const std::string&, bool>())
         .def("start", &DealerEndpoint::start)
