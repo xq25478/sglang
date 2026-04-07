@@ -1,7 +1,7 @@
-from dataclasses import dataclass
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, List
 
 from sglang.srt.server_args import ServerArgs
@@ -47,7 +47,7 @@ class SpectreConfig:
     tp_size: int = 1
     enable_cuda_graph: bool = False
     zmq_transport: str = "tcp"
-    
+
     @classmethod
     def from_server_args(cls, server_args: ServerArgs) -> "SpectreConfig":
         zmq_addr = server_args.spectre_zmq_addr or "127.0.0.1"
@@ -55,7 +55,7 @@ class SpectreConfig:
             zmq_transport = "ipc"
         else:
             zmq_transport = "tcp"
-        
+
         return cls(
             role=server_args.spectre_role,
             zmq_addr=zmq_addr,
@@ -67,33 +67,31 @@ class SpectreConfig:
             enable_cuda_graph=not server_args.disable_cuda_graph,
             zmq_transport=zmq_transport,
         )
-    
+
     @property
     def is_target(self) -> bool:
         return self.role == "target"
-    
+
     @property
     def is_draft(self) -> bool:
         return self.role == "draft"
-    
+
     @property
     def supports_tree_draft(self) -> bool:
         return self.topk > 1
-    
+
     @property
     def supports_paged_kv(self) -> bool:
         return self.page_size > 1
-    
+
     def _get_ipc_base_path(self) -> str:
         if self.zmq_addr.startswith("ipc://"):
-            return self.zmq_addr[len("ipc://"):]
+            return self.zmq_addr[len("ipc://") :]
 
         if "/" in self.zmq_addr or self.zmq_addr.startswith("."):
             return self.zmq_addr
 
-        safe_addr = "".join(
-            ch if ch.isalnum() else "_" for ch in self.zmq_addr
-        )
+        safe_addr = "".join(ch if ch.isalnum() else "_" for ch in self.zmq_addr)
         return f"/tmp/{safe_addr}_{self.zmq_port}"
 
     def get_addr(self) -> str:
@@ -102,7 +100,7 @@ class SpectreConfig:
         if self.zmq_transport == "ipc":
             return f"ipc://{self._get_ipc_base_path()}"
         raise ValueError(f"Unsupported zmq transport: {self.zmq_transport}")
-                
+
     def validate(self) -> None:
         if self.role not in ("target", "draft"):
             raise ValueError(f"Invalid role: {self.role}. Must be 'target' or 'draft'")
@@ -111,19 +109,21 @@ class SpectreConfig:
             raise ValueError(
                 f"Invalid zmq_transport: {self.zmq_transport}. Must be 'tcp' or 'ipc'"
             )
-        
+
         if self.num_draft_tokens < 1:
-            raise ValueError(f"num_draft_tokens must be >= 1, got {self.num_draft_tokens}")
-        
+            raise ValueError(
+                f"num_draft_tokens must be >= 1, got {self.num_draft_tokens}"
+            )
+
         if self.topk < 1:
             raise ValueError(f"topk must be >= 1, got {self.topk}")
-        
+
         if self.page_size < 1:
             raise ValueError(f"page_size must be >= 1, got {self.page_size}")
-        
+
         if self.tp_size < 1:
             raise ValueError(f"tp_size must be >= 1, got {self.tp_size}")
-    
+
     def __repr__(self) -> str:
         return (
             f"SpectreConfig("
@@ -134,7 +134,8 @@ class SpectreConfig:
             f"page_size={self.page_size}, "
             f"tp_size={self.tp_size})"
         )
-               
+
+
 class SpectreZMQCommunicator:
     def __init__(
         self,
@@ -147,35 +148,32 @@ class SpectreZMQCommunicator:
         self.bind = not config.is_target
         self._running = False
         self.identity = self.config.role + "-" + self.generate_identity()
-        
+
         if self.config.role == "draft":
-            self.zmq_communicator = DealerEndpoint(  
-                                        self.zmq_endpoint, 
-                                        self.identity,
-                                        False)
+            self.zmq_communicator = DealerEndpoint(
+                self.zmq_endpoint, self.identity, False
+            )
         else:
-            self.zmq_communicator = RouterEndpoint(  
-                                        self.zmq_endpoint, 
-                                        True)        
-        
-    def generate_identity(self,bits = 8) -> str:
+            self.zmq_communicator = RouterEndpoint(self.zmq_endpoint, True)
+
+    def generate_identity(self, bits=8) -> str:
         id_string = str(uuid.uuid4().hex[:bits])
         return id_string
-    
+
     def get_all_drafts_identity(self) -> List[str]:
         assert self.config.role == "target"
         return self.zmq_communicator.get_all_dealers()
-        
+
     def get_endpoint(self) -> str:
         return self.zmq_endpoint
-        
+
     def start(self) -> None:
         sync_spectre_log_level()
         self.debug_log_enabled = logger.isEnabledFor(logging.DEBUG)
         if self._running:
             spectre_debug("ZMQCommunicator already started")
             return
-        
+
         if not self._running:
             self.zmq_communicator.start()
             self._running = True
@@ -187,38 +185,38 @@ class SpectreZMQCommunicator:
         if self._running:
             self.zmq_communicator.stop()
             self._running = False
-            spectre_info(f"ZMQ Communicator Stoped for {self.config.role}")
-        
-    def _process_data(self, data:Any):
+            spectre_info(f"ZMQ Communicator Stopped for {self.config.role}")
+
+    def _process_data(self, data: Any):
         if isinstance(data, SpectreRequest):
             return data.to_dict()
         return data
-            
-    def send_obj(self,  request: SpectreRequest,
-                        identity: str = "DRAFT" ) -> None:
-        self.send_objs( [ request ] ,identity)
 
-    def send_objs(self, requests: List[SpectreRequest],
-                        identity: str = "DRAFT") -> None:
-        
+    def send_obj(self, request: SpectreRequest, identity: str = "DRAFT") -> None:
+        self.send_objs([request], identity)
+
+    def send_objs(
+        self, requests: List[SpectreRequest], identity: str = "DRAFT"
+    ) -> None:
+
         if not self._running:
             spectre_warning("Cannot send: communicator not running")
             return
         try:
             if self.debug_log_enabled:
                 t1 = time.perf_counter()
-                
-            msgs = [ self._process_data(request) for request in requests ]
-            
+
+            msgs = [self._process_data(request) for request in requests]
+
             if self.debug_log_enabled:
-                t2 = time.perf_counter()  
+                t2 = time.perf_counter()
                 t_process = t2 - t1
-                
+
             if self.config.role == "draft":
                 self.zmq_communicator.send_objs(msgs)
             else:
-                self.zmq_communicator.send_objs(identity,msgs)
-                
+                self.zmq_communicator.send_objs(identity, msgs)
+
             if self.debug_log_enabled:
                 t3 = time.perf_counter()
                 spectre_debug(
@@ -227,18 +225,18 @@ class SpectreZMQCommunicator:
 
         except Exception as e:
             spectre_warning(f"Failed to send: {e}")
-        
+
     def recv_all_objs(self) -> List[SpectreRequest]:
         if not self._running:
             return []
         try:
             if self.debug_log_enabled:
                 t1 = time.perf_counter()
-            
+
             received = self.zmq_communicator.get_received_objs()
-                
-            if self.config.role == 'target':
-                _msgs = [ msg for _, msg in received ]
+
+            if self.config.role == "target":
+                _msgs = [msg for _, msg in received]
             else:
                 _msgs = received
 
@@ -254,14 +252,14 @@ class SpectreZMQCommunicator:
                 msgs = []
                 for _msg in _msgs:
                     if isinstance(_msg, dict):
-                        msgs.append(SpectreRequest.from_dict(_msg))       
+                        msgs.append(SpectreRequest.from_dict(_msg))
                     else:
                         msgs.append(_msg)
                 return msgs
-                        
+
         except Exception as e:
             spectre_warning(f"Failed to receive: {e}")
             return []
-    
+
     def is_running(self) -> bool:
         return self._running

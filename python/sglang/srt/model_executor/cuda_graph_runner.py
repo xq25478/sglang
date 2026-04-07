@@ -858,9 +858,7 @@ class CudaGraphRunner:
 
                 is_spectre = _is_spectre(self)
                 ntpb_list = (
-                    getattr(self, "spectre_ntpb_options", None)
-                    if is_spectre
-                    else None
+                    getattr(self, "spectre_ntpb_options", None) if is_spectre else None
                 ) or [self.num_tokens_per_bs]
                 for ntpb in ntpb_list:
                     if is_spectre:
@@ -877,19 +875,19 @@ class CudaGraphRunner:
                     ) as forward:
                         if is_spectre:
                             graph, output_buffers = self.capture_one_batch_size(
-                                bs, forward, stream_idx,
+                                bs,
+                                forward,
+                                stream_idx,
                                 ntpb_override=ntpb,
                             )
                             key = self._make_graph_key(bs, stream_idx, ntpb)
                         else:
                             graph, output_buffers = self.capture_one_batch_size(
-                                bs, forward, stream_idx,
+                                bs,
+                                forward,
+                                stream_idx,
                             )
-                            key = (
-                                f"{stream_idx}_{bs}"
-                                if stream_idx is not None
-                                else bs
-                            )
+                            key = f"{stream_idx}_{bs}" if stream_idx is not None else bs
                         self.graphs[key] = graph
                         self.output_buffers[key] = output_buffers
 
@@ -912,7 +910,8 @@ class CudaGraphRunner:
 
         if _is_spectre(self):
             spectre_keys = [
-                k for k in self.graphs.keys()
+                k
+                for k in self.graphs.keys()
                 if isinstance(k, str) and k.startswith("r")
             ]
             captured_tensors = getattr(self, "_captured_attn_tensors", {})
@@ -1270,7 +1269,9 @@ class CudaGraphRunner:
 
         effective_replay_mode = (
             ForwardMode.DECODE
-            if _is_spectre(self) and actual_ntpb == 1 and forward_batch.spec_info is None
+            if _is_spectre(self)
+            and actual_ntpb == 1
+            and forward_batch.spec_info is None
             else self.capture_forward_mode
         )
         attn_backend.init_forward_metadata_replay_cuda_graph(
@@ -1347,9 +1348,7 @@ class CudaGraphRunner:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
 
-    def get_spec_info(
-        self, num_tokens: int, ntpb_override: Optional[int] = None
-    ):
+    def get_spec_info(self, num_tokens: int, ntpb_override: Optional[int] = None):
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()

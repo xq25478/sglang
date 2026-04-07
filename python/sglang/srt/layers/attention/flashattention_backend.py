@@ -287,15 +287,14 @@ class FlashAttentionBackend(AttentionBackend):
             # This allows different draft_num_tokens per verify call (e.g., SpectreWorker)
             spec_info = forward_batch.spec_info
             num_draft_tokens = spec_info.draft_token_num
-            
+
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = (
                     forward_batch.seq_lens + num_draft_tokens
                 ).to(torch.int32)
                 metadata.max_seq_len_q = num_draft_tokens
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item()
-                    + num_draft_tokens
+                    forward_batch.seq_lens_cpu.max().item() + num_draft_tokens
                 )
                 metadata.cu_seqlens_q = torch.arange(
                     0,
@@ -341,16 +340,13 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata_expand.max_seq_len_q = 1
                 metadata_expand.cu_seqlens_q = torch.arange(
                     0,
-                    forward_batch.seq_lens.numel() * num_draft_tokens
-                    + 1,
+                    forward_batch.seq_lens.numel() * num_draft_tokens + 1,
                     dtype=torch.int32,
                     device=device,
                 )
 
                 # create expand page table
-                offsets = torch.arange(
-                    num_draft_tokens, device=device
-                ).unsqueeze(
+                offsets = torch.arange(num_draft_tokens, device=device).unsqueeze(
                     0
                 )  # shape: (1, num_draft_tokens)
                 cols = offsets.expand(
@@ -358,16 +354,15 @@ class FlashAttentionBackend(AttentionBackend):
                 ) + forward_batch.seq_lens.unsqueeze(1)
                 cum_len = torch.nn.functional.pad(
                     torch.cumsum(
-                        (
-                            forward_batch.seq_lens + num_draft_tokens
-                        ).repeat_interleave(num_draft_tokens),
+                        (forward_batch.seq_lens + num_draft_tokens).repeat_interleave(
+                            num_draft_tokens
+                        ),
                         dim=0,
                     ),
                     (1, 0),
                 )[:-1]
                 mask_extraction_indices = (
-                    cols.repeat_interleave(num_draft_tokens, dim=0)
-                    + cum_len[:, None]
+                    cols.repeat_interleave(num_draft_tokens, dim=0) + cum_len[:, None]
                 ).view(1, -1)
                 mask = forward_batch.spec_info.custom_mask[
                     mask_extraction_indices
@@ -383,14 +378,10 @@ class FlashAttentionBackend(AttentionBackend):
                 #                        [8, 9, 0],                                    [8, 9, 10],
                 #                        [8, 0, 10]]                                   [8, 10, 9]]
                 # note here cache_seqlens_int32 is [1, 2, 2] so extra page indices will be ignored in each row
-                col_indices = offsets.expand(
-                    mask.shape[0], num_draft_tokens
-                )
+                col_indices = offsets.expand(mask.shape[0], num_draft_tokens)
                 # Build keys: if an entry is valid (mask==True), keep its original index;
                 # if not, add num_draft_tokens so that it sorts after all valid entries.
-                keys = torch.where(
-                    mask, col_indices, col_indices + num_draft_tokens
-                )
+                keys = torch.where(mask, col_indices, col_indices + num_draft_tokens)
                 _, sort_order = torch.sort(keys, dim=1)
                 non_masked_page_table = (
                     forward_batch.req_to_token_pool.req_to_token[
@@ -1589,19 +1580,15 @@ class FlashAttentionBackend(AttentionBackend):
                 if spec_info is not None
                 else self.speculative_num_draft_tokens
             )
-            
+
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + num_draft_tokens)
-                )
+                metadata.cache_seqlens_int32.copy_((seq_lens + num_draft_tokens))
 
                 metadata.max_seq_len_q = num_draft_tokens
-                metadata.max_seq_len_k = (
-                    seq_lens.max().item() + num_draft_tokens
-                )
+                metadata.max_seq_len_k = seq_lens.max().item() + num_draft_tokens
 
                 metadata.cu_seqlens_q = torch.arange(
                     0,
@@ -1862,16 +1849,12 @@ class FlashAttentionBackend(AttentionBackend):
                 if spec_info is not None
                 else self.speculative_num_draft_tokens
             )
-            
+
             if self.topk <= 1:
                 metadata = self.target_verify_metadata[bs]
-                metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + num_draft_tokens)
-                )
+                metadata.cache_seqlens_int32.copy_((seq_lens + num_draft_tokens))
 
-                metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + num_draft_tokens
-                )
+                metadata.max_seq_len_k = seq_lens_cpu.max().item() + num_draft_tokens
                 # Update max_seq_len_q for dynamic draft_token_num
                 metadata.max_seq_len_q = num_draft_tokens
                 # Recompute cu_seqlens_q for dynamic draft_token_num
@@ -1933,25 +1916,22 @@ class FlashAttentionBackend(AttentionBackend):
 
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
-                offsets = torch.arange(
-                    num_draft_tokens, device=device
-                ).unsqueeze(
+                offsets = torch.arange(num_draft_tokens, device=device).unsqueeze(
                     0
                 )  # shape: (1, num_draft_tokens)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
                 cum_len = torch.nn.functional.pad(
                     torch.cumsum(
-                        (
-                            seq_lens + num_draft_tokens
-                        ).repeat_interleave(num_draft_tokens),
+                        (seq_lens + num_draft_tokens).repeat_interleave(
+                            num_draft_tokens
+                        ),
                         dim=0,
                     ),
                     (1, 0),
                 )[:-1]
                 mask_extraction_indices = (
-                    cols.repeat_interleave(num_draft_tokens, dim=0)
-                    + cum_len[:, None]
+                    cols.repeat_interleave(num_draft_tokens, dim=0) + cum_len[:, None]
                 ).view(1, -1)
                 # avoid extracting padded seq indices which will be out of boundary
                 mask_extraction_indices[
@@ -1962,9 +1942,7 @@ class FlashAttentionBackend(AttentionBackend):
                     -1, num_draft_tokens
                 )  # (bsz * draft_num, draft_num)
 
-                col_indices = offsets.expand(
-                    mask.shape[0], num_draft_tokens
-                )
+                col_indices = offsets.expand(mask.shape[0], num_draft_tokens)
                 keys = torch.where(
                     mask,
                     col_indices,

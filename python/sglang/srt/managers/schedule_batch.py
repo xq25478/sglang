@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import enum
-
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.speculative.spectre.spectre_protocol import SpecType
@@ -785,7 +783,7 @@ class Req(ReqDllmMixin):
         self.draft_generation_start_len: int = 0
         self.draft_is_paused: bool = False
         self.draft_tokens_and_logits: Optional[Dict[str, torch.Tensor]] = None
-        
+
         if return_logprob:
             # shape: (bs, 1)
             self.output_token_logprobs_val = []
@@ -896,7 +894,6 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
-
 
     @property
     def seqlen(self) -> int:
@@ -1461,14 +1458,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
-
     draft_num_tokens: Optional[int] = None
     is_high_overhead: bool = False
     recv_draft_fn: Optional[Callable] = None
     retry_fn: Optional[Callable] = None
     retry_fail_ratio: Optional[float] = None
     retry_min_count: Optional[int] = None
-
 
     @classmethod
     def init_new(
@@ -2238,7 +2233,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 for i in range(len(self.reqs))
                 if not self.reqs[i].finished()
                 and self.reqs[i] not in chunked_req_to_exclude
-                and not getattr(self.reqs[i], 'draft_is_paused', False)
+                and not getattr(self.reqs[i], "draft_is_paused", False)
             ]
 
         if keep_indices is None or len(keep_indices) == 0:

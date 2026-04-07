@@ -16,9 +16,7 @@ def build_cpp_zmq():
             text=True,
         )
         if ret.returncode != 0:
-            warnings.warn(
-                f"Failed to build spectre_zmq:\n{ret.stdout}\n{ret.stderr}"
-            )
+            warnings.warn(f"Failed to build spectre_zmq:\n{ret.stdout}\n{ret.stderr}")
 
 
 def _try_import():
@@ -41,7 +39,9 @@ from .spectre_zmq import DealerEndpoint, RouterEndpoint
 try:
     from .spectre_zmq import set_spectre_log_level
 except ImportError:
+
     def set_spectre_log_level(level: int) -> None:
         return None
+
 
 __all__ = ["DealerEndpoint", "RouterEndpoint", "set_spectre_log_level"]

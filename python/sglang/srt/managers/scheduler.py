@@ -209,6 +209,12 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import (
+    SpectreDraftSchedulerMixin as SchedulerSpectreDraftMixin,
+)
+from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import (
+    SchedulerSpectreTargetMixin,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     broadcast_pyobj,
@@ -237,10 +243,6 @@ from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-from sglang.srt.speculative.spectre.drafter.spectre_draft_scheduler_mixin import (
-    SpectreDraftSchedulerMixin as SchedulerSpectreDraftMixin,
-)
-from sglang.srt.speculative.spectre.verifier.spectre_target_scheduler_mixin import SchedulerSpectreTargetMixin
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -2363,15 +2365,15 @@ class Scheduler(
         paused_count = 0
         if self.server_args.spectre_role == "draft":
             with self.paused_reqs_lock:
-                if hasattr(self, 'paused_reqs'):
+                if hasattr(self, "paused_reqs"):
                     paused_count = len(self.paused_reqs)
-        
+
         # Total occupied slots = running + paused
         total_occupied = running_bs + paused_count
-        
+
         res = get_global_server_args().pp_max_micro_batch_size - total_occupied
         if self.pp_size > 1:
-            res = min(res, self.req_to_token_pool.available_size())  
+            res = min(res, self.req_to_token_pool.available_size())
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

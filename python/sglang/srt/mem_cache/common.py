@@ -350,7 +350,7 @@ def alloc_for_extend(
 
     # Allocate req slots.
     reqs_need_alloc: list[Req] = []
-    req_pool_indices: list[Optional[int]] = []
+    req_pool_indices: list[int] = []
     reqs_need_alloc_pos: list[int] = []
     for i, req in enumerate(batch.reqs):
         if (

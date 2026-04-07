@@ -7,9 +7,9 @@ from setuptools.command.build_ext import build_ext
 BASE_DIR = Path(__file__).resolve().parent
 SRC_DIR = BASE_DIR / "src"
 INCLUDE_DIR = BASE_DIR / "include"
-SYSTEM_INCLUDE_DIR = "/usr/include"   # cppzmq header path, e.g. /usr/include/zmq.hpp
-zmq_lib_dir = "/usr/lib"               # ZMQ library path
-zmq_libs = ["zmq"]                     # Link against libzmq.so
+SYSTEM_INCLUDE_DIR = "/usr/include"  # cppzmq header path, e.g. /usr/include/zmq.hpp
+zmq_lib_dir = "/usr/lib"  # ZMQ library path
+zmq_libs = ["zmq"]  # Link against libzmq.so
 
 
 ext_modules = [
@@ -22,7 +22,7 @@ ext_modules = [
             str(SRC_DIR / "spectre_zmq_endpoints.cpp"),
         ],
         include_dirs=[
-            pybind11.get_include(),      # pybind11 headers
+            pybind11.get_include(),  # pybind11 headers
             str(INCLUDE_DIR),
             SYSTEM_INCLUDE_DIR,
         ],

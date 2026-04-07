@@ -5,7 +5,6 @@ import time
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
-
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -13,6 +12,8 @@ from sglang.srt.speculative.spectre.spectre_protocol import (
     SpectreAction,
     SpectreRequest,
     SpecType,
+)
+from sglang.srt.speculative.spectre.spectre_protocol import (
     is_health_check_req as _is_health_check,
 )
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 def _spectre_now_us() -> float:
     return time.time() * 1e6
+
 
 class DraftCircuitBreaker:
     CLOSED = "closed"
@@ -86,6 +88,7 @@ class DraftCircuitBreaker:
             self.state = self.OPEN
             self.rounds_in_open = 0
 
+
 class SchedulerSpectreTargetMixin:
     def _init_draft_recv_infra(self):
         self._recv_timeout_s = (
@@ -115,7 +118,10 @@ class SchedulerSpectreTargetMixin:
     def _bg_recv_loop(self):
         while self._bg_running:
             try:
-                if hasattr(self, "zmq_communicator") and self.zmq_communicator is not None:
+                if (
+                    hasattr(self, "zmq_communicator")
+                    and self.zmq_communicator is not None
+                ):
                     msgs = self.zmq_communicator.recv_all_objs()
                     if msgs:
                         with self._msg_lock:
@@ -178,7 +184,6 @@ class SchedulerSpectreTargetMixin:
             return False
 
         return True
-
 
     @DynamicGradMode()
     def event_loop_normal_spectre_target(self):
@@ -275,9 +280,9 @@ class SchedulerSpectreTargetMixin:
     def _store_messages(self, messages: List[SpectreRequest]) -> bool:
         has_draft = False
         for msg in messages:
-            assert isinstance(msg, SpectreRequest), (
-                f"Expected SpectreRequest, got {type(msg)}"
-            )
+            assert isinstance(
+                msg, SpectreRequest
+            ), f"Expected SpectreRequest, got {type(msg)}"
             if msg.action == SpectreAction.REJECT:
                 if getattr(self, "_accept_reject_messages", True):
                     self.process_reject_action()
@@ -328,9 +333,8 @@ class SchedulerSpectreTargetMixin:
     def _get_reqs_waiting_for_drafts(self, batch: ScheduleBatch) -> List[Req]:
         forward_mode = getattr(batch, "forward_mode", None)
         is_extend_batch = (
-            (forward_mode is not None and forward_mode.is_extend())
-            or getattr(batch, "is_extend_in_batch", False)
-        )
+            forward_mode is not None and forward_mode.is_extend()
+        ) or getattr(batch, "is_extend_in_batch", False)
         if not is_extend_batch:
             return [req for req in batch.reqs if not _is_health_check(req)]
 
@@ -396,9 +400,7 @@ class SchedulerSpectreTargetMixin:
             self._send_retry_requests(failed_reqs, max(1, num_draft_tokens - 1))
 
         if self.tp_size == 1 or self.tp_rank == 0:
-            pending_rids = {
-                req.rid for req in failed_reqs if not _is_health_check(req)
-            }
+            pending_rids = {req.rid for req in failed_reqs if not _is_health_check(req)}
             pending_spec_cnts = {
                 req.rid: req.spec_cnt
                 for req in failed_reqs
@@ -417,7 +419,6 @@ class SchedulerSpectreTargetMixin:
         self._store_messages(messages)
         result = self._build_result_from_cache(failed_reqs)
         return result
-
 
     def send_batch_draft_requests(
         self, batch: ScheduleBatch, speculative_num_draft_tokens: int
@@ -460,18 +461,26 @@ class SchedulerSpectreTargetMixin:
                             spec_cnt=req.spec_cnt,
                             action=SpectreAction.DRAFT,
                             spec_type=SpecType.DRAFT_REQUEST,
-                            input_ids=req.origin_input_ids if needs_full_context else None,
+                            input_ids=(
+                                req.origin_input_ids if needs_full_context else None
+                            ),
                             output_ids=req.output_ids,
                             draft_token_ids=req.cur_drafts,
                             num_draft_tokens=speculative_num_draft_tokens,
-                            sampling_params=req.sampling_params if needs_full_context else None,
+                            sampling_params=(
+                                req.sampling_params if needs_full_context else None
+                            ),
                             grammar=None,
                         )
                     )
                 self._zmq_send(draft_reqs)
 
-    def _send_retry_requests(self, failed_reqs: List[Req], num_draft_tokens: int) -> None:
-        if not (hasattr(self, "zmq_communicator") and self.zmq_communicator is not None):
+    def _send_retry_requests(
+        self, failed_reqs: List[Req], num_draft_tokens: int
+    ) -> None:
+        if not (
+            hasattr(self, "zmq_communicator") and self.zmq_communicator is not None
+        ):
             return
         retry_send_time = time.perf_counter()
         reqs_to_send = [
@@ -494,7 +503,9 @@ class SchedulerSpectreTargetMixin:
     def _zmq_send(self, reqs: List[SpectreRequest]) -> None:
         all_drafts_identity = self.zmq_communicator.get_all_drafts_identity()
         if not all_drafts_identity:
-            logger.warning("\033[32m [Target] No draft available, check draft status! \033[0m")
+            logger.warning(
+                "\033[32m [Target] No draft available, check draft status! \033[0m"
+            )
             return
         self.zmq_communicator.send_objs(reqs, all_drafts_identity[0])
 
@@ -554,11 +565,9 @@ class SchedulerSpectreTargetMixin:
             return 1
 
         no_draft_reqs = sum(
-            1 for req in batch.reqs
-            if not _is_health_check(req) and not req.cur_drafts
+            1 for req in batch.reqs if not _is_health_check(req) and not req.cur_drafts
         )
         bs = batch.batch_size()
         if bs > 0 and no_draft_reqs / bs > self.server_args.spectre_no_draft_ratio:
             return 1
         return self.server_args.speculative_num_draft_tokens
-

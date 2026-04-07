@@ -194,8 +194,13 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_routed_experts(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                        if self.spec_algorithm.is_spectre() and self.server_args.spectre_role == "target":
-                            self.notify_draft_request_finished_or_aborted(req, SpectreAction.FINISH)
+                        if (
+                            self.spec_algorithm.is_spectre()
+                            and self.server_args.spectre_role == "target"
+                        ):
+                            self.notify_draft_request_finished_or_aborted(
+                                req, SpectreAction.FINISH
+                            )
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         self.tree_cache.cache_unfinished_req(req)
                         if self.enable_hisparse:
@@ -471,7 +476,7 @@ class SchedulerOutputProcessorMixin:
             req.check_finished(new_accepted_len)
 
             self._handle_finished_req(req, i, logits_output)
-            
+
             if req.return_logprob:
                 # Spec v1 handles logprobs inside its own worker.
                 # Normalize: non-spec has 1 token, spec v2 has multiple.
@@ -528,7 +533,9 @@ class SchedulerOutputProcessorMixin:
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
 
-            if self.server_args.spectre_role == "draft" and hasattr(self, '_check_and_pause_draft_req'):
+            if self.server_args.spectre_role == "draft" and hasattr(
+                self, "_check_and_pause_draft_req"
+            ):
                 self._check_and_pause_draft_req(req)
 
         self.stream_output(batch.reqs, batch.return_logprob)
@@ -566,7 +573,10 @@ class SchedulerOutputProcessorMixin:
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
-            if self.spec_algorithm.is_spectre() and self.server_args.spectre_role == "target":
+            if (
+                self.spec_algorithm.is_spectre()
+                and self.server_args.spectre_role == "target"
+            ):
                 self.notify_draft_request_finished_or_aborted(req, SpectreAction.FINISH)
 
         self.maybe_collect_customized_info(i, req, logits_output)
@@ -1001,10 +1011,9 @@ class SchedulerOutputProcessorMixin:
         for req in reqs:
             if req is skip_req:
                 continue
-            
-            if hasattr(req, 'spec_type') and req.spec_type == SpecType.DRAFT_REQUEST:
-                continue
 
+            if hasattr(req, "spec_type") and req.spec_type == SpecType.DRAFT_REQUEST:
+                continue
 
             if req.finished():
                 if req.finished_output:

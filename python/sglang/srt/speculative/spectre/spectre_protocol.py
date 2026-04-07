@@ -1,14 +1,13 @@
 from dataclasses import dataclass, fields
-from typing import Optional, List, Dict, Any
 from enum import Enum
+from typing import Any, Dict, List, Optional
+
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 
 def _sampling_params_to_dict(sampling_params: SamplingParams) -> Dict[str, Any]:
     stop_token_ids = (
-        list(sampling_params.stop_token_ids)
-        if sampling_params.stop_token_ids
-        else None
+        list(sampling_params.stop_token_ids) if sampling_params.stop_token_ids else None
     )
     return {
         "max_new_tokens": sampling_params.max_new_tokens,
@@ -38,30 +37,33 @@ def _sampling_params_to_dict(sampling_params: SamplingParams) -> Dict[str, Any]:
         "sampling_seed": sampling_params.sampling_seed,
     }
 
+
 class SpectreAction(Enum):
-    '''
+    """
     SpectreAction is the action to take for the Spectre request.
     draft: normal draft request (D->T & T->D)
     finish: when req is finished in target (T->D)
     abort: when req is aborted in target (T->D)
     reject: when draft is high overhead (D->T)
-    '''
-    DRAFT = 'draft'
-    FINISH = 'finish'
-    ABORT = 'abort'
-    REJECT = 'reject'
+    """
+
+    DRAFT = "draft"
+    FINISH = "finish"
+    ABORT = "abort"
+    REJECT = "reject"
 
 
 class SpecType(Enum):
-    '''
+    """
     SpecType is the type of the Spectre request. It is used to distinguish the type of the request.
-    normal: normal reques
+    normal: normal request
     draft_request: draft request (D->T)
     draft_response: draft response (T->D)
-    '''
-    NORMAL = 'normal'
-    DRAFT_REQUEST = 'draft_request'
-    DRAFT_RESPONSE = 'draft_response'
+    """
+
+    NORMAL = "normal"
+    DRAFT_REQUEST = "draft_request"
+    DRAFT_RESPONSE = "draft_response"
 
 
 @dataclass
@@ -71,8 +73,8 @@ class SpectreRequest:
     action: SpectreAction = SpectreAction.FINISH
     spec_type: SpecType = SpecType.NORMAL
     draft_token_ids: Optional[List[int]] = None
-    target_send_time : float = -1.0
-    target_recv_time : float = -1.0
+    target_send_time: float = -1.0
+    target_recv_time: float = -1.0
 
     input_ids: Optional[List[int]] = None
     output_ids: Optional[List[int]] = None
@@ -81,8 +83,8 @@ class SpectreRequest:
     grammar: Optional[str] = None
 
     draft_logprobs: Optional[List[float]] = None
-    draft_recv_time : float = -1.0
-    draft_send_time : float = -1.0
+    draft_recv_time: float = -1.0
+    draft_send_time: float = -1.0
 
     def to_dict(self) -> Dict[str, Any]:
         result = {}
@@ -100,7 +102,7 @@ class SpectreRequest:
                 else:
                     result[f.name] = val
         return result
-            
+
     @classmethod
     def from_dict(cls, d: dict):
         d = dict(d)
@@ -118,7 +120,7 @@ class SpectreRequest:
                     init_kwargs[f.name] = f.type(val)
                 else:
                     init_kwargs[f.name] = val
-            elif isinstance(val,dict) and "max_new_tokens" in val:
+            elif isinstance(val, dict) and "max_new_tokens" in val:
                 stop_strs = val.pop("stop_strs", None)
                 stop_regex_strs = val.pop("stop_regex_strs", None)
                 sp = SamplingParams(**val)

@@ -21,11 +21,11 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.spec_utils import maybe_detect_nan
 from sglang.srt.speculative.spectre.spectre_protocol import (
     is_health_check_req as _is_health_check,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,6 @@ class SpectreWorker:
 
         self._cached_tree_structures: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
 
-
     @property
     def draft_model_runner(self):
         return None
@@ -91,9 +90,7 @@ class SpectreWorker:
     def clear_cache_pool(self):
         self._cached_tree_structures.clear()
 
-    def forward_batch_generation(
-        self, batch: ScheduleBatch
-    ) -> GenerationBatchResult:
+    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             logits_output, next_token_ids, _ = self.forward_target_extend(batch)
             self._recv_drafts_after_extend(batch, next_token_ids)
@@ -159,15 +156,14 @@ class SpectreWorker:
         new_drafts = recv_draft_fn(batch)
         target_tokens = next_token_ids.tolist()
         decoding_reqs = getattr(batch, "decoding_reqs", None) or []
-        decoding_req_ids = {id(req) for req in decoding_reqs if not _is_health_check(req)}
+        decoding_req_ids = {
+            id(req) for req in decoding_reqs if not _is_health_check(req)
+        }
 
         for i, req in enumerate(batch.reqs):
             if _is_health_check(req):
                 continue
-            if (
-                id(req) not in decoding_req_ids
-                and getattr(req, "is_chunked", 0) > 0
-            ):
+            if id(req) not in decoding_req_ids and getattr(req, "is_chunked", 0) > 0:
                 continue
             token = target_tokens[i] if i < len(target_tokens) else None
             if token is not None:
@@ -354,13 +350,9 @@ class SpectreWorker:
         logits_output.next_token_logits = logits_output.next_token_logits[
             res.accepted_indices
         ]
-        logits_output.hidden_states = logits_output.hidden_states[
-            res.accepted_indices
-        ]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
         batch.forward_mode = (
-            ForwardMode.DECODE
-            if not batch.forward_mode.is_idle()
-            else ForwardMode.IDLE
+            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
         )
         batch.spec_info = res.draft_input
 
@@ -385,7 +377,7 @@ class SpectreWorker:
 
             if drafts is not None:
                 draft_token_ids, draft_logprobs = drafts
-                verified_tokens = req.output_ids[req.len_output_ids:]
+                verified_tokens = req.output_ids[req.len_output_ids :]
                 cur_draft_tokens = list(getattr(req, "cur_drafts", []))
                 cur_draft_tokens.append(draft_token_ids[0])
 
@@ -472,7 +464,9 @@ class SpectreWorker:
         batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
 
         recv_draft_fn = getattr(batch, "recv_draft_fn", None)
-        new_drafts_per_req: dict = recv_draft_fn(batch) if recv_draft_fn is not None else {}
+        new_drafts_per_req: dict = (
+            recv_draft_fn(batch) if recv_draft_fn is not None else {}
+        )
 
         next_token_ids_list = batch_result.next_token_ids.tolist()
         for i, req in enumerate(batch.reqs):
@@ -534,9 +528,7 @@ class SpectreWorker:
         score_list, token_list, parents_list = [], [], []
         for i in range(spec_steps):
             if i == 0:
-                scores = torch.ones(
-                    (bs, 1, topk), dtype=torch.float32, device=device
-                )
+                scores = torch.ones((bs, 1, topk), dtype=torch.float32, device=device)
                 tokens = all_draft_tokens[:, 0:1].repeat(1, topk)
                 parents = (
                     torch.arange(-1, topk, dtype=torch.int64, device=device)
@@ -594,11 +586,13 @@ def _default_draft() -> dict:
         "draft_logprobs": _DEFAULT_DRAFT["draft_logprobs"].clone(),
     }
 
+
 def _make_draft_dict(token_ids, logprobs) -> dict:
     return {
         "draft_tokens": torch.tensor(token_ids, dtype=torch.int64, device="cpu"),
         "draft_logprobs": torch.tensor(logprobs, dtype=torch.float32, device="cpu"),
     }
+
 
 def _find_fork_point(
     verified_tokens: List[int], draft_tokens: List[int]

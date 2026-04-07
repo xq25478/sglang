@@ -2,24 +2,25 @@ import logging
 import os
 import time
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
-from sglang.srt.managers.schedule_policy import PrefillAdder, AddReqResult
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
 from sglang.srt.layers.sampler import SamplingBatchInfo
-from sglang.srt.speculative.spectre.spectre_protocol import (
-    SpectreRequest,
-    SpectreAction,
-    SpecType,
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.spectre.drafter.spectre_kv_rollbacker import (
+    SpectreKVRollbacker,
 )
 from sglang.srt.speculative.spectre.drafter.spectre_state_manager import (
     SpectreDraftState,
     SpectreDraftStateManager,
 )
-from sglang.srt.speculative.spectre.drafter.spectre_kv_rollbacker import (
-    SpectreKVRollbacker,
+from sglang.srt.speculative.spectre.spectre_protocol import (
+    SpectreAction,
+    SpectreRequest,
+    SpecType,
 )
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj
 
@@ -28,18 +29,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 class DraftReqLocation(str, Enum):
     DRAFT_WAITING = "draft_waiting"
-    DRAFT_BATCH   = "draft_batch" 
-    PAUSED        = "paused"
+    DRAFT_BATCH = "draft_batch"
+    PAUSED = "paused"
+
 
 def _fix_sampling_params_stop_strs(sp) -> None:
-    if not hasattr(sp, 'stop_strs') or sp.stop_strs is None:
+    if not hasattr(sp, "stop_strs") or sp.stop_strs is None:
         sp.stop_strs = []
     elif isinstance(sp.stop_strs, str):
         sp.stop_strs = [sp.stop_strs]
 
-    if not hasattr(sp, 'stop_regex_strs') or sp.stop_regex_strs is None:
+    if not hasattr(sp, "stop_regex_strs") or sp.stop_regex_strs is None:
         sp.stop_regex_strs = []
     elif isinstance(sp.stop_regex_strs, str):
         sp.stop_regex_strs = [sp.stop_regex_strs]
@@ -65,7 +68,6 @@ class SpectreDraftSchedulerMixin:
         self.draft_cleanup_interval: int = int(
             os.environ.get("SGLANG_DRAFT_CLEANUP_INTERVAL", "500")
         )
-
 
     def _get_draft_state(self, req_id: str) -> Optional[SpectreDraftState]:
         return self.draft_state_manager.get_state(req_id)
@@ -127,7 +129,7 @@ class SpectreDraftSchedulerMixin:
         remaining_steps = max(
             (r.draft_tokens_target - (len(r.output_ids) - r.draft_generation_start_len))
             for r in self.draft_batch.reqs
-            if not getattr(r, 'draft_is_paused', False)
+            if not getattr(r, "draft_is_paused", False)
         )
         max_steps = self.server_args.spectre_max_draft_priority_steps
         if max_steps <= 0:
@@ -175,7 +177,7 @@ class SpectreDraftSchedulerMixin:
 
         keep_indices: List[int] = []
         for i, req in enumerate(self.draft_batch.reqs):
-            if getattr(req, 'draft_is_paused', False):
+            if getattr(req, "draft_is_paused", False):
                 if req not in self.draft_paused_reqs:
                     self.draft_paused_reqs.append(req)
             elif req.finished():
@@ -207,7 +209,7 @@ class SpectreDraftSchedulerMixin:
 
         paused_indices: List[int] = []
         for i, req in enumerate(self.running_batch.reqs):
-            if not getattr(req, 'draft_is_paused', False):
+            if not getattr(req, "draft_is_paused", False):
                 continue
             if req not in self.draft_paused_reqs:
                 self.draft_paused_reqs.append(req)
@@ -218,7 +220,9 @@ class SpectreDraftSchedulerMixin:
 
         if paused_indices:
             paused_set = set(paused_indices)
-            keep = [i for i in range(len(self.running_batch.reqs)) if i not in paused_set]
+            keep = [
+                i for i in range(len(self.running_batch.reqs)) if i not in paused_set
+            ]
             self.running_batch.filter_batch(keep_indices=keep)
 
     def _prefill_draft_reqs(self) -> None:
@@ -233,7 +237,7 @@ class SpectreDraftSchedulerMixin:
             res = adder.add_one_req(
                 req,
                 has_chunked_req=False,
-                truncation_align_size=getattr(self, 'truncation_align_size', None),
+                truncation_align_size=getattr(self, "truncation_align_size", None),
             )
             if res != AddReqResult.CONTINUE:
                 break
@@ -272,9 +276,7 @@ class SpectreDraftSchedulerMixin:
                 if state:
                     state.location = DraftReqLocation.DRAFT_BATCH
 
-    def _process_draft_prefill_result(
-        self, batch: ScheduleBatch, result
-    ) -> None:
+    def _process_draft_prefill_result(self, batch: ScheduleBatch, result) -> None:
         self.process_batch_result_prefill(batch, result)
 
     def _build_prefill_adder_for_draft(self) -> PrefillAdder:
@@ -289,7 +291,6 @@ class SpectreDraftSchedulerMixin:
             mixed_with_decode_tokens=0,
             priority_scheduling_preemption_threshold=0,
         )
-
 
     def _add_req_to_draft_batch(self, req: Req) -> None:
         tmp_batch = self._build_decode_batch_from_reqs([req])
@@ -311,7 +312,10 @@ class SpectreDraftSchedulerMixin:
 
         try:
             from sglang.srt.mem_cache.allocator import SWATokenToKVPoolAllocator
-            is_hybrid_swa = isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
+
+            is_hybrid_swa = isinstance(
+                self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
+            )
         except ImportError:
             is_hybrid_swa = False
 
@@ -333,11 +337,16 @@ class SpectreDraftSchedulerMixin:
         )
         batch.seq_lens = torch.tensor(seq_lens_list, dtype=torch.int64, device=device)
         batch.seq_lens_cpu = torch.tensor(seq_lens_list, dtype=torch.int64)
-        batch.orig_seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
+        batch.orig_seq_lens = torch.tensor(
+            seq_lens_list, dtype=torch.int32, device=device
+        )
         batch.out_cache_loc = None
         batch.seq_lens_sum = sum(seq_lens_list)
         batch.output_ids = torch.tensor(
-            [r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1] for r in reqs],
+            [
+                r.output_ids[-1] if r.output_ids else r.origin_input_ids[-1]
+                for r in reqs
+            ],
             dtype=torch.int64,
             device=device,
         )
@@ -360,7 +369,7 @@ class SpectreDraftSchedulerMixin:
 
     def recv_and_process_draft_requests(self) -> None:
         if self.tp_size == 1:
-            if not hasattr(self, 'zmq_communicator') or self.zmq_communicator is None:
+            if not hasattr(self, "zmq_communicator") or self.zmq_communicator is None:
                 return
 
         if self._is_self_high_overhead_draft():
@@ -402,7 +411,7 @@ class SpectreDraftSchedulerMixin:
     def _recv_draft_requests(self) -> List[SpectreRequest]:
         try:
             msgs: List[SpectreRequest] = []
-            if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
+            if hasattr(self, "zmq_communicator") and self.zmq_communicator is not None:
                 msgs = self.zmq_communicator.recv_all_objs()
                 if msgs:
                     more = self.zmq_communicator.recv_all_objs()
@@ -427,13 +436,16 @@ class SpectreDraftSchedulerMixin:
 
         for draft_req in messages:
             req_id = draft_req.request_id
-            action = getattr(draft_req, 'action', SpectreAction.DRAFT)
+            action = getattr(draft_req, "action", SpectreAction.DRAFT)
 
             if action in (SpectreAction.FINISH, SpectreAction.ABORT):
                 control_msgs.append(draft_req)
                 continue
 
-            if req_id not in latest_msgs or draft_req.spec_cnt > latest_msgs[req_id].spec_cnt:
+            if (
+                req_id not in latest_msgs
+                or draft_req.spec_cnt > latest_msgs[req_id].spec_cnt
+            ):
                 if req_id in latest_msgs and draft_req.input_ids is None:
                     draft_req.input_ids = latest_msgs[req_id].input_ids
                     draft_req.sampling_params = (
@@ -453,12 +465,12 @@ class SpectreDraftSchedulerMixin:
             action = draft_req.action
             if action in (SpectreAction.FINISH, SpectreAction.ABORT):
                 if self.tp_rank == 0:
-                    logger.debug(f"[Draft] Received {action} for {draft_req.request_id}")
+                    logger.debug(
+                        f"[Draft] Received {action} for {draft_req.request_id}"
+                    )
                 self._finish_draft_request(draft_req.request_id)
 
-    def _process_draft_requests(
-        self, latest_msgs: Dict[str, SpectreRequest]
-    ) -> None:
+    def _process_draft_requests(self, latest_msgs: Dict[str, SpectreRequest]) -> None:
         for req_id, draft_req in latest_msgs.items():
             try:
                 state = self._get_draft_state(req_id)
@@ -496,15 +508,19 @@ class SpectreDraftSchedulerMixin:
                     + (draft_req.output_ids or [])
                     + (draft_req.draft_token_ids or [])
                 )
-                draft_fill_ids: List[int] = (
-                    (req.origin_input_ids or []) + (req.output_ids or [])
+                draft_fill_ids: List[int] = (req.origin_input_ids or []) + (
+                    req.output_ids or []
                 )
 
                 if not target_fill_ids:
                     continue
 
                 skip = len(target_input)
-                if skip > 0 and len(draft_fill_ids) >= skip and len(target_fill_ids) >= skip:
+                if (
+                    skip > 0
+                    and len(draft_fill_ids) >= skip
+                    and len(target_fill_ids) >= skip
+                ):
                     is_identical, fork_offset = self._find_fork_point(
                         draft_fill_ids[skip:], target_fill_ids[skip:]
                     )
@@ -517,7 +533,9 @@ class SpectreDraftSchedulerMixin:
                 if is_identical:
                     self._handle_identical_tokens(req, draft_req, state)
                 else:
-                    self._handle_divergence(req, target_fill_ids, fork_point, draft_req, state)
+                    self._handle_divergence(
+                        req, target_fill_ids, fork_point, draft_req, state
+                    )
 
             except Exception as e:
                 if self.tp_rank == 0:
@@ -572,18 +590,35 @@ class SpectreDraftSchedulerMixin:
 
         if current_len == target_len:
             self._handle_equal_length(
-                req, target_fill_ids, fork_point, current_len, current_kv_len,
-                needs_kv_release, draft_req, state,
+                req,
+                target_fill_ids,
+                fork_point,
+                current_len,
+                current_kv_len,
+                needs_kv_release,
+                draft_req,
+                state,
             )
         elif current_len > target_len:
             self._handle_draft_ahead(
-                req, target_fill_ids, fork_point, current_kv_len,
-                needs_kv_release, draft_req, state,
+                req,
+                target_fill_ids,
+                fork_point,
+                current_kv_len,
+                needs_kv_release,
+                draft_req,
+                state,
             )
         else:
             self._handle_target_ahead(
-                req, target_fill_ids, fork_point, current_len, current_kv_len,
-                needs_kv_release, draft_req, state,
+                req,
+                target_fill_ids,
+                fork_point,
+                current_len,
+                current_kv_len,
+                needs_kv_release,
+                draft_req,
+                state,
             )
 
     def _handle_equal_length(
@@ -608,8 +643,14 @@ class SpectreDraftSchedulerMixin:
             self._resume_or_update(req, state)
         else:
             self._handle_multi_token_divergence(
-                req, target_fill_ids, fork_point, current_kv_len,
-                needs_kv_release, draft_req, state, "1.2",
+                req,
+                target_fill_ids,
+                fork_point,
+                current_kv_len,
+                needs_kv_release,
+                draft_req,
+                state,
+                "1.2",
             )
 
     def _handle_draft_ahead(
@@ -654,8 +695,14 @@ class SpectreDraftSchedulerMixin:
                 self._resume_or_update(req, state)
         else:
             self._handle_multi_token_divergence(
-                req, target_fill_ids, fork_point, current_kv_len,
-                needs_kv_release, draft_req, state, "2.2",
+                req,
+                target_fill_ids,
+                fork_point,
+                current_kv_len,
+                needs_kv_release,
+                draft_req,
+                state,
+                "2.2",
             )
 
     def _handle_target_ahead(
@@ -695,11 +742,10 @@ class SpectreDraftSchedulerMixin:
         case_name: str,
     ) -> None:
         new_len = len(target_fill_ids)
-        can_decode_after_rollback = (new_len - 1 <= fork_point)
+        can_decode_after_rollback = new_len - 1 <= fork_point
 
-        if (
-            can_decode_after_rollback
-            and self.draft_kv_manager.can_local_rollback(req, fork_point)
+        if can_decode_after_rollback and self.draft_kv_manager.can_local_rollback(
+            req, fork_point
         ):
             if self.tp_rank == 0:
                 logger.debug(
@@ -719,12 +765,11 @@ class SpectreDraftSchedulerMixin:
                 )
             self._prepare_for_reprefill(req, target_fill_ids, draft_req, state)
 
-
     def _update_tokens(
         self, req: Req, fork_point: int, delta_tokens: List[int]
     ) -> None:
         truncate_point = fork_point - len(req.origin_input_ids)
-        req.output_ids = req.output_ids[:max(0, truncate_point)]
+        req.output_ids = req.output_ids[: max(0, truncate_point)]
         req.output_ids.extend(delta_tokens)
         req.fill_ids = req.origin_input_ids + req.output_ids
 
@@ -779,9 +824,7 @@ class SpectreDraftSchedulerMixin:
         if self.tp_rank == 0:
             logger.debug(f"[Draft][Resume] {req.rid} → draft_batch (pending)")
 
-    def _rebuild_req_in_draft_batch(
-        self, req: Req, state: SpectreDraftState
-    ) -> None:
+    def _rebuild_req_in_draft_batch(self, req: Req, state: SpectreDraftState) -> None:
         if not self.draft_batch.is_empty() and req in self.draft_batch.reqs:
             self.draft_batch.filter_batch(chunked_req_to_exclude=[req])
 
@@ -838,7 +881,6 @@ class SpectreDraftSchedulerMixin:
         req.output_token_ids_logprobs_val = []
         req.output_token_ids_logprobs_idx = []
 
-
     def _remove_draft_req(self, req: Req) -> None:
         if req in self.draft_paused_reqs:
             self.draft_paused_reqs.remove(req)
@@ -890,7 +932,7 @@ class SpectreDraftSchedulerMixin:
         self.draft_waiting_queue.append(req)
 
     def _check_and_pause_draft_req(self, req: Req) -> bool:
-        if getattr(req, 'spec_type', None) != SpecType.DRAFT_REQUEST:
+        if getattr(req, "spec_type", None) != SpecType.DRAFT_REQUEST:
             return False
 
         if req.draft_is_paused:
@@ -915,10 +957,10 @@ class SpectreDraftSchedulerMixin:
         return False
 
     def _send_draft_response(self, req: Req) -> None:
-        draft_tokens = req.output_ids[req.draft_generation_start_len:]
+        draft_tokens = req.output_ids[req.draft_generation_start_len :]
 
         draft_logits: List[float] = []
-        if hasattr(req, 'output_token_logprobs_val') and req.output_token_logprobs_val:
+        if hasattr(req, "output_token_logprobs_val") and req.output_token_logprobs_val:
             start = req.draft_generation_start_len
             end = start + len(draft_tokens)
             if len(req.output_token_logprobs_val) >= end:
@@ -936,7 +978,7 @@ class SpectreDraftSchedulerMixin:
         )
 
         if self.tp_size == 1 or self.tp_rank == 0:
-            if hasattr(self, 'zmq_communicator') and self.zmq_communicator is not None:
+            if hasattr(self, "zmq_communicator") and self.zmq_communicator is not None:
                 self.zmq_communicator.send_objs([response])
 
         req.draft_generation_start_len = len(req.output_ids)
@@ -955,11 +997,12 @@ class SpectreDraftSchedulerMixin:
 
         if draft_req.sampling_params is None:
             from sglang.srt.sampling.sampling_params import SamplingParams
+
             sampling_params = SamplingParams()
         else:
             sampling_params = draft_req.sampling_params
 
-        if hasattr(sampling_params, 'normalize'):
+        if hasattr(sampling_params, "normalize"):
             try:
                 sampling_params.normalize(self.tokenizer)
             except Exception as e:
@@ -991,7 +1034,7 @@ class SpectreDraftSchedulerMixin:
             bootstrap_room=None,
             vocab_size=self.model_config.vocab_size,
         )
-        
+
         req.spec_cnt = draft_req.spec_cnt
         req.spec_type = SpecType.DRAFT_REQUEST
         req.tokenizer = self.tokenizer
@@ -1037,7 +1080,9 @@ class SpectreDraftSchedulerMixin:
             req.to_abort = True
             req.finished_reason = FINISH_ABORT("Target request finished")
 
-        if req.req_pool_idx is not None and not getattr(req, 'kv_committed_freed', False):
+        if req.req_pool_idx is not None and not getattr(
+            req, "kv_committed_freed", False
+        ):
             self.draft_kv_manager.release_all_kv_for_finished_req(req)
 
         self._delete_draft_state(req_id)
@@ -1057,16 +1102,15 @@ class SpectreDraftSchedulerMixin:
                 except Exception:
                     pass
 
-
     def _is_self_high_overhead_draft(self) -> bool:
-        if not hasattr(self, 'running_batch') or self.running_batch is None:
+        if not hasattr(self, "running_batch") or self.running_batch is None:
             return False
         return self.running_batch.batch_size() > self.server_args.spectre_max_batch_size
 
     def _send_reject_message(self) -> None:
         if self.tp_size > 1 and self.tp_rank != 0:
             return
-        if not hasattr(self, 'zmq_communicator') or self.zmq_communicator is None:
+        if not hasattr(self, "zmq_communicator") or self.zmq_communicator is None:
             return
 
         reject_msg = SpectreRequest(
@@ -1081,17 +1125,16 @@ class SpectreDraftSchedulerMixin:
         if self.tp_rank == 0:
             logger.debug("[Draft] Sent REJECT to Target (high load)")
 
-
     def get_num_allocatable_reqs(self, running_bs: int) -> int:
         paused_id_set: set = set()
-        paused_reqs_lock = getattr(self, 'paused_reqs_lock', None)
-        if paused_reqs_lock is not None and hasattr(self, 'paused_reqs'):
+        paused_reqs_lock = getattr(self, "paused_reqs_lock", None)
+        if paused_reqs_lock is not None and hasattr(self, "paused_reqs"):
             try:
                 with paused_reqs_lock:
                     paused_id_set.update(id(r) for r in self.paused_reqs)
             except Exception:
                 pass
-        if hasattr(self, 'draft_paused_reqs'):
+        if hasattr(self, "draft_paused_reqs"):
             paused_id_set.update(id(r) for r in self.draft_paused_reqs)
 
         paused_count = len(paused_id_set)

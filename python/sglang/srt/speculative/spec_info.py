@@ -56,9 +56,7 @@ class SpeculativeAlgorithm(Enum):
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
 
-    def create_worker(
-        self, server_args: ServerArgs
-    ) -> Optional[
+    def create_worker(self, server_args: ServerArgs) -> Optional[
         Union[
             Type[BaseSpecWorker],
             Type[TpModelWorker],
@@ -128,6 +126,7 @@ class SpeculativeAlgorithm(Enum):
             return SpectreWorker
 
         raise ValueError("Unreachable code path in create_worker.")
+
 
 class SpecInputType(IntEnum):
     # NOTE: introduce this to distinguish the SpecInput types of multiple algorithms when asserting in attention backends.

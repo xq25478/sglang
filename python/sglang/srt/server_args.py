@@ -4994,7 +4994,7 @@ class ServerArgs:
             type=float,
             default=ServerArgs.spectre_retry_fail_ratio,
             help="Minimum ratio of failed requests to batch size required to trigger a retry. "
-                 "E.g. 0.5 means retry only when more than 50%% of requests have no valid draft.",
+            "E.g. 0.5 means retry only when more than 50%% of requests have no valid draft.",
         )
         parser.add_argument(
             "--spectre-zmq-addr",

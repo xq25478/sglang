@@ -193,8 +193,7 @@ class SchedulerMetricsMixin:
         else:
             draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
             num_draft_tokens = (
-                self.server_args.speculative_num_draft_tokens
-                or draft_tokens_fallback
+                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
             )
             self.spec_num_draft_tokens += bs * num_draft_tokens
 
