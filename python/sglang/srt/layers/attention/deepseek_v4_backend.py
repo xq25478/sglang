@@ -897,14 +897,32 @@ class DeepseekV4AttnBackend(
         # materialization is recorded inside the cuda graph; a no-op (Full
         # already) when PREP_IN_CUDA_GRAPH=0.
         if isinstance(self.forward_metadata, DSV4RawVerifyMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_verify(
-                raw_metadata=self.forward_metadata,
-                online_c128_state_slot_offset=self.online_c128_mtp.state_slot_offset(),
-            )
+            online_c128_state_slot_offset = self.online_c128_mtp.state_slot_offset()
+            full_buf = self._lookup_full_metadata_buffer()
+            if full_buf is not None:
+                temp = self.make_forward_metadata_from_raw_verify(
+                    raw_metadata=self.forward_metadata,
+                    online_c128_state_slot_offset=online_c128_state_slot_offset,
+                )
+                full_buf.copy_(temp)
+                self.forward_metadata = full_buf
+            else:
+                self.forward_metadata = self.make_forward_metadata_from_raw_verify(
+                    raw_metadata=self.forward_metadata,
+                    online_c128_state_slot_offset=online_c128_state_slot_offset,
+                )
         elif isinstance(self.forward_metadata, DSV4RawDecodeMetadata):
-            self.forward_metadata = self.make_forward_metadata_from_raw_decode(
-                raw_metadata=self.forward_metadata,
-            )
+            full_buf = self._lookup_full_metadata_buffer()
+            if full_buf is not None:
+                temp = self.make_forward_metadata_from_raw_decode(
+                    raw_metadata=self.forward_metadata,
+                )
+                full_buf.copy_(temp)
+                self.forward_metadata = full_buf
+            else:
+                self.forward_metadata = self.make_forward_metadata_from_raw_decode(
+                    raw_metadata=self.forward_metadata,
+                )
 
         # Compute the SWA KV-store write target once per forward and cache it on
         # the metadata for every layer's store. This is recorded inside the cuda
@@ -1223,6 +1241,9 @@ class DeepseekV4AttnBackend(
                 ],
             ],
         ] = {bucket: {} for bucket in _GraphBucket}
+        self.cuda_graph_full_metadata_of_bucket_and_bs: Dict[
+            _GraphBucket, Dict[int, DSV4Metadata]
+        ] = {}
         self.draft_extend_num_tokens_per_bs = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
@@ -1263,7 +1284,35 @@ class DeepseekV4AttnBackend(
         # restore raw so capture re-runs the upgrade inside the graph.
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
+            # Save the warmup-upgraded full metadata as graph-persistent
+            # buffers so init_forward_metadata_in_graph can copy into them during
+            # CUDA graph replay instead of allocating new tensors.
+            if envs.SGLANG_PREP_IN_CUDA_GRAPH.get() and isinstance(
+                metadata, DSV4Metadata
+            ):
+                for bucket, bs_dict in self.cuda_graph_metadata_of_bucket_and_bs.items():
+                    for bs, saved in bs_dict.items():
+                        if saved is current_raw:
+                            self.cuda_graph_full_metadata_of_bucket_and_bs.setdefault(
+                                bucket, {}
+                            )[bs] = metadata
+                            break
             self.forward_metadata = current_raw
+
+    def _lookup_full_metadata_buffer(self) -> Optional[DSV4Metadata]:
+        current_meta = self.forward_metadata
+        metadata_by_bucket = getattr(self, "cuda_graph_metadata_of_bucket_and_bs", None)
+        full_metadata_by_bucket = getattr(
+            self, "cuda_graph_full_metadata_of_bucket_and_bs", None
+        )
+        if metadata_by_bucket is None or full_metadata_by_bucket is None:
+            return None
+
+        for bucket, bs_dict in metadata_by_bucket.items():
+            for bs, saved_meta in bs_dict.items():
+                if saved_meta is current_meta:
+                    return full_metadata_by_bucket.get(bucket, {}).get(bs)
+        return None
 
     def get_swa_out_cache_loc(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Resolve the SWA KV-store write target for the current forward.
