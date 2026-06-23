@@ -1537,9 +1537,8 @@ class DeepseekV4DecoderLayer(nn.Module):
             if get_moe_a2a_backend().is_none():
                 hidden_states = dsa_cp_gather_hidden_states(hidden_states)
             else:
-                assert get_moe_a2a_backend().is_deepep(), (
-                    "CP requires DeepEP (moe_a2a_backend == deepep). "
-                    "Only DeepEP is tested with CP's per-rank token split."
+                assert get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_megamoe(), (
+                    "CP requires DeepEP or MegaMoE. Only DeepEP and MegaMoE are tested with CP's per-rank token split."
                 )
         elif _use_tp_moe_gather:
             hidden_states, local_hidden_states = (
