@@ -59,10 +59,13 @@ except:
     StructuralTag = Any
 
 from sglang.utils import convert_json_schema_to_str
+from sglang.srt.utils import get_bool_env_var,get_int_env_var
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+_TRUTHY_THINKING_VALUES = {"1", "true", "yes", "y", "on", "enabled"}
+_FALSY_THINKING_VALUES = {"0", "false", "no", "n", "off", "disabled"}
 
 
 class ModelCard(BaseModel):
@@ -714,6 +717,7 @@ class ChatCompletionRequest(BaseModel):
         "and the corresponding task special token (e.g. `<｜domain｜>`) is appended "
         "before generation. Only honored by the dsv4 chat encoder; ignored otherwise.",
     )
+    thinking: Optional[Union[Dict, bool, str]] = None
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: Optional[int] = None
@@ -799,6 +803,33 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
+        if not isinstance(values, dict):
+            return values
+
+        thinking = values.get("thinking")
+        if isinstance(thinking, bool):
+            pass
+        elif isinstance(thinking, str):
+            thinking = thinking.strip().lower()
+            values["thinking"] = (
+                thinking
+                if thinking in (_TRUTHY_THINKING_VALUES | _FALSY_THINKING_VALUES)
+                else None
+            )
+        elif isinstance(thinking, dict):
+            thinking_type = thinking.get("type")
+            if isinstance(thinking_type, str):
+                thinking_type = thinking_type.strip().lower()
+            values["thinking"] = (
+                {**thinking, "type": thinking_type}
+                if thinking_type in {"enabled", "disabled"}
+                else None
+            )
+        elif thinking is not None:
+            # Ignore unsupported top-level thinking payloads instead of failing
+            # request validation. Valid forms are bool / str / dict.
+            values["thinking"] = None
+
         r = values.get("reasoning")
 
         if r is not None and isinstance(r, dict):
@@ -823,6 +854,56 @@ class ChatCompletionRequest(BaseModel):
                 ctk.setdefault("thinking", True)
                 ctk.setdefault("enable_thinking", True)
                 values["chat_template_kwargs"] = ctk
+
+        thinking = values.get("thinking")
+        if isinstance(thinking, bool):
+            ctk = values.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            ctk.setdefault("thinking", thinking)
+            ctk.setdefault("enable_thinking", thinking)
+            values["chat_template_kwargs"] = ctk
+        elif isinstance(thinking, str):
+            if thinking in _TRUTHY_THINKING_VALUES:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", True)
+                ctk.setdefault("enable_thinking", True)
+                values["chat_template_kwargs"] = ctk
+            elif thinking in _FALSY_THINKING_VALUES:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", False)
+                ctk.setdefault("enable_thinking", False)
+                values["chat_template_kwargs"] = ctk
+        elif isinstance(thinking, dict):
+            thinking_type = thinking.get("type")
+            if isinstance(thinking_type, str):
+                thinking_type = thinking_type.strip().lower()
+            if thinking_type in {"enabled", "disabled"}:
+                ctk = values.get("chat_template_kwargs")
+                if not isinstance(ctk, dict):
+                    ctk = {}
+                ctk.setdefault("thinking", thinking_type)
+                ctk.setdefault("enable_thinking", thinking_type == "enabled")
+                values["chat_template_kwargs"] = ctk
+
+        ctk = values.get("chat_template_kwargs")
+        if isinstance(ctk, dict):
+            ctk_thinking = ctk.get("thinking")
+            if isinstance(ctk_thinking, str):
+                ctk_thinking = ctk_thinking.strip().lower()
+            if isinstance(ctk_thinking, bool):
+                ctk.setdefault("enable_thinking", ctk_thinking)
+            elif ctk_thinking in {"enabled", "disabled"}:
+                ctk.setdefault("enable_thinking", ctk_thinking == "enabled")
+
+            enable_thinking = ctk.get("enable_thinking")
+            if isinstance(enable_thinking, bool):
+                ctk.setdefault("thinking", enable_thinking)
+            values["chat_template_kwargs"] = ctk
 
         if values.get("reasoning_effort") == "none":
             ctk = values.get("chat_template_kwargs")
@@ -869,6 +950,9 @@ class ChatCompletionRequest(BaseModel):
 
         return values
 
+    def _verify_ignore_eos(self) -> bool:
+        return self.ignore_eos if get_bool_env_var("JD_ENABLE_IGNORE_EOS","false") else False
+
     def to_sampling_params(
         self,
         stop: List[str],
@@ -897,7 +981,7 @@ class ChatCompletionRequest(BaseModel):
 
         sampling_params = {
             "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
+            "max_new_tokens": self.max_completion_tokens if self.max_completion_tokens is not None else (self.max_tokens if self.max_tokens is not None else get_int_env_var("JD_DEFAULT_MAX_TOKENS", 8192)),
             "min_new_tokens": self.min_tokens,
             "stop": stop,
             "stop_token_ids": self.stop_token_ids,
@@ -912,7 +996,7 @@ class ChatCompletionRequest(BaseModel):
             "ebnf": self.ebnf,
             "n": self.n,
             "no_stop_trim": self.no_stop_trim,
-            "ignore_eos": self.ignore_eos,
+            "ignore_eos": self._verify_ignore_eos(),
             "skip_special_tokens": self.skip_special_tokens,
             "logit_bias": self.logit_bias,
             "custom_params": self.custom_params,

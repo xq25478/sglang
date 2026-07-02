@@ -792,6 +792,9 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
+    # DP Attention
+    SGLANG_DP_ATTN_COMPRESSED_ALLGATHER = EnvBool(False)
+
     # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
     SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
@@ -978,6 +981,10 @@ class Envs:
     SGLANG_KV_CANARY_ENABLE_VERIFY_TOKEN_ASSERT = EnvBool(False)
     SGLANG_KV_CANARY_SWA_DIVERGENCE_STATS_INTERVAL = EnvInt(0)
     SGLANG_KV_CANARY_ENABLE_MHA_V = EnvBool(False)
+
+    # openai server
+    JD_ENABLE_IGNORE_EOS = EnvBool(False)
+    JD_DEFAULT_MAX_TOKENS = EnvInt(8192)
 
 
 envs = Envs()

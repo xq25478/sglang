@@ -150,13 +150,17 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     P_dsml_strs = []
 
     raw_arguments = tool_call["arguments"]
-    arguments = (
-        json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-    )
-    if not isinstance(arguments, dict):
-        raise ValueError(
-            "Assistant tool call function.arguments must be a JSON object."
+    try:
+        arguments = (
+            json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
         )
+    except Exception:
+        arguments = raw_arguments
+
+    if not isinstance(arguments, dict):
+        arguments = {
+            "arguments": arguments if isinstance(arguments, str) else to_json(arguments)
+        }
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

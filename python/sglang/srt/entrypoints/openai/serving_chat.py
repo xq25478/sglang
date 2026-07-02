@@ -731,9 +731,21 @@ class OpenAIServingChat(OpenAIServingBase):
         template_content_format = self.template_manager.jinja_template_content_format
 
         # Try custom encoding first (override in subclass for custom renderers)
-        thinking_requested = (request.chat_template_kwargs or {}).get(
-            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
-        )
+        chat_template_kwargs = request.chat_template_kwargs or {}
+        thinking_requested = chat_template_kwargs.get("thinking")
+        if thinking_requested is None:
+            thinking_requested = chat_template_kwargs.get(
+                "enable_thinking", envs.SGLANG_DEFAULT_THINKING.get()
+            )
+        if isinstance(thinking_requested, str):
+            thinking_requested = thinking_requested.strip().lower() not in (
+                "disabled",
+                "0",
+                "false",
+                "no",
+                "n",
+                "off",
+            )
         thinking_mode = (
             ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
         )
@@ -1524,12 +1536,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 not is_required or parser.detector.supports_structural_tag()
             )
             if should_try_parser and parser.has_tool_call(text):
-                original_finish_type = finish_reason["type"]
-                if finish_reason["type"] == "stop":
-                    finish_reason["type"] = "tool_calls"
-                    finish_reason["matched"] = None
+                original_finish_reason = finish_reason.copy()
                 try:
                     text, call_info_list = parser.parse_non_stream(text)
+                    if not call_info_list:
+                        return ToolCallProcessingResult(
+                            None, text, original_finish_reason
+                        )
+                    if finish_reason["type"] == "stop":
+                        finish_reason["type"] = "tool_calls"
+                        finish_reason["matched"] = None
                     tool_calls = []
                     for call_info in call_info_list:
                         tool_id = self._process_tool_call_id(
@@ -1548,8 +1564,9 @@ class OpenAIServingChat(OpenAIServingBase):
                     return ToolCallProcessingResult(tool_calls, text, finish_reason)
                 except Exception as e:
                     logger.error(f"Tool call parsing error: {e}")
-                    finish_reason["type"] = original_finish_type
-                    return ToolCallProcessingResult(None, text, finish_reason)
+                    return ToolCallProcessingResult(
+                        None, text, original_finish_reason
+                    )
 
         # json_schema constraint → JSON array output for required/named
         if is_required:
@@ -1781,75 +1798,115 @@ class OpenAIServingChat(OpenAIServingBase):
         request.chat_template_kwargs = chat_template_kwargs
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Determine whether reasoning mode should be enabled for this request.
-
+        """Judge whether the request needs reasoning for hybrid reasoning models
         NOTE: This is predefined based on model's chat template
         """
         if not self.reasoning_parser:
             return False
 
+        if self.reasoning_parser == "gemma4":
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
+            )
+        if self.reasoning_parser in [
+            "glm45",
+            "deepseek-v3",
+            "deepseek-v4",
+            "qwen3",
+            "nemotron_3",
+            "interns1",
+            "kimi_k2",
+        ]:
+            # Models that support thinking switches with parser-specific defaults.
+            kwargs = request.chat_template_kwargs or {}  # 防 None
+            thinking = kwargs.get("thinking")
+            if isinstance(thinking, str):
+                thinking = thinking.strip().lower()
+            if kwargs.get("enable_thinking") is True or thinking in [True, "enabled"]:
+                return True
+            if kwargs.get("enable_thinking") is False or thinking in [False, "disabled"]:
+                return False
+
+            # Fallback to protocol.py top-level thinking field
+            if thinking is None:
+                top_thinking = getattr(request, "thinking", None)
+                if isinstance(top_thinking, bool):
+                    thinking = top_thinking
+                elif isinstance(top_thinking, str):
+                    thinking = top_thinking.strip().lower()
+                elif isinstance(top_thinking, dict):
+                    tt = top_thinking.get("type")
+                    if isinstance(tt, str):
+                        tt = tt.strip().lower()
+                    if tt == "enabled":
+                        return True
+                    if tt == "disabled":
+                        return False
+            return self.reasoning_parser not in ("deepseek-v3", "deepseek-v4")
+        if self.reasoning_parser in ["nano_v3"]:
+            return (
+                request.chat_template_kwargs is not None
+                and (
+                    request.chat_template_kwargs.get("thinking")
+                    or request.chat_template_kwargs.get("enable_thinking")
+                )
+            )
+        if self.reasoning_parser in ["mimo"]:
+            # Models that require explicit enable thinking (enable_thinking=True)
+            return (
+                request.chat_template_kwargs is not None
+                and request.chat_template_kwargs.get("enable_thinking") is True
+            )
         if self.reasoning_parser == "hunyuan":
             # Hy3-preview template emits no <think> when reasoning_effort is
             # "no_think" / "none" / unset; forcing reasoning would route all
             # output into reasoning_content.
             return request.reasoning_effort not in (None, "none", "no_think")
-
-        config = self.template_manager.reasoning_config
-        if config is None:
-            # Fallback to parser-level defaults when template toggle config
-            # cannot be inferred (e.g., parser-only <think> templates).
-            mode = (
-                self._reasoning_detector.reasoning_default
-                if self._reasoning_detector is not None
-                else None
-            )
-            if mode is None:
-                return False
-            if mode == "always":
-                return True
-            if mode == "mistral":
-                return (
-                    request.reasoning_effort is not None
-                    and request.reasoning_effort != "none"
-                )
-            if mode in ("thinking", "enable_thinking"):
-                return (
-                    not request.chat_template_kwargs
-                    or request.chat_template_kwargs.get(mode) is not False
-                )
-            if mode in ("explicit_thinking", "explicit_enable_thinking"):
-                toggle = mode.replace("explicit_", "")
-                return (
-                    request.chat_template_kwargs is not None
-                    and request.chat_template_kwargs.get(toggle) is True
-                )
-            logger.warning(
-                "Unknown reasoning_default mode '%s', defaulting to reasoning disabled",
-                mode,
-            )
-            return False
-
-        if config.special_case == "always":
-            return True
-
-        if config.special_case == "mistral":
+        if self.reasoning_parser == "mistral":
+            # Mistral only reasons when reasoning_effort is explicitly set
+            # to a non-"none" value (typically "high").
             return (
                 request.reasoning_effort is not None
                 and request.reasoning_effort != "none"
             )
+        return True  # default
 
-        if config.toggle_param is None or config.default_enabled is None:
+    def _get_enable_thinking_from_request(self, request: ChatCompletionRequest) -> bool:
+        """Extracts the 'enable_thinking' flag from request chat_template_kwargs.
+
+        NOTE: This parameter is only useful for models that support enable_thinking
+        flag, such as Qwen3.
+
+        Args:
+            request_obj: The request object (or an item from a list of requests).
+        Returns:
+            The boolean value of 'enable_thinking' if found, otherwise False.
+        """
+        think = False
+        if hasattr(request, "chat_template_kwargs") and request.chat_template_kwargs:
+            think = request.chat_template_kwargs.get("enable_thinking", False) or request.chat_template_kwargs.get("thinking", False)
+
+        # Fallback to protocol.py top-level thinking field
+        if not think:
+            top_thinking = getattr(request, "thinking", None)
+            if isinstance(top_thinking, bool):
+                think = top_thinking
+            elif isinstance(top_thinking, str):
+                think = top_thinking.strip().lower() == "enabled"
+            elif isinstance(top_thinking, dict):
+                tt = top_thinking.get("type")
+                if isinstance(tt, str):
+                    tt = tt.strip().lower()
+                think = tt == "enabled"
+
+        if self.reasoning_parser in ["qwen3", "glm45"]:
+            return think
+        # For DeepSeek-V3.1 models, `thinking` is supported.
+        elif self.reasoning_parser in ["deepseek-v3", "deepseek-v4"]:
+            return think
+        else:
             return False
-
-        if config.default_enabled:
-            return (
-                not request.chat_template_kwargs
-                or request.chat_template_kwargs.get(config.toggle_param) is not False
-            )
-        return (
-            request.chat_template_kwargs is not None
-            and request.chat_template_kwargs.get(config.toggle_param) is True
-        )
 
     async def _process_tool_call_stream(
         self,
