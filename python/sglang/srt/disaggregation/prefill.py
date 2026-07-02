@@ -148,6 +148,21 @@ class PrefillBootstrapQueue:
             )
         self.kv_manager = self._init_kv_manager()
 
+        if self.scheduler.tp_worker.is_hybrid_swa:
+            chunked_prefill_size = self.scheduler.chunked_prefill_size
+            if chunked_prefill_size is not None and chunked_prefill_size > 0:
+                self.max_total_num_tokens = min(
+                    self.max_total_num_tokens,
+                    self.scheduler.tp_worker.model_runner.full_max_total_num_tokens,
+                )
+            else:
+                # Without chunked prefill, a single forward needs all SWA KV live;
+                # keep the conservative SWA cap to avoid OOM in the forward path.
+                self.max_total_num_tokens = min(
+                    self.max_total_num_tokens,
+                    self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
+                )
+
     def _init_kv_manager(self) -> CommonKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()

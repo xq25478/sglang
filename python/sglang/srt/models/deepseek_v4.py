@@ -534,7 +534,7 @@ class MQALayer(nn.Module):
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
         if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
+            kv = qkv_a[..., self.q_lora_rank :].contiguous()
         else:
             kv, _ = self.wkv(x)
         token_to_kv_pool = get_token_to_kv_pool()
@@ -558,7 +558,7 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         """Bf16-kv path used by the DSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
+            kv = qkv_a[..., self.q_lora_rank :].contiguous()
         else:
             kv, _ = self.wkv(x)
         kv = kv.contiguous()

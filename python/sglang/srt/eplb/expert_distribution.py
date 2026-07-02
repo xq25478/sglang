@@ -321,6 +321,14 @@ class _SinglePassGatherer(ABC):
                 server_args.deepep_mode == "normal"
             ):
                 return _DeepepNormalSinglePassGatherer(expert_location_metadata, rank)
+            elif server_args.moe_a2a_backend != "none" and (
+                server_args.deepep_mode == "auto"
+            ):
+                return _DeepepAutoSinglePassGatherer(
+                    expert_location_metadata,
+                    rank,
+                    normal_gatherer_cls=_DeepepNormalSinglePassGatherer,
+                )
             else:
                 raise NotImplementedError
 
@@ -330,6 +338,12 @@ class _SinglePassGatherer(ABC):
             elif server_args.deepep_mode == "low_latency":
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata, rank
+                )
+            elif server_args.deepep_mode == "auto":
+                return _DeepepAutoSinglePassGatherer(
+                    expert_location_metadata,
+                    rank,
+                    normal_gatherer_cls=_SelectExpertsSinglePassGatherer,
                 )
             else:
                 raise NotImplementedError
@@ -578,6 +592,70 @@ class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
     ):
         # Most naive implementation, can optimize later
         self._data[layer_idx, :] += local_physical_count_of_layer
+
+
+class _DeepepAutoSinglePassGatherer(_SinglePassGatherer):
+    def __init__(
+        self,
+        expert_location_metadata: ExpertLocationMetadata,
+        rank: int,
+        normal_gatherer_cls: Type[_SinglePassGatherer],
+    ):
+        super().__init__(expert_location_metadata, rank)
+        self._normal_gatherer = normal_gatherer_cls(expert_location_metadata, rank)
+        self._low_latency_gatherer = _DeepepLowLatencySinglePassGatherer(
+            expert_location_metadata, rank
+        )
+        self._is_extend_in_batch = False
+
+    def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        self._is_extend_in_batch = forward_batch.is_extend_in_batch
+        self._normal_gatherer.on_forward_pass_start(forward_batch)
+        self._low_latency_gatherer.on_forward_pass_start(forward_batch)
+
+    def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        if self._is_extend_in_batch:
+            self._normal_gatherer.on_select_experts(layer_idx, topk_ids)
+
+    def on_deepep_dispatch_normal(
+        self,
+        layer_idx: int,
+        local_physical_count_of_layer: List[int],
+        num_tokens_per_rank,
+        num_tokens_per_rdma_rank,
+        num_tokens_per_expert,
+    ):
+        if self._is_extend_in_batch:
+            self._normal_gatherer.on_deepep_dispatch_normal(
+                layer_idx,
+                local_physical_count_of_layer,
+                num_tokens_per_rank,
+                num_tokens_per_rdma_rank,
+                num_tokens_per_expert,
+            )
+
+    def on_deepep_dispatch_low_latency(
+        self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
+    ):
+        if not self._is_extend_in_batch:
+            self._low_latency_gatherer.on_deepep_dispatch_low_latency(
+                layer_idx, local_physical_count_of_layer
+            )
+
+    def reset(self):
+        self._is_extend_in_batch = False
+        self._normal_gatherer.reset()
+        self._low_latency_gatherer.reset()
+
+    def collect(self) -> Dict:
+        normal_count = self._normal_gatherer.collect()["global_physical_count"]
+        low_latency_count = self._low_latency_gatherer.collect()[
+            "global_physical_count"
+        ]
+        normal_count = normal_count.to(
+            device=low_latency_count.device, dtype=low_latency_count.dtype
+        )
+        return dict(global_physical_count=normal_count + low_latency_count)
 
 
 def _convert_per_token_to_global_physical_count(

@@ -2050,8 +2050,10 @@ def select_experts(
                 scoring_func=scoring_func,
                 num_fused_shared_experts=num_fused_shared_experts,
                 routed_scaling_factor=routed_scaling_factor,
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
+                # Keep ids logical here; the shared post-process below handles
+                # EPLB dispatch and padded-token masking exactly once.
+                num_token_non_padded=None,
+                expert_location_dispatch_info=None,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
         elif (
