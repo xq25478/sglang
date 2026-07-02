@@ -28,8 +28,23 @@ if TYPE_CHECKING:
     )
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+SUPPORTED_GROUP_SIZES = (32, 128)
 
 logger = logging.getLogger(__name__)
+
+
+def get_cutlass_w4a8_scale_pack(k: int, group_size: int) -> int:
+    if group_size not in SUPPORTED_GROUP_SIZES:
+        raise ValueError(
+            f"Unsupported W4A8 group_size {group_size}. "
+            f"Supported values are {SUPPORTED_GROUP_SIZES}."
+        )
+    tile_k = 128 if group_size == 32 else (512 if k % 512 == 0 else 128)
+    if tile_k % group_size != 0:
+        raise ValueError(
+            f"W4A8 group_size {group_size} must divide Cutlass tile_k {tile_k}."
+        )
+    return tile_k // group_size
 
 
 class W4AFp8Config(QuantizationConfig):
@@ -56,6 +71,11 @@ class W4AFp8Config(QuantizationConfig):
         self.moe_activation_scheme = moe_activation_scheme
         self.ignored_layers = ignored_layers or []
         self.weight_block_size = [128, 128]
+        if group_size not in SUPPORTED_GROUP_SIZES:
+            raise ValueError(
+                f"Unsupported W4A8 group_size {group_size}. "
+                f"Supported values are {SUPPORTED_GROUP_SIZES}."
+            )
         self.group_size = group_size
 
     @classmethod
@@ -82,12 +102,14 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
+        group_size = cls.get_from_keys_or(config, ["group_size"], 128)
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            group_size=group_size,
         )
 
     def get_quant_method(
@@ -108,19 +130,21 @@ class W4AFp8Config(QuantizationConfig):
         return []
 
 
-def interleave_scales(scales: torch.Tensor) -> torch.Tensor:
-    """Interleave scales in groups of 4 similar to TRT-LLM implementation."""
+def interleave_scales(scales: torch.Tensor, scale_pack: int) -> torch.Tensor:
+    """Interleave scales to match the Cutlass packed scale layout."""
     s_shape = scales.shape
-    # Reshape to separate groups of 4
-    alignment = 4 if s_shape[2] % 4 == 0 else 1
+    if s_shape[2] % scale_pack != 0:
+        raise ValueError(
+            f"Scale K groups {s_shape[2]} must be divisible by scale_pack {scale_pack}."
+        )
     scales_interleaved = scales.reshape(
-        s_shape[0], s_shape[1], (s_shape[2] // alignment), alignment
+        s_shape[0], s_shape[1], (s_shape[2] // scale_pack), scale_pack
     )
     # Permute dimensions to interleave
     scales_interleaved = scales_interleaved.permute(0, 2, 1, 3)
     # Reshape back to original dimensions but with interleaved values
     scales_interleaved = scales_interleaved.reshape(
-        s_shape[0], s_shape[2] // alignment, s_shape[1] * alignment
+        s_shape[0], s_shape[2] // scale_pack, s_shape[1] * scale_pack
     )
     return scales_interleaved.contiguous()
 
@@ -141,6 +165,16 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         assert "weight_loader" in extra_weight_attrs
+        if hidden_size % self.quant_config.group_size != 0:
+            raise ValueError(
+                f"hidden_size {hidden_size} must be divisible by "
+                f"group_size {self.quant_config.group_size}."
+            )
+        if intermediate_size_per_partition % self.quant_config.group_size != 0:
+            raise ValueError(
+                f"intermediate_size_per_partition {intermediate_size_per_partition} "
+                f"must be divisible by group_size {self.quant_config.group_size}."
+            )
 
         # Fused gate_up_proj (column parallel)
         w13_weight = torch.nn.Parameter(
@@ -260,12 +294,20 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
 
         # Interleave w13_weight_scale (gate_up_proj)
         w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
-        w13_weight_scale = interleave_scales(w13_weight_scale)
+        w13_k = layer.w13_weight.shape[2] * 2
+        w13_scale_pack = get_cutlass_w4a8_scale_pack(
+            w13_k, self.quant_config.group_size
+        )
+        w13_weight_scale = interleave_scales(w13_weight_scale, w13_scale_pack)
         layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
 
         # Interleave w2_weight_scale (down_proj)
         w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
-        w2_weight_scale = interleave_scales(w2_weight_scale)
+        w2_k = layer.w2_weight.shape[2] * 2
+        w2_scale_pack = get_cutlass_w4a8_scale_pack(
+            w2_k, self.quant_config.group_size
+        )
+        w2_weight_scale = interleave_scales(w2_weight_scale, w2_scale_pack)
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
@@ -323,6 +365,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.w13_input_scale,
             layer.w2_input_scale,
             routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            group_size=self.quant_config.group_size,
         )
         return StandardCombineInput(hidden_states=output)
 
@@ -358,6 +401,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.problem_sizes2,
             layer.w13_input_scale,
             layer.w2_input_scale,
+            group_size=self.quant_config.group_size,
         )
 
         return output
@@ -402,6 +446,7 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
                 self.problem_sizes2,
                 layer.w13_input_scale,
                 layer.w2_input_scale,
+                group_size=self.quant_config.group_size,
             )
         else:
             return hidden_states

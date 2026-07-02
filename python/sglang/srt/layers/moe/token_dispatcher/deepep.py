@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.utils import (
     DeepEPOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -644,6 +645,18 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         self.return_recv_hook = return_recv_hook
         self.device_module = torch.get_device_module()
         self.quant_config = {}
+
+    def set_deepep_dispatcher_dtype(self) -> None:
+        super().set_deepep_dispatcher_dtype()
+        # Low-Latency w4a8 needs fp8 dispatch (per-token scale), not the
+        # BF16 forced by the base selection for the cutlass runner.
+        if (
+            self.deepep_output_dtype == DeepEPOutputDtype.BF16
+            and get_moe_runner_backend().is_cutlass()
+        ):
+            self.deepep_output_dtype = DeepEPOutputDtype.FP8
+            self.use_fp8 = True
+            self.use_nvfp4 = False
 
     def dispatch_a(
         self,

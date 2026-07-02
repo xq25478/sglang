@@ -937,9 +937,16 @@ class FusedMoE(torch.nn.Module):
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
         # should be whatever dimension intermediate_size is
+        is_w4afp8_group_scale = (
+            "scale" in weight_name
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "w4afp8"
+            and getattr(param, "quant_method", None)
+            == FusedMoeWeightScaleSupported.GROUP.value
+        )
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if self.use_triton_kernels:
+        if self.use_triton_kernels and not is_w4afp8_group_scale:
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)

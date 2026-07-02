@@ -1594,3 +1594,164 @@ def fp8_per_token_to_per_tensor_quant_triton(
         K_BLOCK_SIZE=K_BLOCK_SIZE,
         num_warps=8,
     )
+
+
+
+@triton.jit
+def _silu_and_mul_masked_post_per_tensor_dynamic_scale_kernel(
+    input_ptr,
+    stride_input_expert,
+    stride_input_token,
+    stride_input_dim,
+    scale_ptr,
+    masked_m_ptr,
+    inner_dim,
+    fp8_max,
+    BLOCK_N: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    block_id_token = tl.program_id(1)
+    block_id_dim = tl.program_id(0)
+    num_token_blocks = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+
+    stride_input_expert = tl.cast(stride_input_expert, tl.int64)
+    stride_input_token = tl.cast(stride_input_token, tl.int64)
+
+    offset_d = block_id_dim * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_d = offset_d < inner_dim
+
+    input_base_offs = input_ptr + expert_id * stride_input_expert + offset_d
+
+    absmax = 0.0
+    for token_idx in tl.range(
+        block_id_token, token_num_cur_expert, num_token_blocks, num_stages=NUM_STAGE
+    ):
+        gate_ptr = input_base_offs + token_idx * stride_input_token
+        up_ptr = gate_ptr + inner_dim
+        gate = tl.load(gate_ptr, mask=mask_d, other=0.0).to(tl.float32)
+        up = tl.load(up_ptr, mask=mask_d, other=0.0).to(tl.float32)
+        gate = gate / (1.0 + tl.exp(-gate))
+        gate_up = up * gate
+        absmax = tl.maximum(absmax, tl.max(tl.abs(gate_up)))
+
+    absmax = tl.maximum(absmax, 1e-10)
+    tl.atomic_max(scale_ptr, absmax / fp8_max)
+
+
+def silu_and_mul_masked_post_per_tensor_quant_dynamic_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert input.ndim == 3
+    assert input.shape[0] == masked_m.shape[0]
+    assert input.shape[-1] % 2 == 0
+    assert scale.numel() == 1 and scale.dtype == torch.float32
+
+    expert_num = input.shape[0]
+    inner_dim = input.shape[-1] // 2
+
+    BLOCK_N = 256
+    BLOCK_M = 64 if expert_num < 4 else 32
+    NUM_STAGES = 3
+    hidden_dim_split_block_num = triton.cdiv(inner_dim, BLOCK_N)
+    grid = (hidden_dim_split_block_num, BLOCK_M, expert_num)
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    scale.zero_()
+    _silu_and_mul_masked_post_per_tensor_dynamic_scale_kernel[grid](
+        input,
+        *input.stride(),
+        scale,
+        masked_m,
+        inner_dim,
+        fp8_max,
+        BLOCK_N=BLOCK_N,
+        NUM_STAGE=NUM_STAGES,
+    )
+
+    silu_and_mul_masked_post_per_tensor_quant_fwd(input, output, masked_m, scale)
+    return output
+
+
+@triton.jit
+def _fp8_per_token_to_per_tensor_dynamic_amax_kernel(
+    x_ptr,
+    x_scale_ptr,
+    x_scale_stride0,
+    x_scale_stride1,
+    x_scale_stride2,
+    masked_m_ptr,
+    output_scale_ptr,
+    m,
+    k,
+    fp8_max,
+    K_SCALE_BLOCK_SIZE: tl.constexpr,
+    K_BLOCK_SIZE: tl.constexpr,
+):
+    pid_k = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_e = tl.program_id(2)
+    pid_m_dim = tl.num_programs(1)
+
+    last_effective_id = tl.load(masked_m_ptr + pid_e)
+    if pid_m >= last_effective_id:
+        return
+
+    k_offsets = pid_k * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
+    scale_offsets = (k_offsets // K_SCALE_BLOCK_SIZE) * x_scale_stride2
+
+    x_ptrs = x_ptr + pid_e * m * k + k_offsets
+    x_scale_ptrs = x_scale_ptr + pid_e * x_scale_stride0 + scale_offsets
+
+    absmax = 0.0
+    for tok_idx in tl.range(pid_m, last_effective_id, pid_m_dim):
+        hidden = tl.load(x_ptrs + tok_idx * k).to(tl.float32)
+        scale_fp32 = tl.load(x_scale_ptrs + tok_idx * x_scale_stride1).to(tl.float32)
+        val = hidden * scale_fp32
+        absmax = tl.maximum(absmax, tl.max(tl.abs(val)))
+
+    absmax = tl.maximum(absmax, 1e-10)
+    tl.atomic_max(output_scale_ptr, absmax / fp8_max)
+
+
+def fp8_per_token_to_per_tensor_quant_dynamic_triton(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    output_scale: torch.Tensor,
+    output: torch.Tensor,
+):
+    K_SCALE_BLOCK_SIZE = 128
+    K_BLOCK_SIZE = 1024
+    assert len(x.shape) == 3 and x.size(2) % K_SCALE_BLOCK_SIZE == 0
+    assert x.is_contiguous()
+    assert x_scale.size(2) == x.size(2) // K_SCALE_BLOCK_SIZE
+    assert output_scale.numel() == 1 and output_scale.dtype == torch.float32
+    assert x.size(2) % K_BLOCK_SIZE == 0
+
+    output_scale.zero_()
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+
+    grid = (x.size(2) // K_BLOCK_SIZE, 32, x.size(0))
+    _fp8_per_token_to_per_tensor_dynamic_amax_kernel[grid](
+        x, x_scale, *x_scale.stride(),
+        masked_m, output_scale,
+        x.size(1), x.size(2),
+        fp8_max,
+        K_SCALE_BLOCK_SIZE=K_SCALE_BLOCK_SIZE,
+        K_BLOCK_SIZE=K_BLOCK_SIZE,
+        num_warps=8,
+    )
+    fp8_per_token_to_per_tensor_quant_triton(
+        x=x, x_scale=x_scale, masked_m=masked_m,
+        output_scale=output_scale, output=output,
+    )

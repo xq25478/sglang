@@ -1048,6 +1048,8 @@ class ModelConfig:
                 )
                 if parsed_cfg:
                     quant_cfg.update(parsed_cfg)
+            quant_cfg = self._maybe_merge_modelopt_group_size_from_file(quant_cfg)
+            self.hf_config.quantization_config = quant_cfg
 
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
@@ -1105,6 +1107,8 @@ class ModelConfig:
                     with open(quant_config_file) as f:
                         quant_config_dict = json.load(f)
                     quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                    if quant_cfg is not None:
+                        self.hf_config.quantization_config = quant_cfg
                 except huggingface_hub.errors.LocalEntryNotFoundError:
                     # Offline mode and file not in cache - this is normal for non-quantized models
                     logger.debug(
@@ -1129,6 +1133,8 @@ class ModelConfig:
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+                if quant_cfg is not None:
+                    self.hf_config.quantization_config = quant_cfg
         return quant_cfg
 
     def _find_quant_modelslim_config(self):
@@ -1143,6 +1149,49 @@ class ModelConfig:
             # modelslim model description, so we're adding it here manually.
             quant_cfg["quant_method"] = "modelslim"
 
+        return quant_cfg
+
+    @staticmethod
+    def _extract_modelopt_group_size(quant_config_dict: dict) -> Optional[int]:
+        """Extract the shared group_size from ModelOpt W4A8 config."""
+        sizes = set()
+
+        for cfg in (
+            quant_config_dict,
+            quant_config_dict.get("quantization")
+            if isinstance(quant_config_dict, dict)
+            else None,
+        ):
+            if not isinstance(cfg, dict):
+                continue
+            value = cfg.get("group_size")
+            if isinstance(value, int):
+                sizes.add(value)
+
+        if not sizes:
+            return None
+        if len(sizes) > 1:
+            raise ValueError(f"Inconsistent ModelOpt group_size values: {sorted(sizes)}")
+        return next(iter(sizes))
+
+    def _maybe_merge_modelopt_group_size_from_file(self, quant_cfg: dict) -> dict:
+        if (
+            quant_cfg is None
+            or "group_size" in quant_cfg
+            or quant_cfg.get("quant_method") != "w4afp8"
+            or not os.path.exists(self.model_path)
+        ):
+            return quant_cfg
+
+        quant_config_file = os.path.join(self.model_path, "hf_quant_config.json")
+        if not os.path.exists(quant_config_file):
+            return quant_cfg
+
+        with open(quant_config_file) as f:
+            quant_config_dict = json.load(f)
+        group_size = self._extract_modelopt_group_size(quant_config_dict)
+        if group_size is not None:
+            quant_cfg["group_size"] = group_size
         return quant_cfg
 
     def _parse_modelopt_quant_config(self, quant_config_dict: dict) -> Optional[dict]:
@@ -1160,7 +1209,11 @@ class ModelConfig:
             )
             if has_modelopt_nvfp4_layers:
                 return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
-            return {"quant_method": "w4afp8", "quant_algo": quant_algo}
+            quant_cfg = {"quant_method": "w4afp8", "quant_algo": quant_algo}
+            group_size = self._extract_modelopt_group_size(quant_config_dict)
+            if group_size is not None:
+                quant_cfg["group_size"] = group_size
+            return quant_cfg
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}
         elif quant_algo and "FP8" in quant_algo:

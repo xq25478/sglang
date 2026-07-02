@@ -70,9 +70,9 @@ static constexpr int AlignmentB = 128 / cutlass::sizeof_bits<QuantType>::value;
 static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 static constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
 
-template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule>
+template <typename TileShape, typename ClusterShape, typename KernelSchedule, typename EpilogueSchedule, int ScaleGroupSize>
 struct cutlass_3x_w4a8_group_gemm {
-  static constexpr int GroupSize = 128;
+  static constexpr int GroupSize = ScaleGroupSize;
   static constexpr int PackedScalesNum = get<2>(TileShape{}) / GroupSize;
   using ElementScalePacked = cutlass::Array<ElementScale, PackedScalesNum>;
 
