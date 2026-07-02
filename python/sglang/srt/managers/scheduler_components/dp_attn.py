@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
-
+_ENABLE_COMPRESSED_ALLGATHER = envs.SGLANG_DP_ATTN_COMPRESSED_ALLGATHER.get()
 
 @dataclass
 class MLPSyncBatchInfo:
@@ -50,69 +50,148 @@ class MLPSyncBatchInfo:
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
-    def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                self.num_tokens,
-                self.num_tokens_for_logprob,
-                int(self.can_cuda_graph),
-                int(self.is_extend_in_batch),
-                int(self.local_can_run_tbo),
-                self.local_forward_mode,
-                int(self.can_run_breakable_cuda_graph),
-            ],
-            device=device,
-            dtype=dtype,
-        )
+    def _get_local_tensor(self, device, dtype=None) -> torch.Tensor:
+        if _ENABLE_COMPRESSED_ALLGATHER:
+            return torch.tensor(
+                [
+                    int(self.num_tokens),
+                    int(self.num_tokens_for_logprob),
+                    (int(self.can_cuda_graph) << 0)
+                    | (int(self.is_extend_in_batch) << 1)
+                    | (int(self.local_can_run_tbo) << 2),
+                    int(self.local_forward_mode),
+                    int(self.can_run_breakable_cuda_graph),
+                ],
+                device=device,
+                dtype=torch.int32,
+            )
+        else:
+            return torch.tensor(
+                [
+                    self.num_tokens,
+                    self.num_tokens_for_logprob,
+                    int(self.can_cuda_graph),
+                    int(self.is_extend_in_batch),
+                    int(self.local_can_run_tbo),
+                    self.local_forward_mode,
+                    int(self.can_run_breakable_cuda_graph),
+                ],
+                device=device,
+                dtype=torch.int64,
+            )
 
-    def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_breakable_cuda_graph
-            ],
-            device=device,
-            dtype=dtype,
-        )
+    def _get_fallback_tensor(self, device, dtype=None) -> torch.Tensor:
+        if _ENABLE_COMPRESSED_ALLGATHER:
+            return torch.tensor(
+                [
+                    0,
+                    0,
+                    (1 << 0) | (0 << 1) | (1 << 2),
+                    ForwardMode.IDLE.value,
+                    0,
+                ],
+                device=device,
+                dtype=torch.int32,
+            )
+        else:
+            return torch.tensor(
+                [
+                    0,
+                    0,
+                    1,
+                    0,
+                    1,
+                    ForwardMode.IDLE.value,
+                    0,
+                ],
+                device=device,
+                dtype=torch.int64,
+            )
 
     def all_gather(self, device, group: torch.distributed.ProcessGroup):
-        local_info_tensor = self._get_local_tensor(device=device)
-        global_info_tensor = torch.empty(
-            (self.dp_size, self.tp_size * self.cp_size, 7),
-            dtype=torch.int64,
-            device=device,
-        )
+        if _ENABLE_COMPRESSED_ALLGATHER:
+            local_info_tensor = self._get_local_tensor(device=device)
+            global_info_tensor = torch.empty(
+                (self.dp_size, self.tp_size * self.cp_size, 5),
+                dtype=torch.int32,
+                device=device,
+            )
 
-        torch.distributed.all_gather_into_tensor(
-            global_info_tensor.flatten(),
-            local_info_tensor,
-            group=group,
-        )
-        if device == "cpu":
-            tp_active_ranks = get_tp_group().active_ranks_cpu
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.view(-1),
+                local_info_tensor,
+                group=group,
+            )
+            if device == "cpu":
+                tp_active_ranks = get_tp_group().active_ranks_cpu
+            else:
+                tp_active_ranks = get_tp_group().active_ranks
+
+            flat_info = global_info_tensor.view(-1, 5)
+            fallback = self._get_fallback_tensor(device=device)
+            flat_info[tp_active_ranks == 0] = fallback
+
+            tp0_compressed = global_info_tensor[:, 0, :]
+
+            self.tp0_info = torch.zeros(
+                (self.dp_size, 7), dtype=torch.int64, device=device
+            )
+            self.tp0_info[:, 0] = tp0_compressed[:, 0].to(torch.int64)
+            self.tp0_info[:, 1] = tp0_compressed[:, 1].to(torch.int64)
+
+            flags = tp0_compressed[:, 2]
+            self.tp0_info[:, 2] = (flags & 0b001).ne(0).to(torch.int64)
+            self.tp0_info[:, 3] = (flags & 0b010).ne(0).to(torch.int64)
+            self.tp0_info[:, 4] = (flags & 0b100).ne(0).to(torch.int64)
+            self.tp0_info[:, 5] = tp0_compressed[:, 3].to(torch.int64)
+            self.tp0_info[:, 6] = tp0_compressed[:, 4].to(torch.int64)
+
+            cpu_data = self.tp0_info[:, :2].cpu()
+            self.global_num_tokens = cpu_data[:, 0].tolist()
+            self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+            self.can_cuda_graph = bool(self.tp0_info[:, 2].min().item())
+            self.is_extend_in_batch = bool(self.tp0_info[:, 3].max().item())
+            self.can_run_breakable_cuda_graph = bool(
+                self.tp0_info[:, 6].min().item()
+            )
+            if _ENABLE_METRICS_DP_ATTENTION:
+                self.dp_cooperation_info = DPCooperationInfo.create(
+                    self.tp0_info[:, 5].tolist()
+                )
         else:
-            tp_active_ranks = get_tp_group().active_ranks
+            local_info_tensor = self._get_local_tensor(device=device)
+            global_info_tensor = torch.empty(
+                (self.dp_size, self.tp_size * self.cp_size, 7),
+                dtype=torch.int64,
+                device=device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                global_info_tensor.flatten(),
+                local_info_tensor,
+                group=group,
+            )
+            if device == "cpu":
+                tp_active_ranks = get_tp_group().active_ranks_cpu
+            else:
+                tp_active_ranks = get_tp_group().active_ranks
+            tp_info = global_info_tensor.view(
+                self.dp_size * self.tp_size * self.cp_size, 7
+            )
+            tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
 
-        # Set fallback values for inactive ranks
-        tp_info = global_info_tensor.view(self.dp_size * self.tp_size * self.cp_size, 7)
-        tp_info[tp_active_ranks == 0] = self._get_fallback_tensor(device=device)
-
-        tp0_info = global_info_tensor[:, 0, :]
-        self.tp0_info = tp0_info
-        # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
-        self.global_num_tokens = cpu_data[:, 0].tolist()
-        self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-        self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
-        self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
-        self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
-        if _ENABLE_METRICS_DP_ATTENTION:
-            self.dp_cooperation_info = DPCooperationInfo.create(tp0_info[:, 5].tolist())
+            tp0_info = global_info_tensor[:, 0, :]
+            self.tp0_info = tp0_info
+            # Perform only one Device-to-Host (D2H) memory copy
+            cpu_data = tp0_info[:, :2].cpu()
+            self.global_num_tokens = cpu_data[:, 0].tolist()
+            self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+            self.can_cuda_graph = bool(tp0_info[:, 2].min().item())
+            self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
+            self.can_run_breakable_cuda_graph = bool(tp0_info[:, 6].min().item())
+            if _ENABLE_METRICS_DP_ATTENTION:
+                self.dp_cooperation_info = DPCooperationInfo.create(
+                    tp0_info[:, 5].tolist()
+                )
 
 
 def _update_gather_batch(
