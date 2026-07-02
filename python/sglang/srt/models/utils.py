@@ -290,6 +290,8 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     pool = get_token_to_kv_pool()
     return (
         _is_cuda
+        and not get_is_capture_mode()
+        and hasattr(pool, "dtype")
         and pool.dtype == torch.bfloat16
         and not isinstance(pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()

@@ -345,6 +345,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 transport_mode,
                 model_config=self.model_config,
             )
+            self._mm_semaphore = asyncio.Semaphore(
+                server_args.mm_max_concurrent_calls
+            )
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -869,13 +872,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    async with self._mm_semaphore:
+                        try:
+                            mm_inputs = await asyncio.wait_for(
+                                self.mm_processor.process_mm_data_async(
+                                    image_data=obj.image_data,
+                                    audio_data=obj.audio_data,
+                                    input_text=(input_text or input_ids),
+                                    request_obj=obj,
+                                    max_req_input_len=self.max_req_input_len,
+                                ),
+                                timeout=self.server_args.mm_per_request_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            raise ValueError(
+                                f"Multimodal preprocessing timed out after "
+                                f"{self.server_args.mm_per_request_timeout}s. "
+                                f"Reduce image/video size or increase "
+                                f"--mm-per-request-timeout."
+                            )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend
@@ -884,13 +899,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=(input_text or input_ids),
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+                async with self._mm_semaphore:
+                    try:
+                        mm_inputs = await asyncio.wait_for(
+                            self.mm_processor.process_mm_data_async(
+                                image_data=obj.image_data,
+                                audio_data=obj.audio_data,
+                                input_text=(input_text or input_ids),
+                                request_obj=obj,
+                                max_req_input_len=self.max_req_input_len,
+                            ),
+                            timeout=self.server_args.mm_per_request_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        raise ValueError(
+                            f"Multimodal preprocessing timed out after "
+                            f"{self.server_args.mm_per_request_timeout}s. "
+                            f"Reduce image/video size or increase "
+                            f"--mm-per-request-timeout."
+                        )
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids

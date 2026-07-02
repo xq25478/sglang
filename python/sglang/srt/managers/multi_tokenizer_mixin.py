@@ -344,7 +344,20 @@ def _handle_output_by_index(output, i):
 class MultiHttpWorkerDetokenizerMixin:
     """Mixin class for DetokenizerManager"""
 
-    def maybe_clear_socket_mapping(self: DetokenizerManager):
+    def get_worker_ids_from_req_rids(self, rids):
+
+        worker_ids = []
+        try:
+            if isinstance(rids, list):
+                worker_ids = [int(rid.split("_")[0]) for rid in rids]
+            elif isinstance(rids, str):
+                worker_ids = [int(rids.split("_")[0])]
+        except  Exception as e:
+            logger.error(f"get worker ids error: {e}")
+
+        return worker_ids
+
+    def maybe_clear_socket_mapping(self):
         if hasattr(self, "socket_mapping"):
             self.socket_mapping.clear_all_sockets()
 

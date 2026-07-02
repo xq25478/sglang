@@ -1335,6 +1335,11 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
         )
+        # Memory optimization for item.feature:
+        # Offload image inputs to CPU once the concatenated tensor is built so
+        # the per-item CUDA buffers can be released earlier.
+        for item in items:
+            item.feature = item.feature.to("cpu")
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
