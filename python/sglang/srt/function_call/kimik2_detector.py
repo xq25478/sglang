@@ -68,12 +68,12 @@ class KimiK2Detector(BaseFormatDetector):
         # Capture tool_call_id broadly: the model may emit standard IDs
         # like "functions.ReadFile:0" or bare call counters like "3".
         self.tool_call_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?\})\s*<\|tool_call_end\|>",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\"?\{.*?\})\s*\"?<\|tool_call_end\|>",
             re.DOTALL,
         )
 
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\"?\{.*)",
             re.DOTALL,
         )
 
@@ -415,7 +415,6 @@ class KimiK2Detector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
-
         def get_info(name: str) -> StructureInfo:
             return StructureInfo(
                 begin=f"<|tool_calls_section_begin|><|tool_call_begin|>functions.{name}:0<|tool_call_argument_begin|>",
