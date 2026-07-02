@@ -438,3 +438,10 @@ def concat_mla_absorb_q(
     )
     torch.ops.sgl_kernel.concat_mla_absorb_q(a, b, out)
     return out
+
+def optimized_rms_norm(
+    data: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    torch.ops.sgl_kernel.optimized_rms_norm.default(data, weight, eps)
