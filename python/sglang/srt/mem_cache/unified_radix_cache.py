@@ -89,6 +89,9 @@ class UnifiedTreeNode:
         ]
         self.last_access_time = get_and_increase_time_counter()
         self.creation_time = get_and_increase_time_counter()
+        # Wall-clock tier enter times (0 = not currently on that tier).
+        self.l1_tier_enter_time: float = 0.0
+        self.l2_tier_enter_time: float = 0.0
         self.hash_value = None
         self.hit_count = 0
         self.priority = priority
@@ -1019,8 +1022,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        new_node.l1_tier_enter_time = child.l1_tier_enter_time
+        new_node.l2_tier_enter_time = child.l2_tier_enter_time
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
+        
 
         child.parent = new_node
         child.key = child.key[split_len:]
@@ -1074,6 +1080,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(parent)
         self._record_store_event(new_node)
+        self.mark_l1_tier_enter(new_node)
         return new_node
 
     def _unevict_node_on_insert(
@@ -1091,6 +1098,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if node.parent is not None:
             self._update_evictable_leaf_sets(node.parent)
         self._record_store_event(node, medium=StorageMedium.GPU)
+        self.mark_l1_tier_enter(node)
 
     def _insert_helper(
         self,
@@ -1239,6 +1247,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         node.children[child_key] = new_node
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
+        self.mark_l2_tier_enter(new_node)
         result.inserted_host_node = new_node
         return result
 
@@ -1364,6 +1373,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 break
 
             # Full absent on both layers — evict remaining host data, delete.
+            self.finish_l2_tier_stay(cur)
             for comp in self.components.values():
                 if comp.node_has_component_data(cur, target=EvictLayer.HOST):
                     self._evict_component_and_detach_lru(
@@ -1456,6 +1466,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> None:
         """GPU→CPU demotion: release all device resources, node stays in tree."""
         assert not node.evicted and node.backuped
+        self.finish_l1_tier_stay(node)
         trigger = self.components[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
@@ -1494,6 +1505,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return
             else:
                 # Write-through: node has no backup, delete entirely.
+                self.finish_l1_tier_stay(node)
                 self._record_remove_event(node, medium=StorageMedium.GPU)
                 for comp in self._components_tuple:
                     self._evict_component_and_detach_lru(
@@ -1515,6 +1527,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         All freed tokens are accumulated into *tracker*."""
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
+        self.finish_l2_tier_stay(node)
         self._record_remove_event(node, medium=StorageMedium.CPU)
         for comp in self._components_tuple:
             _, hf = self._evict_component_and_detach_lru(

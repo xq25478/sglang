@@ -226,6 +226,9 @@ class TreeNode:
         self.lock_ref = 0
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
+        # Tier enter timestamps for L1/L2 residency metrics (0 = not on tier).
+        self.l1_tier_enter_time: float = 0.0
+        self.l2_tier_enter_time: float = 0.0
 
         self.hit_count = 0
         # indicating the node is locked to protect from eviction
@@ -575,6 +578,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
+            self.finish_l1_tier_stay(x)
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -681,6 +685,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        new_node.l1_tier_enter_time = child.l1_tier_enter_time
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -746,6 +751,7 @@ class RadixCache(SessionRadixCacheMixin, KVCacheEventMixin, BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            self.mark_l1_tier_enter(new_node)
             self._inc_hit_count(new_node, chunked)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)

@@ -219,7 +219,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         from sglang.srt.server_args import get_global_server_args
 
         server_args = get_global_server_args()
-        labels = {"cache_type": self.__class__.__name__}
+        labels = {
+            "cache_type": self.__class__.__name__,
+            "model_name": server_args.served_model_name,
+        }
         if server_args.extra_metric_labels:
             labels.update(server_args.extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
@@ -235,6 +238,36 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
                 time.perf_counter() - start_time
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
+
+    def observe_l1_residency(self, tier_enter_time: float) -> None:
+        if self.metrics_collector is not None and tier_enter_time > 0.0:
+            self.metrics_collector.observe_l1_residency(
+                max(0.0, time.monotonic() - tier_enter_time)
+            )
+
+    def observe_l2_residency(self, tier_enter_time: float) -> None:
+        if self.metrics_collector is not None and tier_enter_time > 0.0:
+            self.metrics_collector.observe_l2_residency(
+                max(0.0, time.monotonic() - tier_enter_time)
+            )
+
+    def mark_l1_tier_enter(self, node) -> None:
+        if node.l1_tier_enter_time == 0.0:
+            node.l1_tier_enter_time = time.monotonic()
+
+    def finish_l1_tier_stay(self, node) -> None:
+        if node.l1_tier_enter_time > 0.0:
+            self.observe_l1_residency(node.l1_tier_enter_time)
+            node.l1_tier_enter_time = 0.0
+
+    def mark_l2_tier_enter(self, node) -> None:
+        if node.l2_tier_enter_time == 0.0:
+            node.l2_tier_enter_time = time.monotonic()
+
+    def finish_l2_tier_stay(self, node) -> None:
+        if node.l2_tier_enter_time > 0.0:
+            self.observe_l2_residency(node.l2_tier_enter_time)
+            node.l2_tier_enter_time = 0.0
 
     @abstractmethod
     def reset(self):

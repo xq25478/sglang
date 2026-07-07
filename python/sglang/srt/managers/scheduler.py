@@ -456,6 +456,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self._emit_kv_cache_bytes_per_token_metric()
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -973,6 +974,38 @@ class Scheduler(
         # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture.
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+
+    # 计算每个token kv的字节数, 需要在kv cache init后才能调用
+    # 因为kv cache init后才能拿到kv cache准确数据
+    def _compute_kv_cache_bytes_per_token(self) -> Optional[float]:
+        try:
+            kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
+            kv_size = kv_pool.get_kv_size_bytes()
+            total_bytes = sum(kv_size) if isinstance(kv_size, tuple) else kv_size
+            if self.max_total_num_tokens > 0:
+                return total_bytes / self.max_total_num_tokens
+            logger.warning(
+                "[kv_cache_bytes_per_token] tp_rank=%s skipped: max_total_num_tokens=%s",
+                self.ps.tp_rank,
+                self.max_total_num_tokens,
+            )
+        except (AttributeError, AssertionError, TypeError) as e:
+            # Pools without K/V buffers (e.g. NoOp / HiSparse) — skip bytes export.
+            logger.warning(
+                "[kv_cache_bytes_per_token] tp_rank=%s failed: %s: %s",
+                self.ps.tp_rank,
+                type(e).__name__,
+                e,
+            )
+        return None
+
+    def _emit_kv_cache_bytes_per_token_metric(self) -> None:
+        if not self.server_args.enable_metrics or self.metrics_collector is None:
+            return
+        kv_cache_bytes_per_token = self._compute_kv_cache_bytes_per_token()
+        if kv_cache_bytes_per_token is None:
+            return
+        self.metrics_collector.emit_kv_cache_bytes_per_token(kv_cache_bytes_per_token)
 
     def init_running_status(self):
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.

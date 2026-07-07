@@ -805,6 +805,7 @@ class HiRadixCache(RadixCache):
         if host_indices is not None:
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
+            self.mark_l2_tier_enter(node)
             self._track_write_through_node(node, len(node.key))
             if not write_back:
                 self.inc_lock_ref(node)
@@ -1091,8 +1092,10 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
             if x.backuped:
+                self.finish_l1_tier_stay(x)
                 num_evicted += self._evict_backuped(x)
             else:
+                self.finish_l1_tier_stay(x)
                 num_evicted += self._evict_regular(x)
             self._promote_parent(x, heap)
         return num_evicted
@@ -1110,6 +1113,7 @@ class HiRadixCache(RadixCache):
                 return
             self.writing_check(write_back=True)
             for node, device_indices in staged:
+                self.finish_l1_tier_stay(node)
                 self.cache_controller.evict_device(device_indices)
                 node.release_host()
             staged.clear()
@@ -1119,6 +1123,7 @@ class HiRadixCache(RadixCache):
             if x.lock_ref > 0:
                 continue
             if x.backuped:
+                self.finish_l1_tier_stay(x)
                 num_evicted += self._evict_backuped(x)
             elif self.write_backup(x, write_back=True) > 0:
                 x.protect_host()
@@ -1181,10 +1186,12 @@ class HiRadixCache(RadixCache):
         for n in nodes:
             if n.host_value is not None:
                 self._record_remove_event(n, medium=StorageMedium.CPU)
+                self.finish_l2_tier_stay(n)
                 self.cache_controller.evict_host(n.host_value)
                 n.host_value = None
             if n.value is not None:
                 self._record_remove_event(n, medium=StorageMedium.GPU)
+                self.finish_l1_tier_stay(n)
                 self.cache_controller.mem_pool_device_allocator.free(n.value)
                 freed_device += len(n.value)
                 self.evictable_size_ -= len(n.value)
@@ -1221,6 +1228,7 @@ class HiRadixCache(RadixCache):
             # Block deleted entirely (GPU already evicted, now CPU freed) --
             # emit remove(CPU) so the router drops the host-tier entry.
             self._record_remove_event(x, medium=StorageMedium.CPU)
+            self.finish_l2_tier_stay(x)
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
             key = x.key.child_key(self.page_size)
@@ -1300,6 +1308,7 @@ class HiRadixCache(RadixCache):
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
             offset += len(node.host_value)
+            self.mark_l1_tier_enter(node)
             # Block promoted from host to GPU -- emit store(GPU) so downstream
             # indexers see it as device-local again.
             self._record_store_event(node, medium=StorageMedium.GPU)
@@ -1675,6 +1684,7 @@ class HiRadixCache(RadixCache):
             new_node.host_value = host_value.clone()
             new_node.hash_value = hash_value
             node.children[child_key] = new_node
+            self.mark_l2_tier_enter(new_node)
             self._update_host_leaf_status(new_node)
             self._update_leaf_status(node)
             self._update_host_leaf_status(node)
@@ -1718,6 +1728,8 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.l1_tier_enter_time = child.l1_tier_enter_time
+        new_node.l2_tier_enter_time = child.l2_tier_enter_time
 
         # split value and host value if exists
         if child.evicted:
@@ -1773,6 +1785,7 @@ class HiRadixCache(RadixCache):
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
                     node.value = value[:prefix_len].clone()
+                    self.mark_l1_tier_enter(node)
                     self.evictable_size_ += len(node.value)
                     self._update_leaf_status(node)
                     self._update_host_leaf_status(node)
@@ -1788,6 +1801,7 @@ class HiRadixCache(RadixCache):
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
                     new_node.value = value[:prefix_len].clone()
+                    self.mark_l1_tier_enter(new_node)
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
                     self._update_host_leaf_status(new_node)
@@ -1809,6 +1823,7 @@ class HiRadixCache(RadixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value.clone()
+            self.mark_l1_tier_enter(new_node)
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
             self._update_leaf_status(node)

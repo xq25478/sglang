@@ -1012,6 +1012,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
+        self.kv_cache_bytes_per_token = Gauge(
+            name=f"{METRICS_PREFIX}:kv_cache_bytes_per_token",
+            documentation="Bytes consumed per token in the KV cache (one logical slot, sum of K+V across all layers).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
         self.context_len = Gauge(
             name=f"{METRICS_PREFIX}:context_len",
             documentation="Maximum context length.",
@@ -1393,6 +1399,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         num_pages: int,
         context_len: int,
         startup_available_gpu_memory_gb: float,
+        kv_cache_bytes_per_token: Optional[float] = None,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
         if max_running_requests_under_SLO is not None:
@@ -1407,7 +1414,11 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         self._log_gauge(
             self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb
         )
+        if kv_cache_bytes_per_token is not None:
+            self._log_gauge(self.kv_cache_bytes_per_token, kv_cache_bytes_per_token)
 
+    def emit_kv_cache_bytes_per_token(self, kv_cache_bytes_per_token: float) -> None:
+        self._log_gauge(self.kv_cache_bytes_per_token, kv_cache_bytes_per_token)
 
 class TokenizerMetricsCollector(_StatLoggerDIMixin):
     def __init__(
@@ -1929,6 +1940,51 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             documentation="The number of tokens loaded from CPU to GPU.",
             labelnames=labels.keys(),
         )
+   
+        # Tier dwell = wall-clock from KV placed on device/host until that tier evicts.
+        bucket_residency = get_histogram_conf_from_env(
+            "SGLANG_BUCKET_RESIDENCY_SECONDS"
+        )
+
+        if bucket_residency is None:
+            bucket_residency = [
+                0.1,
+                0.5,
+                1,
+                5,
+                10,
+                30,
+                60,
+                300,
+                600,
+                1800,
+                3600,
+                7200,
+                10800,
+                14400,
+                18000,
+                21600,
+            ]
+
+        self.l1_residency_seconds = Histogram(
+            name=f"{METRICS_PREFIX}:l1_residency_seconds",
+            documentation=(
+                "Wall-clock seconds from when a radix node entered L1 (device KV "
+                "placed) until L1 eviction."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_residency,
+        )
+
+        self.l2_residency_seconds = Histogram(
+            name=f"{METRICS_PREFIX}:l2_residency_seconds",
+            documentation=(
+                "Wall-clock seconds from when a radix node entered L2 (host KV "
+                "placed) until L2 eviction."
+            ),
+            labelnames=labels.keys(),
+            buckets=bucket_residency,
+        )
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
@@ -1942,6 +1998,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
     def observe_load_back_duration(self, duration_seconds: float) -> None:
         self.load_back_duration_seconds.labels(**self.labels).observe(duration_seconds)
 
+    def observe_l1_residency(self, residency_seconds: float) -> None:
+        self.l1_residency_seconds.labels(**self.labels).observe(residency_seconds)
+
+    def observe_l2_residency(self, residency_seconds: float) -> None:
+        self.l2_residency_seconds.labels(**self.labels).observe(residency_seconds)
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
     """Metrics collector for the EPD encoder server (--encoder-only)."""

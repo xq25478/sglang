@@ -165,6 +165,8 @@ class DeepSeekV4SingleKVPool(KVCache):
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError("Use get_key_buffer instead.")
 
+    def get_kv_size_bytes(self) -> int:
+        return sum(buf.nbytes for buf in self.kv_buffer)
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
 
@@ -869,6 +871,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             ratio=ratio,
             swa_page_size=self.swa_page_size,
         )
+
+    def get_kv_size_bytes(self) -> int:
+        _, contiguous_lens, _ = self.get_contiguous_buf_infos()
+        _, state_lens, _ = self.get_state_buf_infos()
+        return sum(contiguous_lens) + sum(state_lens)
 
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size
