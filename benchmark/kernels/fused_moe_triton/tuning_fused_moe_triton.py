@@ -53,6 +53,7 @@ def benchmark_config(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool,
     per_channel_quant: bool,
     block_shape: List[int] = None,
     num_iters: int = 100,
@@ -80,7 +81,7 @@ def benchmark_config(
             ),
             dtype=torch.int8,
         )
-    elif use_int4_w4a16:
+    elif use_int4_w4a16 or use_int4_w4a8:
         w1 = torch.randint(
             0,
             255,
@@ -119,7 +120,7 @@ def benchmark_config(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_int4_w4a8:
         block_n = 1 if (block_shape[0] == 0) else block_shape[0]
         block_k = block_shape[1]
         n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
@@ -194,6 +195,7 @@ def benchmark_config(
                 use_int8_w8a8=use_int8_w8a8,
                 use_int8_w8a16=use_int8_w8a16,
                 use_int4_w4a16=use_int4_w4a16,
+                use_int4_w4a8=use_int4_w4a8,
                 w1_scale=w1_scale,
                 w2_scale=w2_scale,
                 a1_scale=a1_scale,
@@ -266,6 +268,7 @@ class BenchmarkWorker:
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool,
+        use_int4_w4a8: bool,
         per_channel_quant: bool,
         block_shape: List[int],
     ) -> Tuple[Dict[str, int], float]:
@@ -275,13 +278,14 @@ class BenchmarkWorker:
             use_int8_w8a16=use_int8_w8a16,
             use_fp8_w8a8=use_fp8_w8a8,
             use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int4_w4a8,
         )
         # NOTE(woosuk): The current naming convention uses w2.shape[2], which
         # is the intermediate size after silu_and_mul.
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
         N = shard_intermediate_size // 2
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_int4_w4a8:
             N = N // 2
         op_config = get_moe_configs(
             num_experts,
@@ -317,6 +321,7 @@ class BenchmarkWorker:
                 use_int8_w8a8,
                 use_int8_w8a16,
                 use_int4_w4a16,
+                use_int4_w4a8,
                 per_channel_quant,
                 block_shape,
             )
@@ -334,6 +339,7 @@ class BenchmarkWorker:
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool,
+        use_int4_w4a8: bool,
         per_channel_quant: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
@@ -359,6 +365,7 @@ class BenchmarkWorker:
                         use_int8_w8a8,
                         use_int8_w8a16,
                         use_int4_w4a16,
+                        use_int4_w4a8,
                         per_channel_quant,
                         block_shape,
                         num_iters=10,
@@ -396,7 +403,10 @@ def main(args: argparse.Namespace):
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
+    use_int4_w4a8 = args.dtype == "int4_w4a8"
     per_channel_quant = args.per_channel_quant
+    if use_int4_w4a8:
+        block_shape = [0, 128]
 
     if args.batch_size is None:
         batch_sizes = get_default_batch_sizes()
@@ -419,9 +429,25 @@ def main(args: argparse.Namespace):
         return ray.get(outputs)
 
     if args.tune:
-        search_space = get_configs_compute_bound()
-        if block_shape is not None:
-            block_n, block_k = block_shape[0], block_shape[1]
+        if args.search_space_file:
+            with open(args.search_space_file) as f:
+                search_space = json.load(f)
+            if not isinstance(search_space, list) or not all(
+                isinstance(config, dict) for config in search_space
+            ):
+                raise ValueError(
+                    "--search-space-file must contain a JSON list of configs"
+                )
+        else:
+            search_space = get_configs_compute_bound()
+        if use_int4_w4a8:
+            search_space = [
+                config
+                for config in search_space
+                if config["BLOCK_SIZE_K"] == block_shape[1]
+            ]
+        elif block_shape is not None:
+            block_k = block_shape[1]
             search_space = [
                 config
                 for config in search_space
@@ -438,6 +464,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_int4_w4a8,
             per_channel_quant,
             block_shape,
         )
@@ -460,6 +487,7 @@ def main(args: argparse.Namespace):
                     use_int8_w8a8,
                     use_int8_w8a16,
                     use_int4_w4a16,
+                    use_int4_w4a8,
                     per_channel_quant,
                     block_shape,
                     search_space,
@@ -491,6 +519,7 @@ def main(args: argparse.Namespace):
                     use_int8_w8a8,
                     use_int8_w8a16,
                     use_int4_w4a16,
+                    use_int4_w4a8,
                     per_channel_quant,
                     block_shape,
                 )
@@ -513,7 +542,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int4_w4a16"],
+        choices=[
+            "auto",
+            "fp8_w8a8",
+            "int8_w8a16",
+            "int8_w8a8",
+            "int4_w4a16",
+            "int4_w4a8",
+        ],
         default="auto",
     )
     parser.add_argument(

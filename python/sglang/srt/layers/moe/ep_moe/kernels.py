@@ -1596,6 +1596,161 @@ def fp8_per_token_to_per_tensor_quant_triton(
     )
 
 
+@triton.jit
+def _masked_per_tensor_dynamic_scale_kernel(
+    input_ptr,
+    stride_input_expert,
+    stride_input_token,
+    stride_input_dim,
+    scale_ptr,
+    masked_m_ptr,
+    hidden_size,
+    fp8_max,
+    K_BLOCK_SIZE: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    block_id_token = tl.program_id(1)
+    block_id_dim = tl.program_id(0)
+    num_token_blocks = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+    if token_num_cur_expert == 0:
+        return
+
+    stride_input_expert = tl.cast(stride_input_expert, tl.int64)
+    stride_input_token = tl.cast(stride_input_token, tl.int64)
+
+    offset_d = block_id_dim * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
+    mask_d = offset_d < hidden_size
+    input_base_offs = input_ptr + expert_id * stride_input_expert + offset_d
+
+    absmax = 0.0
+    for token_idx in tl.range(
+        block_id_token, token_num_cur_expert, num_token_blocks, num_stages=NUM_STAGE
+    ):
+        hidden = tl.load(
+            input_base_offs + token_idx * stride_input_token,
+            mask=mask_d,
+            other=0.0,
+        ).to(tl.float32)
+        absmax = tl.maximum(absmax, tl.max(tl.abs(hidden)))
+
+    absmax = tl.maximum(absmax, 1e-10)
+    tl.atomic_max(scale_ptr, absmax / fp8_max)
+
+
+@triton.jit
+def _masked_per_tensor_quant_kernel(
+    input_ptr,
+    stride_input_expert,
+    stride_input_token,
+    stride_input_dim,
+    output_ptr,
+    stride_output_expert,
+    stride_output_token,
+    stride_output_dim,
+    scale_ptr,
+    masked_m_ptr,
+    hidden_size,
+    fp8_max,
+    fp8_min,
+    K_BLOCK_SIZE: tl.constexpr,
+    NUM_STAGE: tl.constexpr,
+):
+    expert_id = tl.program_id(2)
+    block_id_token = tl.program_id(1)
+    block_id_dim = tl.program_id(0)
+    num_token_blocks = tl.num_programs(1)
+
+    token_num_cur_expert = tl.load(masked_m_ptr + expert_id)
+    if token_num_cur_expert == 0:
+        return
+
+    scale = 1.0 / tl.load(scale_ptr).to(tl.float32)
+
+    stride_input_expert = tl.cast(stride_input_expert, tl.int64)
+    stride_input_token = tl.cast(stride_input_token, tl.int64)
+    stride_output_expert = tl.cast(stride_output_expert, tl.int64)
+    stride_output_token = tl.cast(stride_output_token, tl.int64)
+
+    offset_d = block_id_dim * K_BLOCK_SIZE + tl.arange(0, K_BLOCK_SIZE)
+    mask_d = offset_d < hidden_size
+    input_base_offs = input_ptr + expert_id * stride_input_expert + offset_d
+    output_base_offs = output_ptr + expert_id * stride_output_expert + offset_d
+
+    for token_idx in tl.range(
+        block_id_token, token_num_cur_expert, num_token_blocks, num_stages=NUM_STAGE
+    ):
+        hidden = tl.load(
+            input_base_offs + token_idx * stride_input_token,
+            mask=mask_d,
+            other=0.0,
+        ).to(tl.float32)
+        hidden_q = tl.clamp(hidden * scale, fp8_min, fp8_max).to(
+            output_ptr.dtype.element_ty
+        )
+        tl.store(
+            output_base_offs + token_idx * stride_output_token,
+            hidden_q,
+            mask=mask_d,
+        )
+
+
+def masked_per_tensor_quant_fp8_fwd(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    assert input.is_contiguous()
+    assert output.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert input.ndim == 3
+    assert input.shape == output.shape
+    assert input.shape[0] == masked_m.shape[0]
+    assert scale.numel() == 1 and scale.dtype == torch.float32
+
+    expert_num = input.shape[0]
+    hidden_size = input.shape[-1]
+
+    K_BLOCK_SIZE = 1024
+    BLOCK_M = 64 if expert_num < 4 else 8
+    NUM_STAGES = 3
+    hidden_dim_split_block_num = triton.cdiv(hidden_size, K_BLOCK_SIZE)
+    grid = (hidden_dim_split_block_num, BLOCK_M, expert_num)
+
+    fp8_max = torch.finfo(torch.float8_e4m3fn).max
+    fp8_min = -fp8_max
+
+    scale.zero_()
+    _masked_per_tensor_dynamic_scale_kernel[grid](
+        input,
+        *input.stride(),
+        scale,
+        masked_m,
+        hidden_size,
+        fp8_max,
+        K_BLOCK_SIZE=K_BLOCK_SIZE,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=8,
+    )
+    _masked_per_tensor_quant_kernel[grid](
+        input,
+        *input.stride(),
+        output,
+        *output.stride(),
+        scale,
+        masked_m,
+        hidden_size,
+        fp8_max,
+        fp8_min,
+        K_BLOCK_SIZE=K_BLOCK_SIZE,
+        NUM_STAGE=NUM_STAGES,
+        num_warps=8,
+    )
+    return output
+
 
 @triton.jit
 def _silu_and_mul_masked_post_per_tensor_dynamic_scale_kernel(

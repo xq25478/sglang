@@ -97,6 +97,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
+    HUMMING = "humming"
     AITER = "aiter"
 
     def is_auto(self):
@@ -139,6 +140,9 @@ class MoeRunnerBackend(Enum):
 
     def is_marlin(self):
         return self == MoeRunnerBackend.MARLIN
+
+    def is_humming(self):
+        return self == MoeRunnerBackend.HUMMING
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER

@@ -37,15 +37,14 @@ def get_config_file_name(
     E: int,
     N: int,
     dtype: Optional[str],
-    block_shape: Optional[int] = None,
+    block_shape: Optional[List[int]] = None,
     per_channel_quant: bool = False,
     down_moe: bool = False,
 ) -> str:
     device_name = get_device_name().replace(" ", "_")
     dtype_selector = "" if not dtype else f",dtype={dtype}"
-    block_shape_selector = (
-        "" if not block_shape or not all(block_shape) else f",block_shape={block_shape}"
-    )
+    keep_block_shape = block_shape and (all(block_shape) or dtype == "int4_w4a8")
+    block_shape_selector = f",block_shape={block_shape}" if keep_block_shape else ""
     per_channel_quant_selector = ",per_channel_quant=True" if per_channel_quant else ""
     down_moe_selector = "_down" if down_moe else ""
     return f"E={E},N={N},device_name={device_name}{dtype_selector}{block_shape_selector}{per_channel_quant_selector}{down_moe_selector}.json"
@@ -327,6 +326,7 @@ def get_config_dtype_str(
     dtype: torch.dtype,
     use_int8_w8a16: Optional[bool] = False,
     use_int4_w4a16: Optional[bool] = False,
+    use_int4_w4a8: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
 ):
@@ -336,6 +336,8 @@ def get_config_dtype_str(
         return "int8_w8a8"
     elif use_int4_w4a16:
         return "int4_w4a16"
+    elif use_int4_w4a8:
+        return "int4_w4a8"
     elif use_int8_w8a16:
         return "int8_w8a16"
     elif dtype == torch.float:

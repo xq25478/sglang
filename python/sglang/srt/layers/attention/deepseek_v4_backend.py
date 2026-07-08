@@ -523,6 +523,7 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
+        self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
         assert (
             head_dim == 512

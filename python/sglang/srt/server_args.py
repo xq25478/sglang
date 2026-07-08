@@ -231,7 +231,16 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "cutlass",
     "aiter",
     "marlin",
+    "humming",
 ]
+
+FLASHINFER_CUTLASS_MOE_QUANTIZATIONS = (
+    "modelopt_fp4",
+    "modelopt_fp8",
+    "modelopt_mixed",
+    "w4afp8",
+    None,
+)
 
 MOE_A2A_BACKEND_CHOICES = [
     "none",
@@ -4966,16 +4975,31 @@ class ServerArgs:
 
         view = resolved_view(self)
         if view.moe_runner_backend == "flashinfer_cutlass":
-            assert view.quantization in [
-                "modelopt_fp4",
-                "modelopt_fp8",
-                "modelopt_mixed",
-                None,
-            ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
+            assert (
+                view.quantization in FLASHINFER_CUTLASS_MOE_QUANTIZATIONS
+            ), (
+                f"Invalid quantization '{view.quantization}'. \n"
+                "FlashInfer Cutlass MOE supports only: 'modelopt_fp4', "
+                "'modelopt_fp8', 'modelopt_mixed', 'w4afp8', or "
+                "bfloat16 (None)."
+            )
             assert view.ep_size in [
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+
+        if (
+            view.moe_runner_backend == "humming"
+            and view.quantization == "w4afp8"
+        ):
+            assert view.moe_a2a_backend == "none", (
+                "Humming W4A8 supports only moe_a2a_backend='none', "
+                f"got '{view.moe_a2a_backend}'."
+            )
+            assert view.ep_size == 1, (
+                "Humming W4A8 currently supports tensor parallelism only; "
+                f"got ep_size={view.ep_size}."
+            )
 
         if view.moe_runner_backend == "flashinfer_cutedsl":
             assert (

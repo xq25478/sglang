@@ -23,9 +23,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.moe_runner.flashinfer_w4a8_autotune import (
+    get_runtime_profile_ids,
+    observe_route,
+)
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -37,6 +40,8 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+_FI_CUTLASS_TUNE_MAX_NUM_TOKENS = 8192
+
 
 @dataclass
 class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
@@ -46,6 +51,8 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
       - ``"bf16"``: unquantized weights, BF16/FP16 input, no quant scales.
       - ``"fp8"``: FP8 weights, FP8-quantized input, per-tensor scales.
       - ``"fp4"``: NVFP4 packed weights and optional NVFP4 packed input.
+      - ``"w4a8"``: packed INT4 weights with group scales and BF16 input
+        quantized to FP8 inside FlashInfer.
     """
 
     quant_type: str
@@ -57,6 +64,7 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_tp_rank: int = 0
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
+    group_size: int = 128
     apply_routed_scaling_factor: bool = True
 
 
@@ -160,10 +168,14 @@ def _prepare_input(
         x_sf = None
         output_dtype = quant_info.output_dtype or dispatch_output.hidden_states.dtype
         output_col = dispatch_output.hidden_states.shape[1]
-    elif quant_info.quant_type == "fp4":
+    elif quant_info.quant_type in ("fp4", "w4a8"):
         output_dtype = quant_info.output_dtype or torch.bfloat16
         output_col = x.shape[1]
-        if x_sf is not None and runner_config.is_gated:
+        if (
+            quant_info.quant_type == "fp4"
+            and x_sf is not None
+            and runner_config.is_gated
+        ):
             output_col *= 2
     else:
         assert quant_info.quant_type == "bf16"
@@ -217,7 +229,7 @@ def _run_flashinfer_cutlass(
             quant_scales[5],
         ]
 
-    output = flashinfer_cutlass_fused_moe(
+    call_kwargs = dict(
         output=output,
         input=x,
         token_selected_experts=topk_ids.to(torch.int),
@@ -231,12 +243,28 @@ def _run_flashinfer_cutlass(
         ep_rank=quant_info.moe_ep_rank,
         tp_size=quant_info.moe_tp_size,
         tp_rank=quant_info.moe_tp_rank,
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        # Keep one stable FlashInfer tuning configuration across decode and
+        # prefill. Dynamic ceilings create disjoint autotune-cache keys.
+        tune_max_num_tokens=_FI_CUTLASS_TUNE_MAX_NUM_TOKENS,
         activation_type=_activation_type(runner_config),
         enable_alltoall=enable_alltoall,
-    )[0]
+    )
+    if quant_info.quant_type == "w4a8":
+        assert quant_scales is not None and len(quant_scales) == 8
+        observe_route(
+            topk_ids,
+            sample=(quant_info, runner_config),
+        )
+        call_kwargs.update(
+            use_w4_group_scaling=True,
+            use_packed_weights=True,
+        )
+        profile_ids = get_runtime_profile_ids(x.shape[0])
+        if profile_ids is not None:
+            call_kwargs["profile_ids"] = profile_ids
+    output = flashinfer_cutlass_fused_moe(**call_kwargs)[0]
 
-    if quant_info.quant_type in ("bf16", "fp8"):
+    if quant_info.quant_type in ("bf16", "fp8", "w4a8"):
         _maybe_apply_routed_scaling_factor(output, quant_info, runner_config)
     return output
 
@@ -362,7 +390,7 @@ def fused_experts_none_to_flashinfer_mxfp4(
         ep_rank=quant_info.moe_ep_rank,
         use_w4_group_scaling=True,
         activation_type=ActivationType.Swiglu,
-        tune_max_num_tokens=next_power_of_2(x.shape[0]),
+        tune_max_num_tokens=_FI_CUTLASS_TUNE_MAX_NUM_TOKENS,
         output=out,
     )
 

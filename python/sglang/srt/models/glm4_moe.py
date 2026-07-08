@@ -1320,6 +1320,11 @@ class Glm4MoeForCausalLM(nn.Module):
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
+        # Load input_scale for w4afp8 if available in checkpoint
+        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+            expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
+                num_experts=self.config.n_routed_experts
+            )
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"

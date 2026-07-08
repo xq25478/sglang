@@ -94,6 +94,7 @@ def fused_moe_kernel_gptq_awq(
     a_ptr,
     b_ptr,
     c_ptr,
+    a_scale_ptr,
     b_scale_ptr,
     b_zp_ptr,
     topk_weights_ptr,
@@ -116,6 +117,8 @@ def fused_moe_kernel_gptq_awq(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_asm,
+    stride_ask,
     stride_bse,
     stride_bsk,
     stride_bsn,
@@ -133,6 +136,7 @@ def fused_moe_kernel_gptq_awq(
     compute_type: tl.constexpr,
     has_zp: tl.constexpr,
     use_int4_w4a16: tl.constexpr,
+    use_int4_w4a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
@@ -213,7 +217,7 @@ def fused_moe_kernel_gptq_awq(
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
     )
 
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_int4_w4a8:
         b_ptrs = (
             b_ptr
             + off_experts * stride_be
@@ -229,11 +233,11 @@ def fused_moe_kernel_gptq_awq(
             + offs_bn[None, :] * stride_bn
         )
 
-    if not has_zp and use_int4_w4a16:
+    if not has_zp and (use_int4_w4a16 or use_int4_w4a8):
         b_zp_num = 8
     if not has_zp and use_int8_w8a16:
         b_zp_num = 128
-    elif has_zp and use_int4_w4a16:
+    elif has_zp and (use_int4_w4a16 or use_int4_w4a8):
         b_zp_shifter = (offs_bn[None, :] % 2) * 4
 
     # -----------------------------------------------------------
@@ -259,19 +263,28 @@ def fused_moe_kernel_gptq_awq(
             other=0.0,
         )
         b = tl.load(b_ptrs)
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_int4_w4a8:
             b = (b >> b_shifter) & 0xF
 
-        b_scale_ptrs = (
-            b_scale_ptr
-            + off_experts * stride_bse
-            + offs_bn[None, :] * stride_bsn
-            + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
-        )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+        if use_int4_w4a8:
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn * stride_bsn
+                + k * stride_bsk
+            )
+            b_scale = tl.load(b_scale_ptrs)
+        else:
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[None, :] * stride_bsn
+                + ((offs_k[:, None] + BLOCK_SIZE_K * k) // group_size) * stride_bsk
+            )
+            b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
         b_scale = b_scale.to(tl.float32)
 
-        if has_zp and use_int4_w4a16:
+        if has_zp and (use_int4_w4a16 or use_int4_w4a8):
             offs_k_true = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
             b_zp_ptrs = (
                 b_zp_ptr
@@ -294,15 +307,31 @@ def fused_moe_kernel_gptq_awq(
             b_zp = b_zp.to(tl.float32)
 
         # We accumulate along the K dimension.
-        if has_zp:
+        if use_int4_w4a8:
+            # W4AFp8 checkpoints store signed INT4 in two's-complement nibbles.
+            # Sign-extend [0, 15] to [-8, 7], cast to the activation FP8 dtype,
+            # and apply both group scales after the tensor-core dot.
+            b = b.to(tl.int32)
+            b = tl.where(b >= 8, b - 16, b).to(tl.float32).to(a.dtype)
+            a_scale_ptrs = (
+                a_scale_ptr
+                + (offs_token // top_k) * stride_asm
+                + k * stride_ask
+            )
+            a_scale = tl.load(
+                a_scale_ptrs, mask=token_mask, other=0.0
+            ).to(tl.float32)
+            accumulator += tl.dot(a, b) * a_scale[:, None] * b_scale[None, :]
+        elif has_zp:
             b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            accumulator = tl.dot(a, b, acc=accumulator)
         else:
             b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
-        accumulator = tl.dot(a, b, acc=accumulator)
+            accumulator = tl.dot(a, b, acc=accumulator)
 
         # Advance the ptrs to the next K block.
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        if use_int4_w4a16:
+        if use_int4_w4a16 or use_int4_w4a8:
             b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
         else:
             b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -732,6 +761,7 @@ def invoke_fused_moe_kernel(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool,
     per_channel_quant: bool,
     block_shape: Optional[List[int]] = None,
     no_combine: bool = False,
@@ -775,6 +805,21 @@ def invoke_fused_moe_kernel(
             assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
             assert triton.cdiv(B.shape[-2], block_n) == B_scale.shape[-2]
             assert triton.cdiv(B.shape[-1], block_k) == B_scale.shape[-1]
+    elif use_int4_w4a8:
+        assert B_scale is not None
+        assert B_zp is None, "Triton W4A8 supports symmetric INT4 weights only"
+        assert block_shape == [0, 128], "Triton W4A8 requires group_size=128"
+        block_k = block_shape[1]
+        assert (
+            config["BLOCK_SIZE_K"] == block_k
+        ), "Triton W4A8 requires BLOCK_SIZE_K to match the quantization group"
+        if _is_cuda:
+            A, A_scale = sglang_per_token_group_quant_fp8(A, block_k)
+        else:
+            A, A_scale = per_token_group_quant_fp8(A, block_k)
+        assert triton.cdiv(A.shape[-1], block_k) == A_scale.shape[-1]
+        assert B_scale.ndim == 3
+        assert B_scale.shape[-1] == A_scale.shape[-1]
     elif use_int8_w8a8:
         assert B_scale is not None
         if block_shape is None:
@@ -835,7 +880,7 @@ def invoke_fused_moe_kernel(
     # ===== END TO BE REFACTORED ====
 
     if (
-        (use_int8_w8a16 or use_int4_w4a16)
+        (use_int8_w8a16 or use_int4_w4a16 or use_int4_w4a8)
         and block_shape is not None
         and block_shape[1] > 0
     ):
@@ -849,6 +894,7 @@ def invoke_fused_moe_kernel(
             A,
             B,
             C,
+            A_scale,
             B_scale,
             B_zp,
             topk_weights,
@@ -866,6 +912,8 @@ def invoke_fused_moe_kernel(
             B.stride(1),
             C.stride(-2),
             C.stride(-1),
+            A_scale.stride(0) if A_scale is not None else 0,
+            A_scale.stride(1) if A_scale is not None else 0,
             B_scale.stride(0),
             B_scale.stride(2),
             B_scale.stride(1),
@@ -878,6 +926,7 @@ def invoke_fused_moe_kernel(
             compute_type=compute_type,
             has_zp=B_zp is not None,
             use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int4_w4a8,
             use_int8_w8a16=use_int8_w8a16,
             even_Ks=even_Ks,
             filter_expert=filter_expert,

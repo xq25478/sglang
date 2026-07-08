@@ -29,10 +29,13 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     deepep_permute_triton_kernel,
     deepep_post_reorder_triton_kernel,
     deepep_run_moe_deep_preprocess,
+    fp8_per_token_to_per_tensor_quant_dynamic_triton,
     fp8_per_token_to_per_tensor_quant_triton,
+    masked_per_tensor_quant_fp8_fwd,
     post_reorder_for_cutlass_moe,
     pre_reorder_for_cutlass_moe,
     silu_and_mul_masked_post_per_tensor_quant_fwd,
+    silu_and_mul_masked_post_per_tensor_quant_dynamic_fwd,
     silu_mul_static_tensorwise_quant_for_cutlass_moe,
 )
 
@@ -77,8 +80,10 @@ def cutlass_w4a8_moe(
     - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
         Shape: [num_experts, K, N // 2]
         (the weights are passed transposed and int4-packed)
-    - w1_scale (torch.Tensor): The packed scale to dequantize w1_q.
-    - w2_scale (torch.Tensor): The packed scale to dequantize w2_q.
+    - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
+        Shape: [num_experts, K // 512, N * 8]
+    - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
+        Shape: [num_experts, N // 512, K * 4]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - topk_ids (torch.Tensor): The ids of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
@@ -123,7 +128,8 @@ def cutlass_w4a8_moe(
         assert topk == 1, "apply_router_weight_on_input is only implemented for topk=1"
 
     device = a.device
-    topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
+    if get_parallel().moe_ep_size > 1:
+        topk_ids = torch.where(topk_ids == -1, num_local_experts, topk_ids)
 
     src2dst = cutlass_w4_run_moe_ep_preproess(
         topk_ids,
@@ -261,8 +267,10 @@ def cutlass_w4a8_moe_deepep_normal(
     - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
         Shape: [num_experts, K, N // 2]
         (the weights are passed transposed and int4-packed)
-    - w1_scale (torch.Tensor): The packed scale to dequantize w1_q.
-    - w2_scale (torch.Tensor): The packed scale to dequantize w2_q.
+    - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
+        Shape: [num_experts, K // 512, N * 8]
+    - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
+        Shape: [num_experts, N // 512, K * 4]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
@@ -451,8 +459,10 @@ def cutlass_w4a8_moe_deepep_ll(
     - w2_q (torch.Tensor): The second set of int4-quantized expert weights.
         Shape: [num_experts, K, N // 2]
         (the weights are passed transposed and int4-packed)
-    - w1_scale (torch.Tensor): The packed scale to dequantize w1_q.
-    - w2_scale (torch.Tensor): The packed scale to dequantize w2_q.
+    - w1_scale (torch.Tensor): The fp32 scale to dequantize w1_q.
+        Shape: [num_experts, K // 512, N * 8]
+    - w2_scale (torch.Tensor): The fp32 scale to dequantize w2_q.
+        Shape: [num_experts, N // 512, K * 4]
     - topk_weights (torch.Tensor): The weights of each token->expert mapping.
     - a_strides1 (torch.Tensor): The input strides of the first grouped gemm.
     - b_strides1 (torch.Tensor): The weights strides of the first grouped gemm.
@@ -503,13 +513,30 @@ def cutlass_w4a8_moe_deepep_ll(
     )
 
     gateup_input = torch.empty(a_states.shape, dtype=torch.float8_e4m3fn, device=device)
-    fp8_per_token_to_per_tensor_quant_triton(
-        x=a_states,
-        x_scale=a_scales,
-        masked_m=masked_m,
-        output_scale=a1_scale,
-        output=gateup_input,
-    )
+    if a1_scale is None:
+        a1_scale = torch.empty(1, dtype=torch.float32, device=device)
+        if a_scales is not None:
+            fp8_per_token_to_per_tensor_quant_dynamic_triton(
+                x=a_states,
+                x_scale=a_scales,
+                masked_m=masked_m,
+                output_scale=a1_scale,
+                output=gateup_input,
+            )
+        else:
+            masked_per_tensor_quant_fp8_fwd(
+                a_states, gateup_input, masked_m, a1_scale
+            )
+    elif a_scales is not None:
+        fp8_per_token_to_per_tensor_quant_triton(
+            x=a_states,
+            x_scale=a_scales,
+            masked_m=masked_m,
+            output_scale=a1_scale,
+            output=gateup_input,
+        )
+    else:
+        per_tensor_quant_fp8(a_states, gateup_input, a1_scale.float(), True)
     c1 = torch.empty((num_experts, m, n * 2), device=device, dtype=torch.bfloat16)
     c2 = torch.empty((num_experts, m, k), device=device, dtype=torch.bfloat16)
 
@@ -532,9 +559,17 @@ def cutlass_w4a8_moe_deepep_ll(
     intermediate_q = torch.empty(
         (num_experts, m, n), device=a_states.device, dtype=torch.float8_e4m3fn
     )
-    silu_and_mul_masked_post_per_tensor_quant_fwd(
-        c1, intermediate_q, masked_m, a2_scale
-    )
+    if a2_scale is None:
+        # Fused SiLU+Mul + per-tensor dynamic FP8 quantization (2 passes over
+        # c1: one for absmax, one for quant), no BF16 intermediate buffer.
+        a2_scale = torch.zeros(1, dtype=torch.float32, device=device)
+        silu_and_mul_masked_post_per_tensor_quant_dynamic_fwd(
+            c1, intermediate_q, masked_m, a2_scale
+        )
+    else:
+        silu_and_mul_masked_post_per_tensor_quant_fwd(
+            c1, intermediate_q, masked_m, a2_scale
+        )
     cutlass_w4a8_moe_mm(
         c2,
         intermediate_q,

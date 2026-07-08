@@ -136,6 +136,10 @@ fi
 CI_WORK_DIR="${CI_WORK_DIR:-/export/zhangyu}"
 CI_USER="xn_testdev_ci"
 CI_USER_SSH_DIR="/root/.ssh"
+FLASHINFER_PYTHON_WHEEL="flashinfer_python-0.6.15.dev20260723-py3-none-any.whl"
+FLASHINFER_JIT_CACHE_WHEEL="flashinfer_jit_cache-0.6.15.dev20260723+cu130-cp39-abi3-manylinux_2_28_x86_64.whl"
+FLASHINFER_PYTHON_WHEEL_SHA256="b5fbdfb0c43fdd54a044f27d10d9bd58c40a73ca31c56a93d1e2890337d76eee"
+FLASHINFER_JIT_CACHE_WHEEL_SHA256="46bd98393f7b162d5960be45c0c5c691a03fb57547d5e7eec033e87b6604d669"
 
 echo "[SGLang CI] CI_MODE=${CI_MODE}"
 echo "[SGLang CI] EVENT_TYPE=${EVENT_TYPE}"
@@ -145,6 +149,24 @@ echo "[SGLang CI] PUBLISH_IMAGES=${PUBLISH_IMAGES}"
 CI_SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_PATH="$(cd "${CI_SCRIPT_PATH}/../.." && pwd)"
 echo "[SGLang CI] SOURCE_PATH=${SOURCE_PATH}"
+
+verify_backend_wheel() {
+    local wheel_dir="$1"
+    local wheel="$2"
+    local expected_sha256="$3"
+    local path="${wheel_dir}/${wheel}"
+    local actual_sha256
+    if [[ ! -r "${path}" ]]; then
+        echo "[SGLang CI] ERROR: 缺少 W4A8 后端 wheel: ${path}" >&2
+        exit 1
+    fi
+    actual_sha256=$(sha256sum "${path}" | awk '{print $1}')
+    if [[ "${actual_sha256}" != "${expected_sha256}" ]]; then
+        echo "[SGLang CI] ERROR: W4A8 后端 wheel 校验失败: ${path}" >&2
+        echo "[SGLang CI] expected=${expected_sha256} actual=${actual_sha256}" >&2
+        exit 1
+    fi
+}
 
 require_clean_worktree() {
     local source_path="$1"
@@ -185,6 +207,20 @@ BASE_IMAGE_PREFIX="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/lmsysorg
 
 pushd "${SOURCE_PATH}" && BASE_IMAGE_TAG=$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD) && popd
 echo "[SGLang CI] BASE_IMAGE_TAG=${BASE_IMAGE_TAG}"
+
+FLASHINFER_WHEEL_HOST="${CI_WORK_DIR}/ci/sglang/flashinfer/wheels"
+SGL_DEEP_GEMM_WHEEL_HOST="${CI_WORK_DIR}/ci/sglang/sgl-deep-gemm/wheels"
+echo "[SGLang CI] FLASHINFER_WHEEL_HOST=${FLASHINFER_WHEEL_HOST}"
+echo "[SGLang CI] SGL_DEEP_GEMM_WHEEL_HOST=${SGL_DEEP_GEMM_WHEEL_HOST}"
+
+verify_backend_wheel \
+    "${FLASHINFER_WHEEL_HOST}" \
+    "${FLASHINFER_PYTHON_WHEEL}" \
+    "${FLASHINFER_PYTHON_WHEEL_SHA256}"
+verify_backend_wheel \
+    "${FLASHINFER_WHEEL_HOST}" \
+    "${FLASHINFER_JIT_CACHE_WHEEL}" \
+    "${FLASHINFER_JIT_CACHE_WHEEL_SHA256}"
 
 RELEASE_ARTIFACT_BRANCH="JD-${BASE_IMAGE_TAG}"
 if [[ "${CI_MODE}" == "temp-image" && "${BRANCH_NAME}" == "${RELEASE_ARTIFACT_BRANCH}" ]]; then
@@ -634,6 +670,8 @@ run_docker_attached docker run \
     -v /mnt/nas/:/mnt/nas/ \
     -v "${CI_WORK_DIR}:${CI_WORK_DIR}" \
     -v "${WHEEL_CACHE_HOST}:/wheels" \
+    -v "${FLASHINFER_WHEEL_HOST}:/flashinfer-wheels:ro" \
+    -v "${SGL_DEEP_GEMM_WHEEL_HOST}:/sgl-deep-gemm-wheels:ro" \
     -v "${SOURCE_PATH}:${SOURCE_PATH}" \
     -w "${SOURCE_PATH}" \
     --entrypoint /bin/bash \
@@ -688,6 +726,24 @@ run_docker_attached docker run \
             '/deepseek-v4-flash-0731-sps-2d-1p-4gpu-1d-4gpu-g2-flashinfer-cutlass.json'
 
         # ---------- 编译 ----------
+
+        echo '[JD CI] 安装 W4A8 后端依赖'
+        # The patched development Python wheel must not see the base image's
+        # 0.6.14 cubin package; FlashInfer rejects mismatched package versions.
+        python3 -m pip uninstall -y flashinfer-cubin || true
+        pip install humming-kernels==0.1.11
+        python3 -m pip install --no-deps --force-reinstall \
+            /flashinfer-wheels/flashinfer_python-0.6.15.dev20260723-py3-none-any.whl \
+            /flashinfer-wheels/flashinfer_jit_cache-0.6.15.dev20260723+cu130-cp39-abi3-manylinux_2_28_x86_64.whl
+        python3 -m pip show flashinfer-python flashinfer-jit-cache humming-kernels
+        python3 -c \"from importlib.metadata import version; assert version('humming-kernels') == '0.1.11'\"
+        python3 -c 'from flashinfer.fused_moe import get_cutlass_fused_moe_valid_profile_ids; print(get_cutlass_fused_moe_valid_profile_ids)'
+
+        echo '[JD CI] 安装 Hopper MegaMoE 后端依赖'
+        python3 -m pip install --no-deps --force-reinstall \
+            /sgl-deep-gemm-wheels/sgl_deep_gemm-0.1.5-py3-none-any.whl
+        python3 -m pip show sgl-deep-gemm
+        python3 -c 'import deep_gemm; assert callable(deep_gemm.fp8_mega_moe); assert callable(deep_gemm.mega_moe_pre_dispatch_sm90)'
 
         if [[ '${JD_CI_SKIP_MOONCAKE_BUILD}' == '1' ]]; then
             echo '[JD CI] 跳过 mooncake 编译 (JD_CI_SKIP_MOONCAKE_BUILD=1)'

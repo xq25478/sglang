@@ -279,6 +279,10 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   const auto input_ptr = static_cast<const DType*>(params.kv) + work_id * params.kv_stride_batch;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[work_id]);
   const auto out_loc = params.out_loc[work_id];
+  // DSpark uses -1 for graph-captured rows whose commit gate is closed.  The
+  // fused store must preserve that sentinel instead of translating it into a
+  // negative page address and writing before the SWA cache allocation.
+  if (out_loc < 0) return;
   const auto freqs_cis = params.freqs_cis + position * kRopeDim;
 
   PDLWaitPrimary<kUsePDL>();

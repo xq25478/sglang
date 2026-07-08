@@ -7,6 +7,7 @@ import torch
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.moe import MoeRunner, get_moe_runner_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -149,9 +150,113 @@ def interleave_scales(scales: torch.Tensor, scale_pack: int) -> torch.Tensor:
     return scales_interleaved.contiguous()
 
 
+def _interleave_w4a8_scales_with_flashinfer(
+    scales: torch.Tensor, group_size: int
+) -> Optional[torch.Tensor]:
+    """Use FlashInfer's optimized W4A8 scale layout when it supports BF16."""
+    from flashinfer.fused_moe import (
+        interleave_moe_scales_for_sm90_mixed_gemm,
+    )
+
+    try:
+        return interleave_moe_scales_for_sm90_mixed_gemm(
+            scales, group_size
+        )
+    except ValueError as error:
+        # FlashInfer 0.6.12 exposes this helper for MXFP4 E8M0 scales only.
+        # Keep its legacy W4A8 layout until the optimized BF16 implementation
+        # available in newer FlashInfer builds is installed.
+        if scales.dtype != torch.uint8 and "must be uint8" in str(error):
+            return None
+        raise
+
+
+def interleave_flashinfer_w4a8_scales(
+    scales: torch.Tensor, *, k: int, group_size: int
+) -> torch.Tensor:
+    """Convert natural group scales to FlashInfer's SM90 INT4 layout."""
+    if group_size != 128:
+        raise ValueError(
+            "FlashInfer SM90 W4A8 supports only group_size=128, "
+            f"got group_size={group_size}."
+        )
+    if scales.shape[2] != k // group_size:
+        raise ValueError(
+            f"Expected {k // group_size} scale groups for K={k}, "
+            f"got {scales.shape[2]}."
+        )
+    native_layout = _interleave_w4a8_scales_with_flashinfer(
+        scales, group_size
+    )
+    if native_layout is not None:
+        return native_layout
+    scale_pack = 4 if k % 512 == 0 else (2 if k % 256 == 0 else 1)
+    return interleave_scales(scales, scale_pack=scale_pack)
+
+
+def swap_gate_up(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert SGLang's [gate, up] rows to FlashInfer's [up, gate] order."""
+    if tensor.ndim < 2 or tensor.shape[1] % 2:
+        raise ValueError(
+            "gate/up tensor must have at least two dimensions and an even row count"
+        )
+    gate, up = tensor.chunk(2, dim=1)
+    return torch.cat((up, gate), dim=1).contiguous()
+
+
+def build_flashinfer_w4a8_quant_scales(
+    *,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    w13_input_scale: torch.Tensor,
+    w2_input_scale: torch.Tensor,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+) -> list[torch.Tensor]:
+    """Build FlashInfer's eight-tensor group-scaled INT4 quant contract."""
+    device = w13_scale.device
+    dtype = torch.bfloat16
+    a1_scale = w13_input_scale.float().reshape(-1).max()
+    a2_scale = w2_input_scale.float().reshape(-1).max()
+    empty = torch.empty(0, dtype=dtype, device=device)
+    return [
+        w13_scale,
+        w2_scale,
+        torch.full(
+            (hidden_size,),
+            1.0 / a1_scale.item(),
+            dtype=dtype,
+            device=device,
+        ),
+        torch.full(
+            (intermediate_size,),
+            1.0 / a2_scale.item(),
+            dtype=dtype,
+            device=device,
+        ),
+        empty,
+        empty,
+        torch.full(
+            (num_experts,),
+            a1_scale.item(),
+            dtype=torch.float32,
+            device=device,
+        ),
+        torch.full(
+            (num_experts,),
+            a2_scale.item(),
+            dtype=torch.float32,
+            device=device,
+        ),
+    ]
+
+
 class W4AFp8MoEMethod(FusedMoEMethodBase):
     def __init__(self, quant_config: W4AFp8Config):
         self.quant_config = quant_config
+        self.runner = None
+        self.fuse_routed_scaling_factor_in_topk = False
 
     def create_weights(
         self,
@@ -291,23 +396,73 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         dtype = torch.bfloat16
         device = layer.w2_weight.device
+        runner_backend = get_moe_runner_backend()
+        use_flashinfer = runner_backend.is_flashinfer_cutlass()
+        use_triton = runner_backend.is_triton()
+        use_humming = runner_backend.is_humming()
 
-        # Interleave w13_weight_scale (gate_up_proj)
+        # FlashInfer requires [up, gate] packed rows and its SM90 mixed-GEMM
+        # weight interleave. SGLang checkpoints and the native CUTLASS kernel
+        # use [gate, up].
+        if use_flashinfer:
+            from flashinfer.fused_moe import (
+                interleave_moe_weights_for_sm90_mixed_gemm,
+            )
+
+            w13_weight = swap_gate_up(layer.w13_weight).view(torch.uint8)
+            w2_weight = layer.w2_weight.view(torch.uint8)
+            layer.w13_weight = Parameter(
+                interleave_moe_weights_for_sm90_mixed_gemm(w13_weight, "int4"),
+                requires_grad=False,
+            )
+            layer.w2_weight = Parameter(
+                interleave_moe_weights_for_sm90_mixed_gemm(w2_weight, "int4"),
+                requires_grad=False,
+            )
+
+        # Interleave w13_weight_scale (gate_up_proj).
         w13_weight_scale = layer.w13_weight_scale_inv.to(dtype)
+        if use_flashinfer:
+            w13_weight_scale = swap_gate_up(w13_weight_scale)
         w13_k = layer.w13_weight.shape[2] * 2
-        w13_scale_pack = get_cutlass_w4a8_scale_pack(
-            w13_k, self.quant_config.group_size
-        )
-        w13_weight_scale = interleave_scales(w13_weight_scale, w13_scale_pack)
+        if use_flashinfer:
+            w13_weight_scale = interleave_flashinfer_w4a8_scales(
+                w13_weight_scale,
+                k=w13_k,
+                group_size=self.quant_config.group_size,
+            )
+        elif use_triton or use_humming:
+            # The Triton kernel indexes checkpoint-native [E, N, K/group]
+            # scales directly. Humming consumes this natural layout before
+            # its own destructive weight transform below.
+            pass
+        else:
+            w13_scale_pack = get_cutlass_w4a8_scale_pack(
+                w13_k, self.quant_config.group_size
+            )
+            w13_weight_scale = interleave_scales(
+                w13_weight_scale, w13_scale_pack
+            )
         layer.w13_weight_scale_inv = Parameter(w13_weight_scale, requires_grad=False)
 
         # Interleave w2_weight_scale (down_proj)
         w2_weight_scale = layer.w2_weight_scale_inv.to(dtype)
         w2_k = layer.w2_weight.shape[2] * 2
-        w2_scale_pack = get_cutlass_w4a8_scale_pack(
-            w2_k, self.quant_config.group_size
-        )
-        w2_weight_scale = interleave_scales(w2_weight_scale, w2_scale_pack)
+        if use_flashinfer:
+            w2_weight_scale = interleave_flashinfer_w4a8_scales(
+                w2_weight_scale,
+                k=w2_k,
+                group_size=self.quant_config.group_size,
+            )
+        elif use_triton or use_humming:
+            pass
+        else:
+            w2_scale_pack = get_cutlass_w4a8_scale_pack(
+                w2_k, self.quant_config.group_size
+            )
+            w2_weight_scale = interleave_scales(
+                w2_weight_scale, w2_scale_pack
+            )
         layer.w2_weight_scale_inv = Parameter(w2_weight_scale, requires_grad=False)
 
         # Process input scales
@@ -325,23 +480,101 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         layer.w2_input_scale = Parameter(new_w2_input_scale, requires_grad=False)
 
+        # W4AFp8 cutlass G4A8 GEMM2 outputs BF16, and DeepEP's normal combine
+        # kernel is dtype-coupled to the dispatch dtype: FP8 dispatch makes
+        # combine reject the BF16 expert output ('Unsupported type' in
+        # intranode_combine). So dispatch must stay BF16. The per-tensor
+        # dynamic quant then runs on the BF16 a_states in the MoE core.
+        if hasattr(layer, 'dispatcher') and layer.dispatcher is not None:
+            layer.dispatcher.set_quant_config({'dispatcher_output_dtype': 'bf16'})
+
+        # Pre-compute whether input_scale is valid (not default 1.0)
+        # 1.0 means uncalibrated → use dynamic quantization
+        w13_val = layer.w13_input_scale.detach().cpu().item()
+        w2_val = layer.w2_input_scale.detach().cpu().item()
+        layer._has_static_input_scale = (w13_val != 1.0 and w2_val != 1.0)
+
+        if use_flashinfer:
+            self.flashinfer_quant_scales = build_flashinfer_w4a8_quant_scales(
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                w13_input_scale=layer.w13_input_scale,
+                w2_input_scale=layer.w2_input_scale,
+                hidden_size=w13_k,
+                intermediate_size=w2_k,
+                num_experts=layer.w13_weight.shape[0],
+            )
+        elif use_humming:
+            from sglang.srt.layers.moe.moe_runner.humming_w4a8 import (
+                prepare_humming_w4a8_layer,
+            )
+
+            prepare_humming_w4a8_layer(
+                layer,
+                group_size=self.quant_config.group_size,
+            )
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_flashinfer_cutlass():
+            # Fuse routed scaling into TopK weights instead of launching an
+            # output-sized mul kernel after every FlashInfer MoE call.
+            self.fuse_routed_scaling_factor_in_topk = True
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutlass  # noqa: F401
+
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_triton():
+            import sglang.srt.layers.moe.moe_runner.triton  # noqa: F401
+
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        elif moe_runner_backend.is_humming():
+            # The experimental W4AFp8 Humming path is a focused Standard/TP
+            # fused path and does not instantiate the generic MoeRunner.
+            self.runner = None
 
     def apply(
         self,
         layer: Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
+        if get_moe_runner_backend().is_humming():
+            return self._apply_humming(layer, dispatch_output)
+
+        if self.runner is not None:
+            if get_moe_runner_backend().is_triton():
+                return self._apply_triton(layer, dispatch_output)
+
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+                FlashInferCutlassMoeQuantInfo,
+            )
+
+            quant_info = FlashInferCutlassMoeQuantInfo(
+                quant_type="w4a8",
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                quant_scales=self.flashinfer_quant_scales,
+                output_dtype=torch.bfloat16,
+                moe_tp_size=layer.moe_tp_size,
+                moe_tp_rank=layer.moe_tp_rank,
+                moe_ep_size=layer.moe_ep_size,
+                moe_ep_rank=layer.moe_ep_rank,
+                apply_routed_scaling_factor=False,
+            )
+            return self.runner.run(dispatch_output, quant_info)
 
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
-        topk_weights, topk_ids, _ = topk_output
+        # Access named fields instead of relying on the legacy three-item tuple
+        # shape. Internal fused-gate paths may attach packed routing metadata to
+        # the standard top-k carrier, while W4A8 only consumes weights and ids.
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
 
         output = cutlass_w4a8_moe(
             x,
@@ -369,11 +602,65 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         )
         return StandardCombineInput(hidden_states=output)
 
+    def _apply_humming(
+        self,
+        layer: Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sglang.srt.layers.moe.moe_runner.humming_w4a8 import (
+            humming_w4a8_moe,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        topk_output = dispatch_output.topk_output
+        output = humming_w4a8_moe(
+            layer,
+            dispatch_output.hidden_states,
+            topk_output.topk_weights,
+            topk_output.topk_ids,
+            routed_scaling_factor=self.moe_runner_config.routed_scaling_factor or 1.0,
+            swiglu_limit=self.moe_runner_config.swiglu_limit,
+        )
+        return StandardCombineInput(hidden_states=output)
+
+    def _apply_triton(
+        self,
+        layer: Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        """Run packed INT4 weights with dynamic per-token-group FP8 activations."""
+        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+
+        group_size = self.quant_config.group_size
+        if group_size != 128:
+            raise ValueError(
+                "Triton W4A8 supports only group_size=128, "
+                f"got group_size={group_size}."
+            )
+        quant_info = TritonMoeQuantInfo(
+            w13_weight=layer.w13_weight,
+            w2_weight=layer.w2_weight,
+            w13_scale=layer.w13_weight_scale_inv,
+            w2_scale=layer.w2_weight_scale_inv,
+            use_int4_w4a8=True,
+            block_shape=[0, group_size],
+        )
+        return self.runner.run(dispatch_output, quant_info)
+
+    @staticmethod
+    def _reject_humming_nonstandard_dispatch() -> None:
+        if get_moe_runner_backend().is_humming():
+            raise NotImplementedError(
+                "The experimental W4A8 Humming backend supports only "
+                "Standard/TP MoE dispatch."
+            )
+
     def apply_deepep_ll(
         self,
         layer: DeepEPMoE,
         dispatch_output: DeepEPLLDispatchOutput,
     ) -> torch.Tensor:
+        self._reject_humming_nonstandard_dispatch()
 
         from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe_deepep_ll
 
@@ -399,8 +686,9 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
             layer.quant_method.expert_offsets,
             layer.quant_method.problem_sizes1,
             layer.quant_method.problem_sizes2,
-            layer.w13_input_scale,
-            layer.w2_input_scale,
+            # 有 input_scale 走静态, 没有走动态
+            layer.w13_input_scale if getattr(layer, '_has_static_input_scale', False) else None,
+            layer.w2_input_scale if getattr(layer, '_has_static_input_scale', False) else None,
             group_size=self.quant_config.group_size,
         )
 
@@ -411,6 +699,8 @@ class W4AFp8MoEMethod(FusedMoEMethodBase):
         layer: DeepEPMoE,
         dispatch_output: DeepEPNormalDispatchOutput,
     ) -> torch.Tensor:
+        self._reject_humming_nonstandard_dispatch()
+
         from sglang.srt.layers.moe.cutlass_w4a8_moe import (
             cutlass_w4a8_moe_deepep_normal,
         )

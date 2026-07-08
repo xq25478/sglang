@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -138,6 +139,32 @@ class TestJDInternalCIContract(unittest.TestCase):
         self.assertEqual(
             script.count("bash '${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh'"),
             1,
+        )
+
+    def test_humming_version_check_survives_outer_shell_quoting(self):
+        version_check = next(
+            line.strip()
+            for line in self._script().splitlines()
+            if "from importlib.metadata import version" in line
+        )
+        probe = f'payload="\n{version_check}\n"\nprintf "%s" "$payload"\n'
+
+        result = subprocess.run(
+            ["bash", "-c", probe],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            shlex.split(result.stdout.strip()),
+            [
+                "python3",
+                "-c",
+                "from importlib.metadata import version; "
+                "assert version('humming-kernels') == '0.1.11'",
+            ],
         )
 
     def test_sgl_kernel_build_is_enabled_by_default(self):

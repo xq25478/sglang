@@ -579,6 +579,9 @@ class Envs:
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
     SGLANG_FP4_IGNORED_LAYERS = EnvStr("")
 
+    # Quantization (Humming)
+    SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
+
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)

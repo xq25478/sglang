@@ -139,6 +139,7 @@ def benchmark_config(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool,
     topk_ids_list,
     block_shape: List[int] = None,
     ep_size: int = 1,
@@ -170,7 +171,7 @@ def benchmark_config(
             ),
             dtype=torch.int8,
         )
-    elif use_int4_w4a16:
+    elif use_int4_w4a16 or use_int4_w4a8:
         w1 = torch.randint(
             0,
             255,
@@ -208,7 +209,7 @@ def benchmark_config(
             (num_experts, 2 * shard_intermediate_size), dtype=torch.float32
         )
         w2_scale = torch.randn((hidden_size, num_experts), dtype=torch.float32)
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_int4_w4a8:
         block_n = 1 if (block_shape[0] == 0) else block_shape[0]
         block_k = block_shape[1]
         n_tiles_w1 = (shard_intermediate_size + block_n - 1) // block_n
@@ -313,6 +314,7 @@ def benchmark_config(
             moe_inputs[k].num_tokens_post_padded.copy_(num_tokens_post_padded_)
 
     def get_kernel_wrapper(moe_use_tma, inner_iter, use_cuda_graph):
+        moe_use_tma = moe_use_tma and not use_int4_w4a8
         compute_type = (
             tl.bfloat16 if hidden_states.dtype == torch.bfloat16 else tl.float16
         )
@@ -338,6 +340,7 @@ def benchmark_config(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int4_w4a8,
             per_channel_quant=False,
             block_shape=block_shape,
             b_use_tma=moe_use_tma,
@@ -364,6 +367,7 @@ def benchmark_config(
             use_int8_w8a8=use_int8_w8a8,
             use_int8_w8a16=use_int8_w8a16,
             use_int4_w4a16=use_int4_w4a16,
+            use_int4_w4a8=use_int4_w4a8,
             per_channel_quant=False,
             block_shape=block_shape,
             a_use_tma=moe_use_tma,
@@ -467,6 +471,7 @@ class BenchmarkWorker:
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool,
+        use_int4_w4a8: bool,
         block_shape: List[int],
         cfg: Dict[str, int],
         topk_ids_dir: str,
@@ -487,6 +492,7 @@ class BenchmarkWorker:
                 use_int8_w8a8,
                 use_int8_w8a16,
                 use_int4_w4a16,
+                use_int4_w4a8,
                 topk_ids_list,
                 block_shape,
                 ep_size=ep_size,
@@ -505,6 +511,7 @@ class BenchmarkWorker:
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool,
+        use_int4_w4a8: bool,
         block_shape: List[int],
         search_space: List[Dict[str, int]],
         topk_ids_dir: str,
@@ -529,6 +536,7 @@ class BenchmarkWorker:
                         use_int8_w8a8,
                         use_int8_w8a16,
                         use_int4_w4a16,
+                        use_int4_w4a8,
                         topk_ids_list,
                         block_shape,
                         ep_size=ep_size,
@@ -574,6 +582,7 @@ class BenchmarkWorker:
         use_int8_w8a8: bool,
         use_int8_w8a16: bool,
         use_int4_w4a16: bool,
+        use_int4_w4a8: bool,
         block_shape: List[int],
         cmp_config_files: List[str],
         topk_ids_dir: str,
@@ -610,6 +619,7 @@ class BenchmarkWorker:
                         use_int8_w8a8,
                         use_int8_w8a16,
                         use_int4_w4a16,
+                        use_int4_w4a8,
                         topk_ids_list,
                         block_shape,
                         ep_size=ep_size,
@@ -631,6 +641,7 @@ def save_configs_sep(
     use_int8_w8a8: bool,
     use_int8_w8a16: bool,
     use_int4_w4a16: bool,
+    use_int4_w4a8: bool,
     block_shape: List[int],
     down_moe: bool = False,
 ) -> None:
@@ -640,13 +651,17 @@ def save_configs_sep(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int4_w4a16=use_int4_w4a16,
+        use_int4_w4a8=use_int4_w4a8,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
+    config_n = shard_intermediate_size // 2
+    if use_int4_w4a16 or use_int4_w4a8:
+        config_n //= 2
     filename = get_config_file_name(
         num_experts,
-        shard_intermediate_size // 2,
+        config_n,
         dtype_str,
         block_shape,
         down_moe=down_moe,
@@ -684,6 +699,9 @@ def main(args: argparse.Namespace):
     use_int8_w8a8 = args.dtype == "int8_w8a8"
     use_int8_w8a16 = args.dtype == "int8_w8a16"
     use_int4_w4a16 = args.dtype == "int4_w4a16"
+    use_int4_w4a8 = args.dtype == "int4_w4a8"
+    if use_int4_w4a8:
+        block_shape = [0, 128]
 
     topk_ids_dir = args.topk_ids_dir
     if args.batch_size is None:
@@ -705,6 +723,7 @@ def main(args: argparse.Namespace):
             use_int8_w8a8,
             use_int8_w8a16,
             use_int4_w4a16,
+            use_int4_w4a8,
             block_shape,
             args.cmp_configs,
             topk_ids_dir,
@@ -727,6 +746,7 @@ def main(args: argparse.Namespace):
                 use_int8_w8a8,
                 use_int8_w8a16,
                 use_int4_w4a16,
+                use_int4_w4a8,
                 block_shape,
                 search_space,
                 topk_ids_dir,
@@ -753,6 +773,7 @@ def main(args: argparse.Namespace):
                 use_int8_w8a8,
                 use_int8_w8a16,
                 use_int4_w4a16,
+                use_int4_w4a8,
                 block_shape,
                 cfg,
                 topk_ids_dir,
@@ -782,7 +803,13 @@ def main(args: argparse.Namespace):
         return ray.get(outputs)
 
     search_space = get_configs_compute_bound()
-    if block_shape is not None:
+    if use_int4_w4a8:
+        search_space = [
+            config
+            for config in search_space
+            if config["BLOCK_SIZE_K"] == block_shape[1]
+        ]
+    elif block_shape is not None:
         block_n, block_k = block_shape[0], block_shape[1]
         search_space = [
             config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
@@ -797,6 +824,7 @@ def main(args: argparse.Namespace):
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_int4_w4a8,
         False,
         block_shape,
     )
@@ -819,6 +847,7 @@ def main(args: argparse.Namespace):
                 use_int8_w8a8,
                 use_int8_w8a16,
                 use_int4_w4a16,
+                use_int4_w4a8,
                 block_shape,
                 search_space,
                 topk_ids_dir,
@@ -848,6 +877,7 @@ def main(args: argparse.Namespace):
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_int4_w4a8,
         block_shape,
     )
 
@@ -863,6 +893,7 @@ def main(args: argparse.Namespace):
         use_int8_w8a8,
         use_int8_w8a16,
         use_int4_w4a16,
+        use_int4_w4a8,
         block_shape,
         down_moe=True,
     )
@@ -880,7 +911,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dtype",
         type=str,
-        choices=["auto", "fp8_w8a8", "int8_w8a16", "int8_w8a8", "int8_w4a16"],
+        choices=[
+            "auto",
+            "fp8_w8a8",
+            "int8_w8a16",
+            "int8_w8a8",
+            "int4_w4a16",
+            "int4_w4a8",
+        ],
         default="auto",
     )
     parser.add_argument("--seed", type=int, default=0)

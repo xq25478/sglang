@@ -41,6 +41,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    maybe_calibrate_flashinfer_w4a8,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
 )
@@ -77,6 +78,7 @@ def _allocate_decode_buffers(
     num_tokens_per_bs: int,
     cache_loc_dtype: torch.dtype,
     enable_mamba_track: bool,
+    allocate_logits_buffer: bool = True,
     ne_token_table: Optional[torch.Tensor] = None,
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
@@ -95,9 +97,13 @@ def _allocate_decode_buffers(
             (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
             dtype=torch.bool,
         )
-        next_token_logits_buffer = torch.zeros(
-            (max_num_token, vocab_size),
-            dtype=torch.float,
+        next_token_logits_buffer = (
+            torch.zeros(
+                (max_num_token, vocab_size),
+                dtype=torch.float,
+            )
+            if allocate_logits_buffer
+            else None
         )
         mamba_track_indices = (
             torch.zeros((max_bs,), dtype=torch.int64) if enable_mamba_track else None
@@ -219,6 +225,7 @@ class BaseRunner(ABC):
             assert (
                 buffers is not None
             ), "_autotune_buffers() must return a reusable buffer set for autotune"
+            maybe_calibrate_flashinfer_w4a8(self)
             self._flashinfer_autotune(buffers=buffers, batch_size=batch_size)
 
         if (
@@ -259,13 +266,65 @@ class BaseRunner(ABC):
         Supplied by warmup() (the decode runner's captured buffers when a graph
         runner exists; a freshly-allocated dummy set in the eager path).
         """
+        mr = self.model_runner
+
+        def canary_run_ctx():
+            return (
+                c.with_active_single_forward_manager(0)
+                if (c := mr.canary_manager) is not None
+                else empty_context()
+            )
 
         def forward_fn():
-            self._dummy_run(batch_size=batch_size, buffers=buffers)
+            self._dummy_run(
+                batch_size=batch_size,
+                buffers=buffers,
+                run_ctx=canary_run_ctx(),
+            )
+            prefill_tokens = self._flashinfer_autotune_prefill_batch_size()
+            if prefill_tokens:
+                logger.info(
+                    "FlashInfer autotune: warming EXTEND shape with %d tokens",
+                    prefill_tokens,
+                )
+                try:
+                    prefill_buffers = self._alloc_dummy_decode_buffers(
+                        max_bs=1,
+                        num_tokens_per_bs=prefill_tokens,
+                        allocate_logits_buffer=False,
+                    )
+                    self._dummy_run(
+                        batch_size=1,
+                        buffers=prefill_buffers,
+                        num_tokens_override=prefill_tokens,
+                        forward_mode_override=ForwardMode.EXTEND,
+                        run_ctx=canary_run_ctx(),
+                    )
+                except Exception:
+                    logger.warning(
+                        "FlashInfer prefill autotune warmup failed; "
+                        "prefill may use fallback tactics",
+                        exc_info=True,
+                    )
 
         run_flashinfer_autotune_forward(self.model_runner, forward_fn, skip_logits=True)
 
-    def _alloc_dummy_decode_buffers(self, max_bs: int, *, num_tokens_per_bs: int = 1):
+    def _flashinfer_autotune_prefill_batch_size(self) -> Optional[int]:
+        server_args = self.model_runner.server_args
+        if server_args.moe_runner_backend not in (
+            "flashinfer_cutlass",
+            "flashinfer_trtllm",
+        ):
+            return None
+        return min(server_args.chunked_prefill_size or 8192, 8192)
+
+    def _alloc_dummy_decode_buffers(
+        self,
+        max_bs: int,
+        *,
+        num_tokens_per_bs: int = 1,
+        allocate_logits_buffer: bool = True,
+    ):
         """Allocate one static decode-buffer set for a dummy forward, sized to
         (max_bs, max_bs * num_tokens_per_bs).
 
@@ -277,7 +336,7 @@ class BaseRunner(ABC):
         reuses the captured runner buffers instead.
         """
         mr = self.model_runner
-        return _allocate_decode_buffers(
+        buffers = _allocate_decode_buffers(
             device=mr.device,
             max_bs=max_bs,
             max_num_token=max_bs * num_tokens_per_bs,
@@ -297,9 +356,11 @@ class BaseRunner(ABC):
             num_tokens_per_bs=num_tokens_per_bs,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=False,
+            allocate_logits_buffer=allocate_logits_buffer,
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
         )
+        return buffers
 
     def _dummy_run(
         self,
@@ -308,6 +369,7 @@ class BaseRunner(ABC):
         forward_mode_override: Optional[ForwardMode] = None,
         *,
         buffers,
+        num_tokens_override: Optional[int] = None,
     ):
         """Run a dummy forward pass for warmup/profiling.
 
@@ -350,6 +412,19 @@ class BaseRunner(ABC):
             capture_hidden_mode = CaptureHiddenMode.FULL
 
         num_tokens = batch_size * num_tokens_per_bs
+        if num_tokens_override is not None:
+            if num_tokens_override <= 0:
+                raise ValueError(
+                    "num_tokens_override must be positive, got "
+                    f"{num_tokens_override}"
+                )
+            if capture_forward_mode != ForwardMode.EXTEND:
+                if num_tokens_override != num_tokens:
+                    raise ValueError(
+                        "num_tokens_override may change the natural token count "
+                        "only for EXTEND forwards"
+                    )
+            num_tokens = int(num_tokens_override)
 
         # Caller owns the shape: passes a static buffer >= the dummy shape; no
         # allocation, no re-padding (would overflow the reused buffers).
@@ -411,20 +486,68 @@ class BaseRunner(ABC):
 
         buffers.num_token_non_padded[...] = num_tokens
 
+        if num_tokens_override is not None:
+            vocab_size = max(int(mr.model_config.vocab_size), 1)
+            deterministic_ids = (
+                torch.arange(num_tokens, dtype=torch.int64, device=input_ids.device)
+                * 1103515245
+                + 12345
+            ) % vocab_size
+            input_ids.copy_(deterministic_ids)
+
         # For extend mode
         if capture_forward_mode == ForwardMode.EXTEND:
             extend_prefix_lens_cpu = [0] * batch_size
-            extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
             extend_num_tokens = num_tokens
-            extend_seq_lens = torch.full(
-                (batch_size,), seq_len_fill_value, dtype=torch.int32, device=mr.device
-            )
             extend_prefix_lens = torch.zeros(
                 (batch_size,), dtype=torch.int32, device=mr.device
             )
-            extend_start_loc = torch.arange(
-                0, num_tokens, num_tokens_per_bs, dtype=torch.int32, device=mr.device
-            )
+            if num_tokens_override is not None:
+                if num_tokens < batch_size:
+                    raise ValueError(
+                        "EXTEND dummy run needs at least one token per request: "
+                        f"num_tokens={num_tokens}, batch_size={batch_size}"
+                    )
+                tokens_per_request, remainder = divmod(num_tokens, batch_size)
+                extend_seq_lens_cpu = [
+                    tokens_per_request + (index < remainder)
+                    for index in range(batch_size)
+                ]
+                extend_seq_lens = torch.tensor(
+                    extend_seq_lens_cpu, dtype=torch.int32, device=mr.device
+                )
+                extend_start_loc = torch.cat(
+                    (
+                        torch.zeros(1, dtype=torch.int32, device=mr.device),
+                        extend_seq_lens.cumsum(0)[:-1],
+                    )
+                )
+                seq_lens.copy_(extend_seq_lens.to(dtype=seq_lens.dtype))
+                seq_lens_cpu.copy_(
+                    torch.tensor(extend_seq_lens_cpu, dtype=seq_lens_cpu.dtype)
+                )
+                position_values = torch.cat(
+                    [
+                        torch.arange(length, dtype=torch.int64)
+                        for length in extend_seq_lens_cpu
+                    ]
+                ).to(device=positions.device)
+                positions.copy_(position_values)
+            else:
+                extend_seq_lens_cpu = [seq_len_fill_value] * batch_size
+                extend_seq_lens = torch.full(
+                    (batch_size,),
+                    seq_len_fill_value,
+                    dtype=torch.int32,
+                    device=mr.device,
+                )
+                extend_start_loc = torch.arange(
+                    0,
+                    num_tokens,
+                    num_tokens_per_bs,
+                    dtype=torch.int32,
+                    device=mr.device,
+                )
         else:
             extend_prefix_lens_cpu = None
             extend_seq_lens_cpu = None
