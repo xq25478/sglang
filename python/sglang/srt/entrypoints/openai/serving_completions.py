@@ -85,6 +85,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
         else:
             logprob_start_len = -1
 
+        self._maybe_apply_deepseek_ocr_custom_logit_processor(request)
         # Build sampling parameters
         sampling_params = self._build_sampling_params(request)
 

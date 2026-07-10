@@ -520,6 +520,10 @@ def register_conv_template_matching_function(func):
 
 
 def get_conv_template_by_model_path(model_path):
+    # DeepSeek-OCR-2 checkpoints keep model_type=deepseek_vl_v2, so the generic
+    # model_type matcher would otherwise select the DeepSeek-VL2 chat template.
+    if "deepseek-ocr" in model_path.lower():
+        return "deepseek-ocr"
     for matching_func in matching_function_registry:
         conv_name = matching_func(model_path)
         if conv_name is not None:
@@ -691,6 +695,17 @@ def generate_chat_conv(
                     real_content = _get_full_multimodal_text_prompt(
                         conv.image_token, num_image_url, real_content
                     )
+                if conv.name == "deepseek-ocr" and num_image_url > 0:
+                    explicit_token = conv.image_token + "\n"
+                    while real_content.count(
+                        conv.image_token
+                    ) > num_image_url and real_content.startswith(explicit_token * 2):
+                        real_content = (
+                            explicit_token + real_content[len(explicit_token) * 2 :]
+                        )
+                    while real_content.count(conv.image_token) > num_image_url:
+                        real_content = real_content.replace(explicit_token, "", 1)
+                    real_content = real_content.strip()
                 conv.append_message(conv.roles[0], real_content)
         elif msg_role == "assistant":
             parsed_content = ""

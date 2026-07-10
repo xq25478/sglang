@@ -1,5 +1,6 @@
 from typing import List, Union
 
+from sglang.srt.configs.deepseek_ocr import get_default_deepseek_ocr_image_size
 from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
 from sglang.srt.models.deepseek_ocr import DeepseekOCRForCausalLM
 from sglang.srt.multimodal.processors.base_processor import (
@@ -12,7 +13,7 @@ class DeepseekOCRProcessor(BaseMultimodalProcessor):
     models = [DeepseekOCRForCausalLM]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
-        _processor.image_size = 640
+        _processor.image_size = get_default_deepseek_ocr_image_size()
         _processor.ocr2_mode = (
             str(
                 getattr(getattr(hf_config, "vision_config", None), "model_name", "")

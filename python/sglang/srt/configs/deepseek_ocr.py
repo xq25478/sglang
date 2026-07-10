@@ -16,6 +16,7 @@ from transformers import (
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
 )
+from sglang.srt.environ import envs
 from sglang.srt.sampling.custom_logit_processor import (
     DeepseekOCRNoRepeatNGramLogitProcessor,
 )
@@ -23,7 +24,6 @@ from sglang.srt.sampling.custom_logit_processor import (
 DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
-IMAGE_SIZE = 640
 CROP_MODE = True
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
@@ -33,12 +33,18 @@ PRINT_NUM_VIS_TOKENS = False
 SKIP_REPEAT = True
 MODEL_PATH = "deepseek-ai/DeepSeek-OCR"  # change to your model path
 
-NGRAM_NO_REPEAT_SIZE = 30
+NGRAM_NO_REPEAT_SIZE = 20
 NGRAM_NO_REPEAT_WINDOW = 90
-# Whitelist `<td>` and `</td>` token ids to allow table structures.
 NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
 
 DEFAULT_CUSTOM_LOGIT_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
+
+
+def get_default_deepseek_ocr_image_size() -> int:
+    return envs.SGLANG_DEEPSEEK_OCR_DEFAULT_IMAGE_SIZE.get()
+
+
+IMAGE_SIZE = get_default_deepseek_ocr_image_size()
 
 
 def get_default_ngram_custom_params() -> Dict[str, Any]:
@@ -219,8 +225,11 @@ def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_
 
 
 def dynamic_preprocess(
-    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=640, use_thumbnail=False
+    image, min_num=MIN_CROPS, max_num=MAX_CROPS, image_size=None, use_thumbnail=False
 ):
+    if image_size is None:
+        image_size = get_default_deepseek_ocr_image_size()
+
     orig_width, orig_height = get_image_size(image)
     aspect_ratio = orig_width / orig_height
 
@@ -288,7 +297,7 @@ class DeepseekOCRProcessor(ProcessorMixin):
     ):
 
         self.candidate_resolutions = candidate_resolutions
-        self.image_size = candidate_resolutions[0][0]
+        self.image_size = get_default_deepseek_ocr_image_size()
         self.patch_size = patch_size
         self.image_mean = image_mean
         self.image_std = image_std
@@ -544,18 +553,18 @@ class DeepseekOCRProcessor(ProcessorMixin):
             img_w, img_h = get_image_size(image)
             image_shapes.append((img_w, img_h))
 
-            if img_w <= 640 and img_h <= 640:
+            if img_w <= self.image_size and img_h <= self.image_size:
                 crop_ratio = [1, 1]
             else:
                 if cropping:
                     images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=IMAGE_SIZE
+                        image, image_size=self.image_size
                     )
                 else:
                     crop_ratio = [1, 1]
 
             """process the global view"""
-            if self.image_size <= 640 and not cropping:
+            if not cropping:
                 image = resize_image(image, (self.image_size, self.image_size))
 
             global_view = pad_image(

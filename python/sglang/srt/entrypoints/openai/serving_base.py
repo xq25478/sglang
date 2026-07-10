@@ -37,6 +37,43 @@ class OpenAIServingBase(ABC):
             else None
         )
 
+    def _is_deepseek_ocr_model(self) -> bool:
+        model_config = getattr(self.tokenizer_manager, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        if hf_config is None:
+            return False
+
+        architectures = getattr(hf_config, "architectures", None) or []
+        model_type = getattr(hf_config, "model_type", None)
+
+        return (
+            model_type == "deepseek-ocr"
+            or "DeepseekOCRForCausalLM" in architectures
+            or "DeepseekOCR2ForCausalLM" in architectures
+        )
+
+    def _maybe_apply_deepseek_ocr_custom_logit_processor(
+        self, request: OpenAIServingRequest
+    ) -> None:
+        if (
+            getattr(request, "custom_logit_processor", None) is not None
+            or not self._is_deepseek_ocr_model()
+        ):
+            return
+
+        from sglang.srt.configs.deepseek_ocr import get_default_ngram_custom_params
+        from sglang.srt.sampling.custom_logit_processor import (
+            DeepseekOCRNoRepeatNGramLogitProcessor,
+        )
+
+        request.custom_params = {
+            **get_default_ngram_custom_params(),
+            **(getattr(request, "custom_params", None) or {}),
+        }
+        request.custom_logit_processor = (
+            DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
+        )
+
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
 
