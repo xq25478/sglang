@@ -44,6 +44,7 @@ class MLPSyncBatchInfo:
 
     # some gathered elements
     tp0_info: torch.Tensor = None
+    tbo_info: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
@@ -132,31 +133,22 @@ class MLPSyncBatchInfo:
             flat_info[tp_active_ranks == 0] = fallback
 
             tp0_compressed = global_info_tensor[:, 0, :]
-
-            self.tp0_info = torch.zeros(
-                (self.dp_size, 7), dtype=torch.int64, device=device
-            )
-            self.tp0_info[:, 0] = tp0_compressed[:, 0].to(torch.int64)
-            self.tp0_info[:, 1] = tp0_compressed[:, 1].to(torch.int64)
-
+            self.tp0_info = tp0_compressed
             flags = tp0_compressed[:, 2]
-            self.tp0_info[:, 2] = (flags & 0b001).ne(0).to(torch.int64)
-            self.tp0_info[:, 3] = (flags & 0b010).ne(0).to(torch.int64)
-            self.tp0_info[:, 4] = (flags & 0b100).ne(0).to(torch.int64)
-            self.tp0_info[:, 5] = tp0_compressed[:, 3].to(torch.int64)
-            self.tp0_info[:, 6] = tp0_compressed[:, 4].to(torch.int64)
-
-            cpu_data = self.tp0_info[:, :2].cpu()
+            self.tbo_info = torch.stack(
+                ((flags & 0b100).ne(0), tp0_compressed[:, 3]), dim=1
+            )
+            cpu_data = tp0_compressed[:, :2].cpu()
             self.global_num_tokens = cpu_data[:, 0].tolist()
             self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
-            self.can_cuda_graph = bool(self.tp0_info[:, 2].min().item())
-            self.is_extend_in_batch = bool(self.tp0_info[:, 3].max().item())
+            self.can_cuda_graph = bool((flags & 0b001).ne(0).min().item())
+            self.is_extend_in_batch = bool((flags & 0b010).ne(0).max().item())
             self.can_run_breakable_cuda_graph = bool(
-                self.tp0_info[:, 6].min().item()
+                tp0_compressed[:, 4].min().item()
             )
             if _ENABLE_METRICS_DP_ATTENTION:
                 self.dp_cooperation_info = DPCooperationInfo.create(
-                    self.tp0_info[:, 5].tolist()
+                    tp0_compressed[:, 3].tolist()
                 )
         else:
             local_info_tensor = self._get_local_tensor(device=device)
@@ -181,6 +173,7 @@ class MLPSyncBatchInfo:
 
             tp0_info = global_info_tensor[:, 0, :]
             self.tp0_info = tp0_info
+            self.tbo_info = tp0_info[:, 4:6]
             # Perform only one Device-to-Host (D2H) memory copy
             cpu_data = tp0_info[:, :2].cpu()
             self.global_num_tokens = cpu_data[:, 0].tolist()
@@ -304,7 +297,7 @@ def prepare_mlp_sync_batch_raw(
 
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
-                mlp_sync_info.tp0_info[:, 4:6],
+                mlp_sync_info.tbo_info,
             )
         )
 
