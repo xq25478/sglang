@@ -1,0 +1,4 @@
+interface:
+  display_name: "JD Release Rebase"
+  short_description: "Rebuild JD releases safely on new SGLang community tags"
+  default_prompt: "Use $xq-sglang-jd-release-rebase to port the current JD release line onto a newly published SGLang tag."

@@ -48,7 +48,13 @@ coverage.xml
 *.cover
 *.py,cover
 .hypothesis/
+test/jd-ci/ci_log
+test/jd-ci/ci_logs/
+test/jd-ci/tmp/
 
+test/jd-ci/results/
+test/jd-ci/__pycache__/
+test/jd-ci/data/eval/__pycache__/
 # Tokenizer cache for tests
 .tokenizer_cache/
 .pytest_cache/
@@ -283,3 +289,4 @@ test/registered/xpu/test_nvidia_nemotron_3_nano.py
 artifacts/
 .claude/scheduled_tasks.lock
 .humanize/
+ci_log

@@ -1,0 +1,31 @@
+{
+  "auto_promote_kinds": [
+    "path-symbol-mapping",
+    "validation-addition",
+    "failure-signature",
+    "api-rename-adaptation"
+  ],
+  "forbidden_action_patterns": [
+    "skip required verification",
+    "relax accuracy tolerance",
+    "relax performance threshold",
+    "turn unverified evidence into a pass",
+    "automatically classify an internal fix as absorbed-semantic"
+  ],
+  "mandatory_review_kinds": [
+    "semantic-equivalence",
+    "absorbed-semantic",
+    "internal-fix-retirement",
+    "case-retirement",
+    "conflict-behavior",
+    "dependency-choice",
+    "accuracy-threshold",
+    "performance-threshold",
+    "model-gpu-scope",
+    "hard-boundary-change",
+    "publication-policy"
+  ],
+  "minimum_independent_evidence": 2,
+  "schema_version": 1,
+  "skill": "xq-sglang-jd-release-rebase"
+}

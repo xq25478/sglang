@@ -108,7 +108,10 @@ def run_eval(args):
     if args.eval_name == "mmlu":
         from sglang.test.simple_eval_mmlu import MMLUEval
 
-        filename = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        filename = (
+            args.mmlu_data_path
+            or "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
+        )
         eval_obj = MMLUEval(filename, args.num_examples, args.num_threads)
     elif args.eval_name == "math":
         from sglang.test.simple_eval_math import MathEval
@@ -269,11 +272,13 @@ def run_eval(args):
     # Dump reports
     file_stem = f"{args.eval_name}_{sampler.model.replace('/', '_')}"
     report_filename = f"/tmp/{file_stem}.html"
+    os.makedirs(os.path.dirname(report_filename), exist_ok=True)
     print(f"Writing report to {report_filename}")
     with open(report_filename, "w") as fh:
         fh.write(make_report(result))
     print(metrics)
     result_filename = f"/tmp/{file_stem}.json"
+    os.makedirs(os.path.dirname(result_filename), exist_ok=True)
     with open(result_filename, "w") as f:
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
@@ -319,6 +324,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
+    parser.add_argument(
+        "--mmlu-data-path",
+        type=str,
+        default=None,
+        help="Path to a local MMLU csv file. Uses the public simple-evals url if unset.",
+    )
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)

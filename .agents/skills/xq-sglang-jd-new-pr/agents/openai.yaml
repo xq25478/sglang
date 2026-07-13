@@ -1,0 +1,4 @@
+interface:
+  display_name: "JD New PR Test Author"
+  short_description: "Analyze JD branch changes and add focused regression tests"
+  default_prompt: "Use $xq-sglang-jd-new-pr to compare this JD branch with its target base and add the required JD-only regression cases."

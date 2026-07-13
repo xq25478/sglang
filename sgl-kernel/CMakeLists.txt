@@ -174,6 +174,7 @@ option(SGL_KERNEL_ENABLE_BF16             "Enable BF16"             ON)
 option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SGL_KERNEL_ENABLE_FA3})
+option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -424,23 +425,14 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     file(GLOB FA3_BF16_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_bf16*_sm90.cu")
-    file(GLOB FA3_BF16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
 
     # FP16 source files - use individual hdim files instead of hdimall to avoid ptxas crash
     file(GLOB FA3_FP16_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_fp16*_sm90.cu")
-    file(GLOB FA3_FP16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
 
     # FP8 source files
     file(GLOB FA3_FP8_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_e4m3*_sm90.cu")
-    file(GLOB FA3_FP8_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
-    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
 
@@ -472,6 +464,9 @@ if (SGL_KERNEL_ENABLE_FA3)
 
     if(NOT ENABLE_BELOW_SM90)
         list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
+    endif()
+    if(NOT SGL_KERNEL_ENABLE_FA3_SPARSE_MASK)
+        list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SPARSE_MASK)
     endif()
     target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
 endif()

@@ -58,6 +58,28 @@ using fp8x2_e4m3_t = uint16_t;
 
 static constexpr uint32_t kWarpSize = 32;
 
+template <uint32_t kRopeSize>
+__device__ __forceinline__ bool is_tail_rope_lane(uint32_t lane_id) {
+  static_assert(kRopeSize <= kWarpSize);
+  constexpr uint32_t kRopeLaneStart = kWarpSize - kRopeSize;
+  if constexpr (kRopeLaneStart == 0) {
+    return true;
+  } else {
+    return lane_id >= kRopeLaneStart;
+  }
+}
+
+template <uint32_t kRopeSize>
+__device__ __forceinline__ uint32_t tail_rope_id(uint32_t lane_id) {
+  static_assert(kRopeSize <= kWarpSize);
+  constexpr uint32_t kRopeLaneStart = kWarpSize - kRopeSize;
+  if constexpr (kRopeLaneStart == 0) {
+    return lane_id;
+  } else {
+    return lane_id - kRopeLaneStart;
+  }
+}
+
 template <uint32_t kNumThreads = kWarpSize>
 __device__ __forceinline__ float warp_reduce_sum(float val) {
 #pragma unroll
@@ -278,11 +300,11 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_norm_rope_kernel
   }
 
   // Stash rope tail into shared memory; write nope tiles to gmem.
-  const bool is_rope_lane = lane_id >= kWarpSize - kRopeSize;
+  const bool is_rope_lane = is_tail_rope_lane<kRopeSize>(lane_id);
 #pragma unroll
   for (int i = 0; i < kLocalSize; ++i) {
     if (i == kLocalSize - 1 && is_rope_lane) {
-      const auto rope_id = lane_id - (kWarpSize - kRopeSize);
+      const auto rope_id = tail_rope_id<kRopeSize>(lane_id);
       s_rope[warp_id][rope_id] = input_vec[i];
     } else {
       input_vec[i].store(output_ptr, lane_id + i * kWarpSize);
@@ -436,7 +458,7 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_had
   const auto warp_id = threadIdx.x / kWarpSize;
   const auto lane_id = threadIdx.x % kWarpSize;
   const auto work_id = blockIdx.x * kFusedQNumWarps + warp_id;
-  const bool is_rope_lane = lane_id >= kWarpSize - kRopeSize;
+  const bool is_rope_lane = is_tail_rope_lane<kRopeSize>(lane_id);
 
   const uint32_t total_works = params.batch_size * params.num_heads;
   if (work_id >= total_works) return;
@@ -453,7 +475,7 @@ __global__ __launch_bounds__(kFusedQBlockSize, 16) void fused_q_indexer_rope_had
   {
     Storage input_vec;
     input_vec.load(input_ptr, lane_id);
-    if (is_rope_lane) freq.load(freqs_cis, lane_id - (kWarpSize - kRopeSize));
+    if (is_rope_lane) freq.load(freqs_cis, tail_rope_id<kRopeSize>(lane_id));
 #pragma unroll
     for (int i = 0; i < kVecSize; ++i)
       data[i] = bf16_to_float(input_vec[i]);
