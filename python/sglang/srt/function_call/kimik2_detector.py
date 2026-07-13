@@ -184,6 +184,16 @@ class KimiK2Detector(BaseFormatDetector):
             local_tool_index = 0
             for match in function_call_tuples:
                 function_id, function_args = match
+                if function_args.startswith('"'):
+                    try:
+                        decoded_arguments = json.loads(function_args + '"')
+                        if isinstance(decoded_arguments, str):
+                            function_args = decoded_arguments
+                    except json.JSONDecodeError:
+                        logger.debug(
+                            "Failed to decode quoted Kimi K2 arguments: %s",
+                            function_args,
+                        )
                 function_name, _ = self._parse_tool_call_id(
                     function_id, tools, function_args
                 )
