@@ -375,7 +375,11 @@ class MQALayer(nn.Module):
             self.register_buffer("cos_cache", cos_cache, persistent=False)
             self.register_buffer("sin_cache", sin_cache, persistent=False)
 
-        if envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get() and alt_streams is not None:
+        use_multi_streams = (
+            envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            or envs.SGLANG_OPT_USE_CP_MULTI_STREAM_OVERLAP.get()
+        )
+        if use_multi_streams and alt_streams is not None:
             self.alt_streams = alt_streams[:3]
             self.alt_streams_indexer = alt_streams[-2:]
         else:
@@ -635,6 +639,86 @@ class MQALayer(nn.Module):
         current_stream.wait_stream(stream_indexer)
 
         return q
+
+    def _forward_prepare_multi_stream_cp(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Overlap DSA prefill-CP preparation while preserving KV semantics.
+
+        KV projection, CP all-gather, and the full-KV cache write stay ordered on
+        one stream.  Indexer/compressor work and Q projection are independent and
+        may execute concurrently.  The caller joins all streams before launching
+        attention, so the gathered KV and compressor metadata are ready.
+        """
+        assert self.alt_streams is not None
+        assert len(self.alt_streams) >= 3
+
+        current_stream = torch.cuda.current_stream()
+        stream_kv = self.alt_streams[0]
+        stream_compressor = self.alt_streams[1]
+        stream_indexer = self.alt_streams[2]
+
+        stream_kv.wait_stream(current_stream)
+        stream_compressor.wait_stream(current_stream)
+        stream_indexer.wait_stream(current_stream)
+
+        x_linear = x_quant if x_quant is not None else x
+        qkv_a: Optional[torch.Tensor] = None
+        qkv_a_ready: Optional[torch.cuda.Event] = None
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+            qkv_a_ready = current_stream.record_event()
+
+        q_lora = self._compute_q_a(x_linear, qkv_a=qkv_a)
+        q_lora_ready = current_stream.record_event()
+
+        if self.indexer is not None:
+            with torch.cuda.stream(stream_indexer):
+                self.indexer(
+                    x=x,
+                    q_lora=q_lora,
+                    forward_batch=forward_batch,
+                    attn_backend=attn_backend,
+                    enable_multi_stream=True,
+                    q_lora_ready=q_lora_ready,
+                )
+
+        with torch.cuda.stream(stream_kv):
+            if qkv_a_ready is not None:
+                stream_kv.wait_event(qkv_a_ready)
+            kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
+            kv = cp_all_gather_rerange_output(
+                kv.contiguous(),
+                self.cp_size,
+                forward_batch,
+                stream_kv,
+            )
+            attn_backend.store_cache(
+                layer_id=self.layer_id,
+                swa_k=kv,
+                forward_batch=forward_batch,
+            )
+
+        del qkv_a
+
+        if self.compressor is not None:
+            with torch.cuda.stream(stream_compressor):
+                attn_backend.forward_core_compressor(
+                    x, forward_batch, self.layer_id, self.compressor
+                )
+
+        q = self._compute_q_b(q_lora, positions, q_out)
+        current_stream.wait_stream(stream_kv)
+        current_stream.wait_stream(stream_compressor)
+        current_stream.wait_stream(stream_indexer)
+
+        return q, kv
 
     def _forward_prepare_multi_stream_hip(
         self,
@@ -950,12 +1034,19 @@ class MQALayer(nn.Module):
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
 
+        use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        enable_cp_multi_stream = (
+            envs.SGLANG_OPT_USE_CP_MULTI_STREAM_OVERLAP.get()
+            and self.alt_streams is not None
+            and use_cp
+            and not _is_hip
+        )
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
             and get_is_capture_mode()
             and x.shape[0] <= self._multi_stream_bs_limit
-            and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+            and not use_cp
             and not (_is_hip and self.compressor is None)
         )
 
@@ -986,7 +1077,16 @@ class MQALayer(nn.Module):
                 ]
                 self._attn_sink_local = sink
 
-        if enable_multi_stream:
+        if enable_cp_multi_stream:
+            q, kv = self._forward_prepare_multi_stream_cp(
+                x,
+                positions,
+                forward_batch,
+                attn_backend,
+                q_out,
+                x_quant=x_quant,
+            )
+        elif enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             if _is_hip:
@@ -1854,6 +1954,7 @@ class DeepseekV4Model(nn.Module):
             and (
                 envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
                 or envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                or envs.SGLANG_OPT_USE_CP_MULTI_STREAM_OVERLAP.get()
             )
         )
         num_alt_streams = 5 if _is_cuda else 2
