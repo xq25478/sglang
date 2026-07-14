@@ -28,6 +28,8 @@ INTERNAL_COMMITS: tuple[str, ...] = (
     "77465c63d4bf9d5500132e29a0d8e47f60eead8c",
     "222b102f00f8bb7ddbedc887bc32d33755794f73",
     "fb21094805856bc73899df4d2d46beeece26a352",
+    "1625f1cbcd97c6e99acf70904f84112b8dfe713a",
+    "1bbc3102c77fd9e6aa6896658d1387a3bf93dba1",
 )
 
 VALID_CATEGORIES = frozenset(
@@ -83,6 +85,20 @@ CASES: tuple[JDCase, ...] = (
             "-v",
         ),
         assertion="JD runtime, multimodal, EPLB, CUDA-graph, CP, quantization, and OCR branches",
+    ),
+    JDCase(
+        case_id="jd-dsv4-inference-buffer-copy",
+        commits=(
+            "225d4b2fcc2d95b9f9929266a6c22c2ff3b104b9",
+            "1bbc3102c77fd9e6aa6896658d1387a3bf93dba1",
+        ),
+        category="cpu",
+        command=(
+            "python3",
+            "test/jd-ci/unit/server/test_dsv4_inference_buffer_copy.py",
+            "-v",
+        ),
+        assertion="DSV4 decode and verify metadata support persistent inference tensors",
     ),
     JDCase(
         case_id="jd-metrics-cache",
@@ -216,6 +232,26 @@ CASES: tuple[JDCase, ...] = (
         min_gpus=1,
         operator="dsv4_norm_rope",
         tracks_ci_head=True,
+    ),
+    JDCase(
+        case_id="jd-moe-fused-gate-correctness",
+        commits=("1625f1cbcd97c6e99acf70904f84112b8dfe713a",),
+        category="operator_correctness",
+        command=("python3", "test/jd-ci/operators/test_moe_fused_gate.py"),
+        assertion="Real MoE fused-gate dispatch and Triton paths match the Torch reference",
+        min_gpus=1,
+        timeout_seconds=300,
+        operator="moe_fused_gate",
+    ),
+    JDCase(
+        case_id="jd-moe-fused-gate-performance",
+        commits=("1625f1cbcd97c6e99acf70904f84112b8dfe713a",),
+        category="operator_performance",
+        command=("python3", "test/jd-ci/operators/bench_moe_fused_gate.py"),
+        assertion="DSV4 MoE fused-gate stays within its relative gate against the legacy CUDA reference",
+        min_gpus=1,
+        timeout_seconds=300,
+        operator="moe_fused_gate",
     ),
     JDCase(
         case_id="jd-w4a8-correctness",
