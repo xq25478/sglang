@@ -48,6 +48,10 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
+_RECEIVER_ZMQ_RECONNECT_IVL_MS = 100
+_RECEIVER_ZMQ_RECONNECT_IVL_MAX_MS = 1000
+_RECEIVER_ZMQ_SEND_TIMEOUT_MS = 5000
+
 
 class KVTransferError(Exception):
     def __init__(
@@ -1043,10 +1047,12 @@ class CommonKVReceiver(BaseKVReceiver):
                             return
 
                 self.bootstrap_infos = bootstrap_infos
-                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
 
                 # Register kv_args only once to prefill KVManager according to the info fetched from the bootstrap server
                 self._register_kv_args()
+                if self.conclude_state == KVPoll.Failed:
+                    return
+                self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
             else:
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
@@ -1104,7 +1110,11 @@ class CommonKVReceiver(BaseKVReceiver):
                 sock = cls._ctx.socket(zmq.PUSH)
                 if is_ipv6:
                     sock.setsockopt(zmq.IPV6, 1)
-                sock.setsockopt(zmq.RECONNECT_IVL, -1)
+                sock.setsockopt(zmq.RECONNECT_IVL, _RECEIVER_ZMQ_RECONNECT_IVL_MS)
+                sock.setsockopt(
+                    zmq.RECONNECT_IVL_MAX, _RECEIVER_ZMQ_RECONNECT_IVL_MAX_MS
+                )
+                sock.setsockopt(zmq.SNDTIMEO, _RECEIVER_ZMQ_SEND_TIMEOUT_MS)
                 sock.setsockopt(zmq.LINGER, 0)
                 sock.connect(endpoint)
                 cls._socket_cache[endpoint] = sock
@@ -1131,6 +1141,29 @@ class CommonKVReceiver(BaseKVReceiver):
         na = NetworkAddress(ip_address, port)
         sock, lock = cls._connect(na.to_tcp(), is_ipv6=na.is_ipv6)
         return sock, lock
+
+    def _send_multipart_to_bootstrap_server(
+        self, bootstrap_info: dict, payload: List[bytes]
+    ) -> bool:
+        na = NetworkAddress(bootstrap_info["rank_ip"], bootstrap_info["rank_port"])
+        endpoint = na.to_tcp()
+        sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+        try:
+            with lock:
+                sock.send_multipart(payload)
+        except zmq.ZMQError as e:
+            self.disconnect_endpoint(endpoint)
+            failure_reason = f"Failed to send metadata to {endpoint}: {e}"
+            logger.warning(
+                "Request %s failed while sending disaggregation metadata: %s",
+                self.bootstrap_room,
+                failure_reason,
+            )
+            self.kv_mgr.record_failure(self.bootstrap_room, failure_reason)
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            self.conclude_state = KVPoll.Failed
+            return False
+        return True
 
     def _register_kv_args(self):
         pass
