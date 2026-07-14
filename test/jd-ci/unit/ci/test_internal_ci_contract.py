@@ -130,10 +130,12 @@ class TestJDInternalCIContract(unittest.TestCase):
     def test_build_components_are_present_once(self):
         script = (REPO_ROOT / "test/jd-ci/run_jd_ci.sh").read_text(encoding="utf-8")
 
-        self.assertEqual(script.count('mkcompile "te"'), 1)
-        self.assertEqual(script.count("mkcompile store"), 1)
+        self.assertEqual(script.count("'${MOONCAKE_TE_WORK_DIR}/compile' 'te'"), 1)
         self.assertEqual(
-            script.count("bash ${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh"),
+            script.count("'${MOONCAKE_STORE_WORK_DIR}/compile' 'store'"), 1
+        )
+        self.assertEqual(
+            script.count("bash '${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh'"),
             1,
         )
 
@@ -159,7 +161,7 @@ class TestJDInternalCIContract(unittest.TestCase):
         self.assertIn("review|merge)", script)
         self.assertIn("temp-image)", script)
         self.assertIn(
-            'JD_CI_TEMP_ARTIFACT_ROOT="${CI_ARTIFACT_ROOT}/tmp_artifacts/${COMMIT_SHA}"',
+            'JD_CI_TEMP_ARTIFACT_ROOT="${CI_RUNNER_ROOT}/artifacts"',
             script,
         )
         self.assertNotIn("persistent-reuse", script)
@@ -301,6 +303,86 @@ printf 'LENGTH=%s\\n' "${#value}"
         ):
             self.assertEqual(script.count(f"pipeline/{runner}"), 1)
         self.assertNotIn("前一回归项失败", script)
+
+    def test_runner_workspace_uses_nine_character_commit_id(self):
+        script = self._script()
+
+        self.assertIn("COMMIT_SHA=$(git rev-parse HEAD)", script)
+        self.assertIn('COMMIT_ID="${COMMIT_SHA:0:9}"', script)
+        self.assertIn('CI_RUNNER_ID="${COMMIT_ID}"', script)
+        self.assertIn(
+            'CI_RUNNER_ROOT="${CI_ARTIFACT_ROOT}/runners/${CI_RUNNER_ID}"',
+            script,
+        )
+        self.assertIn('CI_LOGS_DIR="${CI_RUNNER_ROOT}/logs"', script)
+
+    def test_component_logs_and_workspaces_are_isolated(self):
+        script = self._script()
+
+        for required in (
+            'MAIN_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/sglang.log"',
+            'MSTORE_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/mooncake-store.log"',
+            'SGL_KERNEL_BUILD_LOG="${CI_BUILD_LOGS_DIR}/sgl-kernel.log"',
+            'MOONCAKE_TE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-te.log"',
+            'MOONCAKE_STORE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-store.log"',
+            'MAIN_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/sglang"',
+            'MSTORE_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/mooncake-store"',
+            'SGL_KERNEL_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/sgl-kernel"',
+            'MOONCAKE_TE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-te"',
+            'MOONCAKE_STORE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-store"',
+            'CPU_MOCK_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/cpu-mock"',
+            'SERVER_API_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/server-api"',
+            'OPERATOR_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/operator"',
+            '-v "${MAIN_CONTAINER_TMP_DIR}:/tmp"',
+            '-v "${MSTORE_CONTAINER_TMP_DIR}:/tmp"',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, script)
+
+        self.assertNotIn('CI_TMP_DIR="${CI_ARTIFACT_ROOT}/tmp/"', script)
+        self.assertNotIn('-v "${CI_TMP_DIR}:/tmp"', script)
+        self.assertNotIn("/tmp/* /tmp/.[!.]* /tmp/..?*", script)
+
+    def test_mooncake_clone_roots_exist_before_container_builds(self):
+        script = self._script()
+        setup = script.split("cleanup_ci_runner_dir \"启动前清理\"", maxsplit=1)[
+            1
+        ].split("# 构建镜像信息", maxsplit=1)[0]
+
+        self.assertIn('"${MOONCAKE_TE_WORK_DIR}/compile"', setup)
+        self.assertIn('"${MOONCAKE_STORE_WORK_DIR}/compile"', setup)
+
+    def test_exit_cleanup_removes_containers_before_runner_workspace(self):
+        script = self._script()
+        cleanup = script.split("cleanup_on_exit() {", maxsplit=1)[1].split(
+            "trap cleanup_on_exit EXIT", maxsplit=1
+        )[0]
+
+        main_cleanup = cleanup.index(
+            'cleanup_container_by_name "${CONTAINER_NAME}" "主容器"'
+        )
+        store_cleanup = cleanup.index(
+            'cleanup_container_by_name "${MSTORE_CONTAINER}" "mooncake-store 容器"'
+        )
+        runner_cleanup = cleanup.index('cleanup_ci_runner_dir "收尾清理"')
+        self.assertLess(main_cleanup, runner_cleanup)
+        self.assertLess(store_cleanup, runner_cleanup)
+        self.assertIn('CI_RUNNER_ROOT="${CI_ARTIFACT_ROOT}/runners/', script)
+        self.assertIn("rm -rf \"${CI_RUNNER_ROOT}\"", script)
+
+    def test_readme_documents_ephemeral_runner_directory(self):
+        readme = (REPO_ROOT / "test/jd-ci/README.md").read_text(encoding="utf-8")
+
+        for required in (
+            "runners/${COMMIT_ID:0:9}",
+            "主 SGLang 容器",
+            "mooncake-store 容器",
+            "SGL-Kernel",
+            "Mooncake TE/store",
+            "无论成功、失败还是中断",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, readme)
 
 
 if __name__ == "__main__":

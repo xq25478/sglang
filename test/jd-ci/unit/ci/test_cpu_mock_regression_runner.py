@@ -51,9 +51,14 @@ class TestCPUAndMockRegressionRunner(CustomTestCase):
     def test_main_pipeline_keeps_build_and_packaging_flow(self):
         script = (REPO_ROOT / "test/jd-ci/run_jd_ci.sh").read_text(encoding="utf-8")
 
-        self.assertEqual(script.count('mkcompile "te"'), 1)
-        self.assertEqual(script.count("mkcompile store"), 1)
-        self.assertEqual(script.count("bash ${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh"), 1)
+        self.assertEqual(script.count("'${MOONCAKE_TE_WORK_DIR}/compile' 'te'"), 1)
+        self.assertEqual(
+            script.count("'${MOONCAKE_STORE_WORK_DIR}/compile' 'store'"), 1
+        )
+        self.assertEqual(
+            script.count("bash '${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh'"),
+            1,
+        )
         self.assertIn("pipeline/run_cpu_mock_regression.sh", script)
         self.assertIn("pipeline/run_server_api_regression.sh", script)
         self.assertIn("pipeline/run_operator_regression.sh", script)

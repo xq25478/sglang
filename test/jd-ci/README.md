@@ -216,7 +216,7 @@ Mooncake-store 缓存；任一 cache miss 都直接失败，不允许回退到�
 
 | 环境变量 | 默认值 | `0` | `1` |
 | --- | --- | --- | --- |
-| `JD_CI_SKIP_SGL_KERNEL_BUILD` | `0` | 在 `${CI_ARTIFACT_ROOT}/tmp_artifacts/${COMMIT_SHA}` 编译并安装 | 用户确认无相关改动，继承基础镜像组件 |
+| `JD_CI_SKIP_SGL_KERNEL_BUILD` | `0` | 在本次 commit runner 的 `artifacts/` 目录编译并安装 | 用户确认无相关改动，继承基础镜像组件 |
 | `JD_CI_SKIP_MOONCAKE_BUILD` | `0` | 在同一 commit 临时根目录编译并安装 TE/store | 用户确认无相关改动，继承基础镜像组件 |
 | `JD_CI_SKIP_TEST` | `0` | 固定执行全部三类 JD 回归 | 跳过全部回归并生成显式 skip 报告 |
 
@@ -262,12 +262,26 @@ JD_CI_SKIP_TEST=1 \
 | SGL-Kernel 正式缓存 | `${CI_WORK_DIR}/ci/sglang/sgl-kernel/${BASE_IMAGE_TAG}` | `-r` 更新，`-m` 只读 |
 | Mooncake TE 正式缓存 | `${CI_WORK_DIR}/ci/sglang/mooncake_te/${MOONCAKE_VERSION_TAG}` | `-r` 更新，`-m` 只读 |
 | Mooncake-store 正式缓存 | `${CI_WORK_DIR}/ci/sglang/mooncake_store/${MOONCAKE_VERSION_TAG}` | `-r` 更新，`-m` 只读 |
-| 临时分支组件产物 | `${CI_WORK_DIR}/ci/sglang/jd-ci/tmp_artifacts/${COMMIT_SHA}` | `-t` 专属，退出时清理 |
-| 每次运行日志和报告 | `${CI_WORK_DIR}/ci/sglang/jd-ci/ci_logs/${CI_RUN_ID}` | 持续保留用于定位 |
+| 本次 runner 日志、临时依赖和 `-t` 产物 | `${CI_WORK_DIR}/ci/sglang/jd-ci/runners/${COMMIT_ID:0:9}` | 仅本次 CI 存在，退出时整体清理 |
 
-每次运行会生成主容器日志、Mooncake-store 容器日志，以及三类回归的独立 JSON
-报告。汇总文件为 `jd_ci_report.json` 和 `jd_ci_report.md`。失败时默认把完整日志转储到
-流水线 stdout；退出 trap 会停止活动 Docker CLI、删除本次容器并清理共享临时目录。
+本次 runner id 固定为 commit id 的前 9 位。runner 目录内按用途隔离：
+
+```text
+runners/<9-char-commit>/
+├── logs/
+│   ├── containers/       # 主 SGLang 容器、mooncake-store 容器
+│   ├── builds/           # SGL-Kernel、Mooncake TE/store 编译日志
+│   └── tests/            # CPU/Mock、Server/API、Operator 独立 case 日志和报告
+├── work/
+│   ├── containers/       # 两个容器各自的临时目录和缓存
+│   ├── builds/           # 三类编译各自的依赖和中间文件
+│   └── tests/            # 三类回归各自的临时依赖和缓存
+└── artifacts/                 # 仅 `-t` 使用的临时 wheel
+```
+
+失败时会在删除前把完整日志转储到流水线 stdout。退出 trap 先停止
+Docker CLI 并删除两个容器，再删除整个 runner 目录。无论成功、失败还是中断，
+日志、报告、临时依赖、编译中间文件和临时产物都不会在磁盘上持续保留。
 
 ## 提交前与流水线机器验证
 
