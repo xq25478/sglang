@@ -46,7 +46,10 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
 )
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_prefill_cp_round_robin_split,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel
@@ -68,6 +71,23 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+
+def _should_use_sparse_prefill(forward_batch: ForwardBatch, num_queries: int) -> bool:
+    if not forward_batch.forward_mode.is_extend_without_speculative():
+        return False
+
+    if dsa_use_prefill_cp(forward_batch):
+        # Only round-robin CP reindexes the DSV4 attention metadata into the
+        # same rank-local query order as q. Keep the zigzag/in-seq mode on the
+        # paged path until it provides the equivalent local metadata contract.
+        if not is_dsa_prefill_cp_round_robin_split():
+            return False
+
+    return (
+        num_queries > _LARGE_INDEXER_QUERY_THRESHOLD
+        or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
+    )
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -135,6 +155,7 @@ def _copy_or_replace(dst, src):
 class DSV4AttnMetadata:
     page_size: int
     page_table: torch.Tensor
+    req_pool_indices_repeated: torch.Tensor
     raw_out_loc: torch.Tensor
     cuda_int32_kwargs: dict
 
@@ -202,6 +223,7 @@ class DSV4AttnMetadata:
                 "c4_sparse_topk_lengths",
                 "c4_sparse_page_indices",
                 "c4_sparse_raw_indices",
+                "req_pool_indices_repeated",
             ],
             assign_fields=[
                 # Recomputed by the recorded init_forward_metadata_in_graph op
@@ -227,6 +249,7 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            "req_pool_indices_repeated",
         ]
         reference_assign_fields = [
             "page_table",
@@ -292,6 +315,7 @@ class DSV4AttnMetadata:
         "c4_topk_lengths_clamp1",
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
+        "req_pool_indices_repeated",
     ]
     _CP_GLOBAL_FIELDS = [
         "raw_out_loc",
@@ -1454,19 +1478,7 @@ class DeepseekV4AttnBackend(
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            # SparsePrefillChunkCache is built from the global request lengths,
-            # while DSA prefill CP passes a rank-local q tensor. Until the cache
-            # metadata is CP-sharded as well, taking this path can size the
-            # workspace and indices for different token domains and cause an
-            # out-of-bounds dequantization. Keep CP on the paged FlashMLA path.
-            if (
-                forward_batch.forward_mode.is_extend_without_speculative()
-                and not dsa_use_prefill_cp(forward_batch)
-                and (
-                    q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
-                    or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
-                )
-            ):
+            if _should_use_sparse_prefill(forward_batch, q.shape[0]):
                 return self._forward_prefill_sparse(
                     q=q,
                     layer_id=layer_id,
@@ -1547,21 +1559,37 @@ class DeepseekV4AttnBackend(
 
         cache = self.forward_metadata.sparse_prefill_cache
         if cache is None:
-            seq_lens_cpu = forward_batch.seq_lens_cpu
-            assert seq_lens_cpu is not None
-            # ``swa_window_size`` on the pool is its storage page size, not
-            # the model's SWA window — pass both explicitly.
-            cache = SparsePrefillChunkCache.build(
-                seq_lens=forward_batch.seq_lens.to(torch.int32),
-                extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
-                req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
-                req_to_token=self.req_to_token,
-                full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
-                swa_window_size=SWA_WINDOW,
-                swa_page_size=token_to_kv_pool.swa_window_size,
-                num_qo_tokens=q_flat.shape[0],
-                max_seq_len=int(seq_lens_cpu.max().item()),
-            )
+            if dsa_use_prefill_cp(forward_batch):
+                assert is_dsa_prefill_cp_round_robin_split()
+                cache = SparsePrefillChunkCache.build_from_query_metadata(
+                    seq_lens_casual=core_attn_metadata.seq_lens_casual[
+                        : q_flat.shape[0]
+                    ].contiguous(),
+                    req_pool_indices_repeated=core_attn_metadata.req_pool_indices_repeated[
+                        : q_flat.shape[0]
+                    ].contiguous(),
+                    req_to_token=self.req_to_token,
+                    full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+                    swa_window_size=SWA_WINDOW,
+                    swa_page_size=token_to_kv_pool.swa_window_size,
+                    num_qo_tokens=q_flat.shape[0],
+                )
+            else:
+                seq_lens_cpu = forward_batch.seq_lens_cpu
+                assert seq_lens_cpu is not None
+                # ``swa_window_size`` on the pool is its storage page size, not
+                # the model's SWA window — pass both explicitly.
+                cache = SparsePrefillChunkCache.build(
+                    seq_lens=forward_batch.seq_lens.to(torch.int32),
+                    extend_seq_lens=forward_batch.extend_seq_lens.to(torch.int32),
+                    req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
+                    req_to_token=self.req_to_token,
+                    full_to_swa=token_to_kv_pool.full_to_swa_index_mapping,
+                    swa_window_size=SWA_WINDOW,
+                    swa_page_size=token_to_kv_pool.swa_window_size,
+                    num_qo_tokens=q_flat.shape[0],
+                    max_seq_len=int(seq_lens_cpu.max().item()),
+                )
             self.forward_metadata.sparse_prefill_cache = cache
 
         # Resolve the workspace + indices for this ratio, then dequant
@@ -1774,6 +1802,7 @@ class DeepseekV4AttnBackend(
         core_attn_metadata = DSV4AttnMetadata(
             page_size=self.page_size,
             raw_out_loc=out_loc,
+            req_pool_indices_repeated=req_pool_indices_repeated,
             seq_lens_casual=seq_lens_casual,
             cuda_int32_kwargs=self.cuda_int32_kwargs,
             positions_casual=raw_positions,

@@ -310,6 +310,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             page_table=torch.tensor(
                 [[base + 1, base + 2], [base + 3, base + 4]], dtype=torch.int32
             ),
+            req_pool_indices_repeated=torch.tensor(
+                [base + 41, base + 42], dtype=torch.int32
+            ),
             raw_out_loc=torch.tensor([base + 5, base + 6], dtype=torch.int32),
             cuda_int32_kwargs={"dtype": torch.int32},
             seq_lens_casual=torch.tensor([base + 7, base + 8], dtype=torch.int32),
@@ -382,6 +385,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "c4_topk_lengths_raw",
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
+            "req_pool_indices_repeated",
         ]
         reference_assign_fields = [
             "page_table",
@@ -487,6 +491,134 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertEqual(grown.shape, (7, 1, 512))
         self.assertNotEqual(grown.data_ptr(), first.data_ptr())
         self.assertEqual(workspace._buffer.data_ptr(), grown.data_ptr())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_sparse_prefill_cp_combines_rank_local_causal_positions(self):
+        from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
+            combine_topk_swa_indices_for_query_seq_lens,
+        )
+
+        device = torch.device("cuda")
+        indices, lengths = combine_topk_swa_indices_for_query_seq_lens(
+            topk_indices=torch.tensor(
+                [[3, 2, 1, 0], [2, 1, 0, 3]],
+                dtype=torch.int32,
+                device=device,
+            ),
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32, device=device),
+            query_seq_lens=torch.tensor([4, 8], dtype=torch.int32, device=device),
+            swa_first_pos=torch.tensor([0], dtype=torch.int32, device=device),
+            compressed_base=torch.tensor([10], dtype=torch.int32, device=device),
+            swa_base=torch.tensor([20], dtype=torch.int32, device=device),
+            window_size=4,
+            compress_ratio=4,
+            topk=4,
+        )
+
+        self.assertEqual(lengths.cpu().tolist(), [5, 6])
+        self.assertEqual(indices[0, :5].cpu().tolist(), [13, 20, 21, 22, 23])
+        self.assertEqual(indices[1, :6].cpu().tolist(), [12, 11, 24, 25, 26, 27])
+        self.assertTrue(torch.all(indices[0, 5:] == -1).item())
+        self.assertTrue(torch.all(indices[1, 6:] == -1).item())
+
+    def test_round_robin_cp_large_prefill_uses_sparse_path(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend
+
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        with (
+            mock.patch.object(
+                deepseek_v4_backend, "dsa_use_prefill_cp", return_value=True
+            ),
+            mock.patch.object(
+                deepseek_v4_backend,
+                "is_dsa_prefill_cp_round_robin_split",
+                return_value=True,
+            ),
+            deepseek_v4_backend.envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(False),
+        ):
+            self.assertTrue(
+                deepseek_v4_backend._should_use_sparse_prefill(
+                    forward_batch, num_queries=32608
+                )
+            )
+
+    def test_non_round_robin_cp_keeps_sparse_path_disabled(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend
+
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        with (
+            mock.patch.object(
+                deepseek_v4_backend, "dsa_use_prefill_cp", return_value=True
+            ),
+            mock.patch.object(
+                deepseek_v4_backend,
+                "is_dsa_prefill_cp_round_robin_split",
+                return_value=False,
+            ),
+            deepseek_v4_backend.envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
+        ):
+            self.assertFalse(
+                deepseek_v4_backend._should_use_sparse_prefill(
+                    forward_batch, num_queries=32608
+                )
+            )
+
+    def test_sparse_prefill_cp_cache_uses_rank_local_query_metadata(self):
+        from sglang.srt.layers.attention.dsv4 import sparse_prefill_utils
+
+        # Two request-local query groups after CP round-robin reindexing. The
+        # causal lengths advance by cp_size instead of being a contiguous tail.
+        query_seq_lens = torch.tensor([6, 8, 10, 4, 6], dtype=torch.int32)
+        req_pool_indices_repeated = torch.tensor([7, 7, 7, 3, 3], dtype=torch.int64)
+        combined = (
+            torch.empty((5, 128), dtype=torch.int32),
+            torch.empty(5, dtype=torch.int32),
+        )
+
+        with (
+            mock.patch.object(
+                sparse_prefill_utils,
+                "build_swa_token_ids_from_ranges",
+                return_value=torch.arange(14, dtype=torch.int32),
+            ) as build_swa,
+            mock.patch.object(
+                sparse_prefill_utils,
+                "combine_topk_swa_indices_for_query_seq_lens",
+                return_value=combined,
+            ) as combine,
+        ):
+            cache = (
+                sparse_prefill_utils.SparsePrefillChunkCache.build_from_query_metadata(
+                    seq_lens_casual=query_seq_lens,
+                    req_pool_indices_repeated=req_pool_indices_repeated,
+                    req_to_token=torch.zeros((8, 16), dtype=torch.int32),
+                    full_to_swa=torch.arange(128, dtype=torch.int64),
+                    swa_window_size=4,
+                    swa_page_size=128,
+                    num_qo_tokens=5,
+                )
+            )
+
+        self.assertEqual(cache.num_reqs, 2)
+        self.assertEqual(cache.num_qo_tokens, 5)
+        self.assertEqual(cache.query_start_loc.tolist(), [0, 3, 5])
+        self.assertEqual(cache.seq_lens.tolist(), [10, 6])
+        self.assertEqual(cache.swa_first_pos.tolist(), [2, 0])
+        self.assertEqual(cache.swa_gather_lens.tolist(), [8, 6])
+        self.assertEqual(cache.swa_offsets.tolist(), [0, 8, 14])
+        self.assertEqual(cache.representative_q_per_req.tolist(), [2, 4])
+        self.assertIs(cache.query_seq_lens, query_seq_lens)
+        self.assertEqual(cache.max_seq_len, 10)
+
+        self.assertEqual(
+            build_swa.call_args.kwargs["req_pool_indices"].tolist(), [7, 3]
+        )
+        self.assertEqual(
+            build_swa.call_args.kwargs["req_pool_indices"].dtype, torch.int32
+        )
+        self.assertEqual(
+            combine.call_args.kwargs["query_seq_lens"].tolist(), [6, 8, 10, 4, 6]
+        )
 
     def test_sparse_prefill_c4_uses_live_extent(self):
         page_table = torch.zeros((2, 4096), dtype=torch.int32)

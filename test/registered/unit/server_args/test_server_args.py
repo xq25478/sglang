@@ -473,6 +473,24 @@ class TestContextParallelServerArgs(CustomTestCase):
         self.assertTrue(is_cp_enabled())
         self.assertTrue(is_interleave())
 
+    def test_deepseek_v4_cp_preserves_sparse_prefill_setting(self):
+        from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+        from sglang.srt.environ import envs
+
+        server_args = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            tp_size=2,
+            dp_size=1,
+        )
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(enabled),
+            ):
+                validate_deepseek_v4_cp(server_args)
+                self.assertEqual(envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get(), enabled)
+
     def test_registered_cp_legacy_args_map_to_unified_strategy(self):
         cases = [
             (
