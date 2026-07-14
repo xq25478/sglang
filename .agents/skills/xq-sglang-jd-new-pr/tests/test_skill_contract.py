@@ -102,6 +102,19 @@ class TestSkillContract(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, self.text)
 
+    def test_skill_audits_existing_pr_tests_and_real_execution_paths(self):
+        for required in (
+            "先审计 PR 已有测试资产",
+            "真实 dispatch 条件",
+            "至少一个 case 必须经过生产调用入口",
+            "candidate 与 reference 必须进入不同的底层实现",
+            "共享 wrapper",
+            "base 公共接口",
+            "迁移或删除原位置的重复 JD 测试资产",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.text)
+
     def test_jd_readme_documents_the_skill_entrypoint(self):
         readme = (REPO_ROOT / "test/jd-ci/README.md").read_text(encoding="utf-8")
         self.assertIn("$xq-sglang-jd-new-pr", readme)
