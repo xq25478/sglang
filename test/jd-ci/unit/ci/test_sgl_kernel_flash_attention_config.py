@@ -48,7 +48,11 @@ class TestSglKernelFlashAttentionConfig(CustomTestCase):
         script = BUILD_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn(
-            'SGL_KERNEL_FETCHCONTENT_BASE_DIR="${WHEEL_CACHE_ROOT%/}/_deps"',
+            'FETCHCONTENT_CACHE_ROOT="${6:-${WHEEL_CACHE_ROOT}}"',
+            script,
+        )
+        self.assertIn(
+            'SGL_KERNEL_FETCHCONTENT_BASE_DIR="${FETCHCONTENT_CACHE_ROOT%/}/_deps"',
             script,
         )
         self.assertIn('mkdir -p "${SGL_KERNEL_FETCHCONTENT_BASE_DIR}"', script)

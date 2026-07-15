@@ -645,7 +645,8 @@ run_docker_attached docker run \
                 '${BASE_IMAGE_TAG}' \
                 '${CI_WORK_DIR}' \
                 '/wheels' \
-                '/sgl-workspace/sglang/sgl-kernel' 2>&1 | tee '${SGL_KERNEL_BUILD_LOG}'
+                '/sgl-workspace/sglang/sgl-kernel' \
+                '${PERSISTENT_SGL_KERNEL_CACHE_HOST}' 2>&1 | tee '${SGL_KERNEL_BUILD_LOG}'
             set +o pipefail
         fi
 

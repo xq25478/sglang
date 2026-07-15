@@ -207,6 +207,18 @@ class TestJDInternalCIContract(unittest.TestCase):
             merge_policy.index("make -C"),
         )
 
+    def test_temp_sgl_kernel_build_reuses_release_fetchcontent_deps(self):
+        script = self._script()
+
+        self.assertIn(
+            "'${PERSISTENT_SGL_KERNEL_CACHE_HOST}' 2>&1 | tee '${SGL_KERNEL_BUILD_LOG}'",
+            script,
+        )
+        self.assertIn(
+            'WHEEL_CACHE_HOST="${JD_CI_TEMP_ARTIFACT_ROOT}/sgl-kernel/${BASE_IMAGE_TAG}"',
+            script,
+        )
+
     def test_review_event_cannot_publish_an_image(self):
         script = self._script()
 

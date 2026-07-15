@@ -1,6 +1,6 @@
 #!/bin/bash
 # 容器内执行：sgl-kernel wheel 缓存命中则直接 pip install，否则编译并写回缓存
-# 用法: env/build_sgl_kernel.sh <EVENT_TYPE> <BASE_IMAGE_TAG> <CI_WORK_DIR> <WHEEL_CACHE_ROOT> <KERNEL_DIR>
+# 用法: env/build_sgl_kernel.sh <EVENT_TYPE> <BASE_IMAGE_TAG> <CI_WORK_DIR> <WHEEL_CACHE_ROOT> <KERNEL_DIR> [FETCHCONTENT_CACHE_ROOT]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,6 +51,7 @@ BASE_IMAGE_TAG=$2
 CI_WORK_DIR=$3
 WHEEL_CACHE_ROOT=$4
 KERNEL_DIR=$5
+FETCHCONTENT_CACHE_ROOT="${6:-${WHEEL_CACHE_ROOT}}"
 
 # Copy sgl-kernel source from workspace mount to editable install target
 if [ -d "${KERNEL_DIR}" ] && [ -d sgl-kernel ]; then
@@ -169,7 +170,7 @@ fi
 
 TARGET_ARCH_KEY=$(echo "${TARGET_ARCHS}" | tr ',' '-')
 WHEEL_CACHE_DIR="${WHEEL_CACHE_ROOT}/cuda${CUDA_TOOLKIT_VERSION}-${TARGET_ARCH_KEY}/wheels"
-SGL_KERNEL_FETCHCONTENT_BASE_DIR="${WHEEL_CACHE_ROOT%/}/_deps"
+SGL_KERNEL_FETCHCONTENT_BASE_DIR="${FETCHCONTENT_CACHE_ROOT%/}/_deps"
 VERSION=$(awk -F'"' '/^__version__/{print $2}' "${KERNEL_DIR}/python/sgl_kernel/version.py")
 mkdir -p "${WHEEL_CACHE_DIR}"
 mkdir -p "${SGL_KERNEL_FETCHCONTENT_BASE_DIR}"
