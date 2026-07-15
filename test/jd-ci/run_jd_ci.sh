@@ -653,7 +653,7 @@ run_docker_attached docker run \
             jd_ci_failed=0
 
             echo '[JD CI] ========================================'
-            echo '[JD CI]  CPU and Mock Regression: 固定累积 JD CPU/mock 回归（GPU 隐藏）'
+            echo '[JD CI]  CPU and Mock Regression: 固定累积 JD CPU/mock 回归（GPU 可见）'
             echo '[JD CI] ========================================'
             run_with_isolated_workspace '${CPU_MOCK_TEST_WORK_DIR}' \
                 bash '${SOURCE_PATH}/test/jd-ci/pipeline/run_cpu_mock_regression.sh' \

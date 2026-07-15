@@ -17,8 +17,6 @@ REGRESSION_STATUS="passed"
 mkdir -p "${REGRESSION_DIR}"
 printf "name\tstatus\texit_code\tlog_file\tdetail\tassertion\tduration_seconds\ttimeout_seconds\n" > "${CASES_TSV}"
 
-export CUDA_VISIBLE_DEVICES=""
-export NVIDIA_VISIBLE_DEVICES="void"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="${SOURCE_PATH}/test/jd-ci:${SOURCE_PATH}/python:${PYTHONPATH:-}"
 

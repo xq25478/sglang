@@ -22,10 +22,13 @@ RUNNER = REPO_ROOT / "test/jd-ci/pipeline/run_cpu_mock_regression.sh"
 
 
 class TestCPUAndMockRegressionRunner(CustomTestCase):
-    def test_dry_run_writes_gpu_free_report_with_all_cpu_cases(self):
+    def test_dry_run_keeps_gpu_visible_report_with_all_cpu_cases(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             env = os.environ.copy()
             env["JD_CI_CPU_MOCK_DRY_RUN"] = "1"
+            env["CUDA_VISIBLE_DEVICES"] = "0,1"
+            env["NVIDIA_VISIBLE_DEVICES"] = "all"
+            env["PATH"] = f"{Path(os.sys.executable).parent}:{env.get('PATH', '')}"
             result = subprocess.run(
                 ["bash", str(RUNNER), str(REPO_ROOT), "HEAD", tmp_dir],
                 text=True,
@@ -41,12 +44,15 @@ class TestCPUAndMockRegressionRunner(CustomTestCase):
             self.assertEqual(report["test_area"], "cpu_mock")
             self.assertEqual(report["status"], "skipped")
             self.assertFalse(report["gpu_required"])
-            self.assertTrue(report["gpu_hidden"])
+            self.assertFalse(report["gpu_hidden"])
             self.assertEqual(report["failed"], 0)
             self.assertGreater(report["total"], 0)
             self.assertTrue(
                 all(case["name"].startswith("jd-") for case in report["cases"])
             )
+            script = RUNNER.read_text(encoding="utf-8")
+            self.assertNotIn('export CUDA_VISIBLE_DEVICES=""', script)
+            self.assertNotIn('export NVIDIA_VISIBLE_DEVICES="void"', script)
 
     def test_main_pipeline_keeps_build_and_packaging_flow(self):
         script = (REPO_ROOT / "test/jd-ci/run_jd_ci.sh").read_text(encoding="utf-8")
