@@ -208,11 +208,7 @@ MOONCAKE_VERSION_TAG="v${MSTORE_IMAGE_TAG}"
 MSTORE_CONTAINER="SGLANG_CI_BASE_IMAGE_MSTORE_${MSTORE_IMAGE_TAG}-BRANCH_${BRANCH_NAME_FOR_DOCKER}-COMMIT_${COMMIT_ID}-RUN_${CI_RUN_ID}"
 MSTORE_CONTAINER=${MSTORE_CONTAINER,,} # 转小写
 
-if [[ "${CI_MODE}" == "temp-image" ]]; then
-    CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/sglang:${BASE_IMAGE_TAG}_JD_TMP_${BRANCH_NAME_FOR_DOCKER}_${COMMIT_ID}"
-else
-    CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/sglang:${BASE_IMAGE_TAG}_JD_${COMMIT_ID}"
-fi
+CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/sglang:${BASE_IMAGE_TAG}_JD_${COMMIT_ID}"
 CLOUD_IMAGE=${CLOUD_IMAGE,,} # 转小写
 
 echo "[SGLang CI] CLOUD_IMAGE:${CLOUD_IMAGE}"
@@ -714,11 +710,7 @@ set -e
 #############################################################################################
 MSTORE_IMAGE_PREFIX="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/kvcacheai/mooncake"
 MSTORE_IMAGE="${MSTORE_IMAGE_PREFIX}:${MSTORE_IMAGE_TAG}"
-if [[ "${CI_MODE}" == "temp-image" ]]; then
-    MSTORE_CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/kvcacheai/mooncake-store:${MSTORE_IMAGE_TAG}_JD_TMP_${BRANCH_NAME_FOR_DOCKER}_${COMMIT_ID}"
-else
-    MSTORE_CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/kvcacheai/mooncake-store:${MSTORE_IMAGE_TAG}_JD_${COMMIT_ID}"
-fi
+MSTORE_CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/kvcacheai/mooncake-store:${MSTORE_IMAGE_TAG}_JD_${COMMIT_ID}"
 MSTORE_CLOUD_IMAGE=${MSTORE_CLOUD_IMAGE,,} # 转小写
 
 set +e

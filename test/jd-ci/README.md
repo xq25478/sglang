@@ -200,7 +200,7 @@ bash test/jd-ci/run_jd_ci.sh -t  # 临时分支验证镜像
 | --- | --- | --- | --- |
 | `-r` / `--review` / `note__merge_request` / 无参数 | 强制编译并更新正式缓存 | 固定全量执行 | 不产出 |
 | `-m` / `--merge` / `merge_request__merged` | 任意分支只安装对应版本主分支的正式缓存，cache miss 失败 | 固定跳过 | 产出带当前 commit 标识的 SGLang 和 Mooncake-store 镜像 |
-| `-t` / `--temp-image` | 继承基础镜像或在 commit 临时目录编译 | 默认全量执行，可显式全部跳过 | 产出临时 SGLang 和 Mooncake-store 镜像 |
+| `-t` / `--temp-image` | 继承基础镜像或在 commit 临时目录编译 | 默认全量执行，可显式全部跳过 | 产出与 `-m` 标签格式一致的 SGLang 和 Mooncake-store 镜像 |
 
 `-r` 固定按 CPU/Mock、Server/API、算子正确性与性能的顺序执行全部三类回归。
 任一回归失败会记录失败状态，但不会阻止后续回归执行；三类回归结束后统一生成报告
@@ -227,8 +227,8 @@ Mooncake-store 缓存；任一 cache miss 都直接失败，不允许回退到�
 
 临时模式不读取、写入或覆盖正式组件缓存。成功、失败、中断和镜像推送完成后都会
 清理 commit 临时目录。主容器与 Mooncake-store 容器被视为同一组验证产物；任一
-组件、容器或已启用测试失败时，两张镜像都不推送。全部门禁通过后才产出带分支名和
-commit 的独立临时 tag。
+组件、容器或已启用测试失败时，两张镜像都不推送。全部门禁通过后才产出镜像；
+`-t` 与 `-m` 统一使用 `*_JD_${COMMIT_ID}` 标签格式。
 
 ```bash
 # 组件都编译并执行全部测试

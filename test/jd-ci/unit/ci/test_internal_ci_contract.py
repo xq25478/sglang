@@ -273,16 +273,33 @@ printf 'LENGTH=%s\\n' "${#value}"
         self.assertEqual(script.count("docker commit"), 2)
         self.assertEqual(script.count("docker push"), 2)
 
-    def test_temp_images_have_branch_and_commit_scoped_tags(self):
+    def test_temp_and_merge_publish_the_same_image_tag_format(self):
         script = self._script()
 
-        self.assertIn(
-            "${BASE_IMAGE_TAG}_JD_TMP_${BRANCH_NAME_FOR_DOCKER}_${COMMIT_ID}",
-            script,
+        cloud_image_assignments = [
+            line.strip()
+            for line in script.splitlines()
+            if line.strip().startswith('CLOUD_IMAGE="')
+        ]
+        mstore_cloud_image_assignments = [
+            line.strip()
+            for line in script.splitlines()
+            if line.strip().startswith('MSTORE_CLOUD_IMAGE="')
+        ]
+
+        self.assertEqual(
+            cloud_image_assignments,
+            [
+                'CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/'
+                'sglang:${BASE_IMAGE_TAG}_JD_${COMMIT_ID}"'
+            ],
         )
-        self.assertIn(
-            "${MSTORE_IMAGE_TAG}_JD_TMP_${BRANCH_NAME_FOR_DOCKER}_${COMMIT_ID}",
-            script,
+        self.assertEqual(
+            mstore_cloud_image_assignments,
+            [
+                'MSTORE_CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/'
+                'kvcacheai/mooncake-store:${MSTORE_IMAGE_TAG}_JD_${COMMIT_ID}"'
+            ],
         )
 
     def test_obsolete_priority_skip_switches_are_removed(self):
