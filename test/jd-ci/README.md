@@ -108,6 +108,7 @@ JD CI 通过表示：在当前固定清单、测试输入、GPU 型号和性能�
 - OpenAI 协议、thinking/ignore-EOS 和函数调用解析；
 - tokenizer/request state、多模态清理和超时；
 - EPLB/DP metadata、CUDA Graph metadata、W4A8 配置；
+- DSV4 fused WQKV 在普通/CP multi-stream 中的跨 Stream 生命周期与 overlap 顺序；
 - L1/L2 cache metrics；
 - JD deploy/TMA 配置；
 - JD CI 编译、缓存、日志和发布契约。
@@ -162,7 +163,7 @@ bash test/jd-ci/pipeline/run_server_api_regression.sh "$PWD" /tmp/jd-ci
 结束后统一返回非零状态，确保一次 CI 能收集完整的算子回归结果。
 
 当前固定覆盖 optimized RMSNorm、DP-attention compressed all-gather、DSV4
-norm-rope 和 W4A8 dynamic quantization。
+norm-rope、DSV4 CP sparse-prefill/multi-stream 和 W4A8 dynamic quantization。
 
 ```bash
 bash test/jd-ci/pipeline/run_operator_regression.sh "$PWD" /tmp/jd-ci

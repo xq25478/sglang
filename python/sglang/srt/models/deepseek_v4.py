@@ -625,8 +625,6 @@ class MQALayer(nn.Module):
                 x_linear, positions, forward_batch, attn_backend, qkv_a=qkv_a
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -637,6 +635,11 @@ class MQALayer(nn.Module):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+
+        # qkv_a is allocated on current_stream but may still be consumed by
+        # stream_kv.  Keep its storage alive through the existing join so the
+        # CUDA caching allocator cannot reuse it while KV work is in flight.
+        del qkv_a
 
         return q
 
@@ -705,8 +708,6 @@ class MQALayer(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        del qkv_a
-
         if self.compressor is not None:
             with torch.cuda.stream(stream_compressor):
                 attn_backend.forward_core_compressor(
@@ -717,6 +718,11 @@ class MQALayer(nn.Module):
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
+
+        # qkv_a is allocated on current_stream but may still be consumed by
+        # stream_kv.  Keep its storage alive through the existing join so the
+        # CUDA caching allocator cannot reuse it while KV work is in flight.
+        del qkv_a
 
         return q, kv
 

@@ -101,6 +101,21 @@ CASES: tuple[JDCase, ...] = (
         assertion="DSV4 decode and verify metadata support persistent inference tensors",
     ),
     JDCase(
+        case_id="jd-dsv4-multistream-lifetime",
+        commits=(),
+        category="cpu",
+        tracks_ci_head=True,
+        command=(
+            "python3",
+            "test/jd-ci/unit/server/test_dsv4_multistream_lifetime.py",
+            "-v",
+        ),
+        assertion=(
+            "DSV4 fused WQKV storage survives standard and CP KV-stream joins "
+            "without serializing Q projection"
+        ),
+    ),
+    JDCase(
         case_id="jd-metrics-cache",
         commits=("3cd534c9d38682361514ae9f4b8d105c9a6a0e08",),
         category="cpu",
@@ -231,6 +246,33 @@ CASES: tuple[JDCase, ...] = (
         assertion="JD DSV4 norm-rope kernel stays within its relative performance gate",
         min_gpus=1,
         operator="dsv4_norm_rope",
+        tracks_ci_head=True,
+    ),
+    JDCase(
+        case_id="jd-dsv4-cp-prefill-correctness",
+        commits=(),
+        category="operator_correctness",
+        command=("python3", "test/jd-ci/operators/test_dsv4_cp_prefill.py"),
+        assertion=(
+            "DSV4 CP sparse prefill and fused-WQKV multi-stream ownership remain "
+            "correct through 65280 tokens"
+        ),
+        min_gpus=1,
+        timeout_seconds=300,
+        operator="dsv4_cp_prefill",
+        tracks_ci_head=True,
+    ),
+    JDCase(
+        case_id="jd-dsv4-cp-prefill-performance",
+        commits=(),
+        category="operator_performance",
+        command=("python3", "test/jd-ci/operators/bench_dsv4_cp_prefill.py"),
+        assertion=(
+            "DSV4 CP sparse-prefill combine stays within its relative performance gate"
+        ),
+        min_gpus=1,
+        timeout_seconds=300,
+        operator="dsv4_cp_prefill",
         tracks_ci_head=True,
     ),
     JDCase(

@@ -71,6 +71,9 @@ class TestJDTestManifest(CustomTestCase):
             tracked,
             {
                 "jd-ci-contract",
+                "jd-dsv4-multistream-lifetime",
+                "jd-dsv4-cp-prefill-correctness",
+                "jd-dsv4-cp-prefill-performance",
                 "jd-dsv4-norm-rope-correctness",
                 "jd-dsv4-norm-rope-performance",
             },
