@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from collections.abc import Iterable
 from typing import Any
 
@@ -42,6 +43,16 @@ FAILURE_KEYWORDS = (
     "失败",
     "异常",
 )
+FAILURE_LINE_PATTERN = re.compile(
+    r"(?:\b(?:ERROR|FAILED|FAILURE|FATAL)\b|Traceback|"
+    r"(?:Exception|Error):|RuntimeError|ValueError|TimeoutError|"
+    r"timed?\s*out|CUDA out of memory|Segmentation fault|core dumped|"
+    r"No such file|not exist|失败|异常)",
+    re.IGNORECASE,
+)
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+FAILURE_CONTEXT_MAX_FILES = 4
+FAILURE_CONTEXT_MAX_LINE_LENGTH = 800
 
 
 def load_json(path: str) -> Any:
@@ -140,6 +151,154 @@ def collect_paths(logs_dir: str, full: bool) -> list[str]:
     return paths
 
 
+def _find_report(logs_root: str, name: str) -> str | None:
+    for path in iter_files(logs_root):
+        if os.path.basename(path) == name:
+            return path
+    return None
+
+
+def _display_value(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    text = str(value).strip().replace("\n", " ")
+    return text or default
+
+
+def _failure_context(path: str) -> list[str]:
+    try:
+        with open(path, "rb") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - 512 * 1024))
+            text = file.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+
+    lines = [ANSI_ESCAPE_PATTERN.sub("", line).rstrip() for line in text.splitlines()]
+    matches = [index for index, line in enumerate(lines) if FAILURE_LINE_PATTERN.search(line)]
+    if matches:
+        last_match = matches[-1]
+        selected = lines[max(0, last_match - 3) : min(len(lines), last_match + 5)]
+    else:
+        selected = [line for line in lines[-12:] if line.strip()]
+    return [line[:FAILURE_CONTEXT_MAX_LINE_LENGTH] for line in selected if line.strip()]
+
+
+def _append_candidate(
+    candidates: list[tuple[str, str]],
+    seen: set[str],
+    path: Any,
+    allowed_root: str,
+) -> None:
+    if not isinstance(path, str) or not path:
+        return
+    candidate = os.path.realpath(path)
+    if (
+        candidate in seen
+        or not os.path.isfile(candidate)
+        or not is_under(candidate, allowed_root)
+    ):
+        return
+    seen.add(candidate)
+    candidates.append((candidate, allowed_root))
+
+
+def render_failure_summary(
+    logs_dir: str,
+    *,
+    overall_exit_code: str,
+    main_exit_code: str = "",
+    fallback_logs_dir: str = "",
+) -> str:
+    logs_root = os.path.realpath(logs_dir)
+    lines = [
+        f"[JD CI FAILURE] overall_exit_code={_display_value(overall_exit_code, 'unknown')}"
+    ]
+    if main_exit_code and main_exit_code != "0":
+        lines.append(f"[JD CI FAILURE] pipeline=sglang exit_code={main_exit_code}")
+
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    report_path = _find_report(logs_root, "jd_ci_report.json") if os.path.isdir(logs_root) else None
+    report = load_json(report_path) if report_path else None
+    failed_case_count = 0
+    if isinstance(report, dict):
+        for regression in report.get("regressions", []):
+            if not isinstance(regression, dict):
+                continue
+            area = _display_value(
+                regression.get("display_name"),
+                _display_value(regression.get("test_area"), "unknown regression"),
+            )
+            for case in regression.get("cases", []):
+                if not isinstance(case, dict) or case.get("status") not in {
+                    "failed",
+                    "blocked",
+                }:
+                    continue
+                failed_case_count += 1
+                case_name = _display_value(case.get("name"), "unknown case")
+                status = _display_value(case.get("status"), "failed")
+                exit_code = _display_value(case.get("exit_code"), "unknown")
+                detail = _display_value(
+                    case.get("detail") or case.get("assertion"), "no detail"
+                )
+                lines.append(
+                    f"[JD CI FAILURE] case={area}/{case_name} "
+                    f"status={status} exit_code={exit_code} detail={detail}"
+                )
+                _append_candidate(candidates, seen, case.get("log_file"), logs_root)
+
+    builds_dir = os.path.join(logs_root, "builds")
+    if os.path.isdir(builds_dir):
+        for path in iter_files(builds_dir):
+            if file_has_failure_keyword(path):
+                _append_candidate(candidates, seen, path, logs_root)
+
+    main_pipeline_log = os.path.join(logs_root, "containers", "sglang.log")
+    if main_exit_code and main_exit_code != "0":
+        _append_candidate(
+            candidates,
+            seen,
+            main_pipeline_log,
+            logs_root,
+        )
+    fallback_root = os.path.realpath(fallback_logs_dir) if fallback_logs_dir else ""
+    if fallback_root and os.path.isdir(fallback_root):
+        if (
+            main_exit_code
+            and main_exit_code != "0"
+            and not os.path.isfile(main_pipeline_log)
+        ):
+            _append_candidate(
+                candidates,
+                seen,
+                os.path.join(fallback_root, "containers", "sglang.log"),
+                fallback_root,
+            )
+
+    context_count = 0
+    for path, display_root in candidates[:FAILURE_CONTEXT_MAX_FILES]:
+        context = _failure_context(path)
+        if not context:
+            continue
+        context_count += 1
+        relative_path = os.path.relpath(path, display_root)
+        if display_root != logs_root:
+            relative_path = f"final-output-tail/{relative_path}"
+        lines.append(f"[JD CI FAILURE] root_cause_log={relative_path}")
+        lines.extend(f"[JD CI FAILURE]   {line}" for line in context)
+
+    if failed_case_count == 0 and context_count == 0:
+        lines.append(
+            "[JD CI FAILURE] root_cause=未从现有日志提取到明确错误行，请查看上方完整日志转储"
+        )
+    else:
+        lines.append("[JD CI FAILURE] 完整上下文见上方 [JD CI LOG DUMP]")
+    return "\n".join(lines)
+
+
 def print_file(path: str, logs_root: str, max_bytes: int) -> None:
     rel = os.path.relpath(path, logs_root)
     size = os.path.getsize(path)
@@ -166,6 +325,14 @@ def main() -> int:
     parser.add_argument("--logs-dir", required=True)
     parser.add_argument("--full", action="store_true", help="Dump every text log/report file")
     parser.add_argument(
+        "--failure-summary",
+        action="store_true",
+        help="Print a concise final failure summary instead of the full log dump",
+    )
+    parser.add_argument("--overall-exit-code", default="")
+    parser.add_argument("--main-exit-code", default="")
+    parser.add_argument("--fallback-logs-dir", default="")
+    parser.add_argument(
         "--max-bytes",
         type=int,
         default=0,
@@ -174,6 +341,17 @@ def main() -> int:
     args = parser.parse_args()
 
     logs_dir = os.path.realpath(args.logs_dir)
+    if args.failure_summary:
+        print(
+            render_failure_summary(
+                logs_dir,
+                overall_exit_code=args.overall_exit_code,
+                main_exit_code=args.main_exit_code,
+                fallback_logs_dir=args.fallback_logs_dir,
+            ),
+            flush=True,
+        )
+        return 0
     if not os.path.isdir(logs_dir):
         print(f"[JD CI LOG DUMP] logs dir not found: {args.logs_dir}", flush=True)
         return 0

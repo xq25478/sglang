@@ -1,5 +1,7 @@
+import json
 import os
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -131,9 +133,7 @@ class TestJDInternalCIContract(unittest.TestCase):
         script = (REPO_ROOT / "test/jd-ci/run_jd_ci.sh").read_text(encoding="utf-8")
 
         self.assertEqual(script.count("'${MOONCAKE_TE_WORK_DIR}/compile' 'te'"), 1)
-        self.assertEqual(
-            script.count("'${MOONCAKE_STORE_WORK_DIR}/compile' 'store'"), 1
-        )
+        self.assertNotIn("MOONCAKE_STORE_WORK_DIR", script)
         self.assertEqual(
             script.count("bash '${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh'"),
             1,
@@ -153,6 +153,146 @@ class TestJDInternalCIContract(unittest.TestCase):
         self.assertIn("dump_ci_logs.py", script)
         self.assertIn("CI_ARTIFACT_ROOT", script)
         self.assertIn("RELEASE_ARTIFACT_BRANCH", script)
+
+    def test_failure_summary_is_printed_after_cleanup(self):
+        script = self._script()
+        cleanup = script.split("cleanup_on_exit() {", maxsplit=1)[1].split(
+            "capture_ci_failure_summary() {", maxsplit=1
+        )[0]
+
+        capture = cleanup.index('capture_ci_failure_summary "${status}"')
+        runner_cleanup = cleanup.index('cleanup_ci_runner_dir "收尾清理"')
+        final_summary = cleanup.index('print_final_failure_summary "${status}"')
+        self.assertLess(capture, runner_cleanup)
+        self.assertLess(runner_cleanup, final_summary)
+        self.assertIn("最终失败原因（现场清理已完成）", script)
+        self.assertIn("FINAL_STATUS=FAILED", script)
+
+    def test_failure_summary_reports_failed_case_and_root_cause(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            logs_dir = Path(temporary_directory)
+            case_log = logs_dir / "tests/server_api/jd-server-api-regressions.log"
+            case_log.parent.mkdir(parents=True)
+            case_log.write_text(
+                "request started\nTraceback (most recent call last):\n"
+                "RuntimeError: dummy server failed to start\n",
+                encoding="utf-8",
+            )
+            report = {
+                "status": "failed",
+                "regressions": [
+                    {
+                        "test_area": "server_api",
+                        "display_name": "Server and API Regression",
+                        "cases": [
+                            {
+                                "name": "jd-server-api-regressions",
+                                "status": "failed",
+                                "exit_code": 7,
+                                "detail": "fixed JD case exited with code 7",
+                                "log_file": str(case_log),
+                            }
+                        ],
+                    }
+                ],
+            }
+            (logs_dir / "tests/jd_ci_report.json").write_text(
+                json.dumps(report), encoding="utf-8"
+            )
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "test/jd-ci/report/dump_ci_logs.py"),
+                    "--logs-dir",
+                    str(logs_dir),
+                    "--failure-summary",
+                    "--overall-exit-code",
+                    "7",
+                    "--main-exit-code",
+                    "7",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("overall_exit_code=7", result.stdout)
+        self.assertIn("pipeline=sglang exit_code=7", result.stdout)
+        self.assertIn(
+            "case=Server and API Regression/jd-server-api-regressions",
+            result.stdout,
+        )
+        self.assertIn("RuntimeError: dummy server failed to start", result.stdout)
+        self.assertIn("root_cause_log=tests/server_api/", result.stdout)
+
+    def test_failure_summary_falls_back_to_unique_live_output_tail(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            logs_dir = root / "deleted-runner-logs"
+            fallback_dir = root / "final-state"
+            main_tail = fallback_dir / "containers/sglang.log"
+            main_tail.parent.mkdir(parents=True)
+            main_tail.write_text(
+                "[SGLang CI] build Mooncake TE\n"
+                "ERROR: clone Mooncake Path:/export/zhangyu/compile not exist\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "test/jd-ci/report/dump_ci_logs.py"),
+                    "--logs-dir",
+                    str(logs_dir),
+                    "--fallback-logs-dir",
+                    str(fallback_dir),
+                    "--failure-summary",
+                    "--overall-exit-code",
+                    "1",
+                    "--main-exit-code",
+                    "1",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("pipeline=sglang exit_code=1", result.stdout)
+        self.assertIn("final-output-tail/containers/sglang.log", result.stdout)
+        self.assertIn("clone Mooncake Path:/export/zhangyu/compile not exist", result.stdout)
+
+    def test_recent_output_capture_streams_all_lines_and_keeps_only_tail(self):
+        script = self._script()
+        function_body = script.split("capture_recent_output() {", maxsplit=1)[1].split(
+            "\n}\n\nrm_ci_runner_dir()", maxsplit=1
+        )[0]
+        capture_function = f"capture_recent_output() {{{function_body}\n}}"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            tail_file = Path(temporary_directory) / "tail.log"
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    capture_function + '\ncapture_recent_output "$1" 3',
+                    "bash",
+                    str(tail_file),
+                ],
+                input="line-1\nline-2\nline-3\nline-4\nline-5\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            tail = tail_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout, "line-1\nline-2\nline-3\nline-4\nline-5\n"
+        )
+        self.assertEqual(tail, "line-3\nline-4\nline-5\n")
 
     def test_modes_select_formal_or_commit_scoped_artifacts(self):
         script = self._script()
@@ -258,9 +398,8 @@ printf 'LENGTH=%s\\n' "${#value}"
         self.assertNotRegex(script, r"(?<!JD_CI_)SKIP_CI_TEST")
         self.assertIn("for test_area in cpu_mock server_api operator", script)
 
-    def test_images_publish_only_after_both_containers_succeed(self):
+    def test_image_publishes_only_after_main_container_succeeds(self):
         script = self._script()
-        store_status = script.index("STORE_EXIT_CODE=")
         first_commit = script.index("docker commit")
         publish_condition = (
             'if [[ ${EXIT_CODE} -eq 0 && "${PUBLISH_IMAGES}" == "1" ]]'
@@ -268,10 +407,11 @@ printf 'LENGTH=%s\\n' "${#value}"
         self.assertIn(publish_condition, script)
         publish_gate = script.index(publish_condition)
 
-        self.assertLess(store_status, publish_gate)
         self.assertLess(publish_gate, first_commit)
-        self.assertEqual(script.count("docker commit"), 2)
-        self.assertEqual(script.count("docker push"), 2)
+        self.assertEqual(script.count("docker commit"), 1)
+        self.assertEqual(script.count("docker push"), 1)
+        self.assertNotIn("MSTORE", script)
+        self.assertNotIn("mooncake-store", script)
 
     def test_temp_and_merge_publish_the_same_image_tag_format(self):
         script = self._script()
@@ -281,12 +421,6 @@ printf 'LENGTH=%s\\n' "${#value}"
             for line in script.splitlines()
             if line.strip().startswith('CLOUD_IMAGE="')
         ]
-        mstore_cloud_image_assignments = [
-            line.strip()
-            for line in script.splitlines()
-            if line.strip().startswith('MSTORE_CLOUD_IMAGE="')
-        ]
-
         self.assertEqual(
             cloud_image_assignments,
             [
@@ -294,13 +428,7 @@ printf 'LENGTH=%s\\n' "${#value}"
                 'sglang:${BASE_IMAGE_TAG}_JD_${COMMIT_ID}"'
             ],
         )
-        self.assertEqual(
-            mstore_cloud_image_assignments,
-            [
-                'MSTORE_CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/'
-                'kvcacheai/mooncake-store:${MSTORE_IMAGE_TAG}_JD_${COMMIT_ID}"'
-            ],
-        )
+        self.assertNotIn("MSTORE_CLOUD_IMAGE", script)
 
     def test_obsolete_priority_skip_switches_are_removed(self):
         script = (REPO_ROOT / "test/jd-ci/run_jd_ci.sh").read_text(encoding="utf-8")
@@ -350,20 +478,17 @@ printf 'LENGTH=%s\\n' "${#value}"
 
         for required in (
             'MAIN_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/sglang.log"',
-            'MSTORE_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/mooncake-store.log"',
             'SGL_KERNEL_BUILD_LOG="${CI_BUILD_LOGS_DIR}/sgl-kernel.log"',
             'MOONCAKE_TE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-te.log"',
-            'MOONCAKE_STORE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-store.log"',
             'MAIN_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/sglang"',
-            'MSTORE_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/mooncake-store"',
             'SGL_KERNEL_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/sgl-kernel"',
             'MOONCAKE_TE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-te"',
-            'MOONCAKE_STORE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-store"',
             'CPU_MOCK_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/cpu-mock"',
             'SERVER_API_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/server-api"',
             'OPERATOR_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/operator"',
             '-v "${MAIN_CONTAINER_TMP_DIR}:/tmp"',
-            '-v "${MSTORE_CONTAINER_TMP_DIR}:/tmp"',
+            'FINAL_MAIN_TAIL_LOG="${CI_FINAL_STATE_ROOT}/containers/sglang.log"',
+            '| capture_recent_output "${FINAL_MAIN_TAIL_LOG}"',
         ):
             with self.subTest(required=required):
                 self.assertIn(required, script)
@@ -371,6 +496,19 @@ printf 'LENGTH=%s\\n' "${#value}"
         self.assertNotIn('CI_TMP_DIR="${CI_ARTIFACT_ROOT}/tmp/"', script)
         self.assertNotIn('-v "${CI_TMP_DIR}:/tmp"', script)
         self.assertNotIn("/tmp/* /tmp/.[!.]* /tmp/..?*", script)
+        self.assertNotIn("MOONCAKE_STORE", script)
+        self.assertNotIn("MSTORE", script)
+
+    def test_final_output_tail_is_unique_and_cleaned_before_summary(self):
+        script = self._script()
+        cleanup = script.split("cleanup_on_exit() {", maxsplit=1)[1].split(
+            "capture_ci_failure_summary() {", maxsplit=1
+        )[0]
+
+        self.assertIn('CI_FINAL_STATE_ID="${CI_RUNNER_ID}-$$-${RANDOM}"', script)
+        final_state_cleanup = cleanup.index("cleanup_ci_final_state_dir")
+        final_summary = cleanup.index('print_final_failure_summary "${status}"')
+        self.assertLess(final_state_cleanup, final_summary)
 
     def test_mooncake_clone_roots_exist_before_container_builds(self):
         script = self._script()
@@ -379,7 +517,7 @@ printf 'LENGTH=%s\\n' "${#value}"
         ].split("# 构建镜像信息", maxsplit=1)[0]
 
         self.assertIn('"${MOONCAKE_TE_WORK_DIR}/compile"', setup)
-        self.assertIn('"${MOONCAKE_STORE_WORK_DIR}/compile"', setup)
+        self.assertNotIn("MOONCAKE_STORE_WORK_DIR", setup)
 
     def test_exit_cleanup_removes_containers_before_runner_workspace(self):
         script = self._script()
@@ -390,12 +528,9 @@ printf 'LENGTH=%s\\n' "${#value}"
         main_cleanup = cleanup.index(
             'cleanup_container_by_name "${CONTAINER_NAME}" "主容器"'
         )
-        store_cleanup = cleanup.index(
-            'cleanup_container_by_name "${MSTORE_CONTAINER}" "mooncake-store 容器"'
-        )
         runner_cleanup = cleanup.index('cleanup_ci_runner_dir "收尾清理"')
         self.assertLess(main_cleanup, runner_cleanup)
-        self.assertLess(store_cleanup, runner_cleanup)
+        self.assertNotIn("MSTORE_CONTAINER", cleanup)
         self.assertIn('CI_RUNNER_ROOT="${CI_ARTIFACT_ROOT}/runners/', script)
         self.assertIn("rm -rf \"${CI_RUNNER_ROOT}\"", script)
 
@@ -405,9 +540,8 @@ printf 'LENGTH=%s\\n' "${#value}"
         for required in (
             "runners/${COMMIT_ID:0:9}",
             "主 SGLang 容器",
-            "mooncake-store 容器",
             "SGL-Kernel",
-            "Mooncake TE/store",
+            "Mooncake TE",
             "无论成功、失败还是中断",
         ):
             with self.subTest(required=required):

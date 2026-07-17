@@ -8,10 +8,10 @@ SGL-Kernel 编译、清理和镜像发布结构；评审事件只运行测试，
 - 向 `JD-${BASE_IMAGE_TAG}` 提交正常 PR：使用 `-r`。每次重编两个组件、执行全部
   JD case、更新正式缓存，但不创建镜像。
 - 任意分支需要快速产出验证镜像：使用 `-m`。只读复用对应版本主分支由 `-r`
-  生成的正式缓存，不重编、不跑测试，cache miss 直接失败；成功后发布两张带当前
-  commit 标识的镜像。
+  生成的正式缓存，不重编、不跑测试，cache miss 直接失败；成功后发布一张带当前
+  commit 标识的 SGLang 镜像。
 - 临时开发分支需要验证镜像：使用 `-t`。默认重编两个组件并执行全部 JD case；
-  用户确认某组件无改动后，才可显式跳过该组件编译。成功后发布两张临时镜像。
+  用户确认某组件无改动后，才可显式跳过该组件编译。成功后发布一张临时 SGLang 镜像。
 
 无参数等价于 `-r`。旧调用方可继续使用 `note__merge_request` 和
 `merge_request__merged`，分别等价于 `-r` 和 `-m`。
@@ -89,7 +89,7 @@ JD CI 通过表示：在当前固定清单、测试输入、GPU 型号和性能�
 - Server/API 回归 `1/1` 通过；
 - 算子正确性与性能回归 `8/8` 通过；
 - 汇总报告为 `status=passed`、`failed_regressions=[]`；
-- 评审事件未产出主镜像或 Mooncake-store 镜像。
+- 评审事件未产出 SGLang 镜像。
 
 完整 GPU 流水线对应功能提交 `6eedb906b`。最终提交 `628e4428d` 只清理残留术语
 并补强命名契约，已在同一流水线机器重新通过 37 个 JD CI 单测、Shell 语法和命名
@@ -103,7 +103,7 @@ JD CI 通过表示：在当前固定清单、测试输入、GPU 型号和性能�
 
 ### CPU and Mock Regression：全部 JD CPU/mock 回归
 
-强制隐藏 GPU，执行 manifest 中全部 `cpu` case。覆盖：
+不隐藏流水线机器上的 GPU，执行 manifest 中全部 `cpu` case。覆盖：
 
 - OpenAI 协议、thinking/ignore-EOS 和函数调用解析；
 - tokenizer/request state、多模态清理和超时；
@@ -200,16 +200,16 @@ bash test/jd-ci/run_jd_ci.sh -t  # 临时分支验证镜像
 | 入口 | 组件产物 | 固定累积 JD 回归 | 镜像 |
 | --- | --- | --- | --- |
 | `-r` / `--review` / `note__merge_request` / 无参数 | 强制编译并更新正式缓存 | 固定全量执行 | 不产出 |
-| `-m` / `--merge` / `merge_request__merged` | 任意分支只安装对应版本主分支的正式缓存，cache miss 失败 | 固定跳过 | 产出带当前 commit 标识的 SGLang 和 Mooncake-store 镜像 |
-| `-t` / `--temp-image` | 继承基础镜像或在 commit 临时目录编译 | 默认全量执行，可显式全部跳过 | 产出与 `-m` 标签格式一致的 SGLang 和 Mooncake-store 镜像 |
+| `-m` / `--merge` / `merge_request__merged` | 任意分支只安装对应版本主分支的正式缓存，cache miss 失败 | 固定跳过 | 产出带当前 commit 标识的 SGLang 镜像 |
+| `-t` / `--temp-image` | 继承基础镜像或在 commit 临时目录编译 | 默认全量执行，可显式全部跳过 | 产出与 `-m` 标签格式一致的 SGLang 镜像 |
 
 `-r` 固定按 CPU/Mock、Server/API、算子正确性与性能的顺序执行全部三类回归。
 任一回归失败会记录失败状态，但不会阻止后续回归执行；三类回归结束后统一生成报告
 并返回失败。`-r` 不存在回归跳过开关，也不允许按 commit diff 跳过 case。
 
-`-m` 允许任意分支只读复用对应版本主分支的正式 SGL-Kernel、Mooncake TE 和
-Mooncake-store 缓存；任一 cache miss 都直接失败，不允许回退到源码编译。它固定
-跳过 JD 回归，并产出带当前 commit 标识的两张镜像。`note__merge_request` 和
+`-m` 允许任意分支只读复用对应版本主分支的正式 SGL-Kernel 和 Mooncake TE
+缓存；任一 cache miss 都直接失败，不允许回退到源码编译。它固定
+跳过 JD 回归，并产出带当前 commit 标识的一张 SGLang 镜像。`note__merge_request` 和
 `merge_request__merged` 继续分别兼容 `-r` 和 `-m`，方便现有流水线事件调用方
 无缝迁移。
 
@@ -218,7 +218,7 @@ Mooncake-store 缓存；任一 cache miss 都直接失败，不允许回退到�
 | 环境变量 | 默认值 | `0` | `1` |
 | --- | --- | --- | --- |
 | `JD_CI_SKIP_SGL_KERNEL_BUILD` | `0` | 在本次 commit runner 的 `artifacts/` 目录编译并安装 | 用户确认无相关改动，继承基础镜像组件 |
-| `JD_CI_SKIP_MOONCAKE_BUILD` | `0` | 在同一 commit 临时根目录编译并安装 TE/store | 用户确认无相关改动，继承基础镜像组件 |
+| `JD_CI_SKIP_MOONCAKE_BUILD` | `0` | 在同一 commit 临时根目录编译并安装 Mooncake TE | 用户确认无相关改动，继承基础镜像组件 |
 | `JD_CI_SKIP_TEST` | `0` | 固定执行全部三类 JD 回归 | 跳过全部回归并生成显式 skip 报告 |
 
 三个变量默认均为 `0`，并且只允许用于 `-t`。任何一个变量在 `-r` 或 `-m` 中设为
@@ -227,8 +227,8 @@ Mooncake-store 缓存；任一 cache miss 都直接失败，不允许回退到�
 显式 skip。
 
 临时模式不读取、写入或覆盖正式组件缓存。成功、失败、中断和镜像推送完成后都会
-清理 commit 临时目录。主容器与 Mooncake-store 容器被视为同一组验证产物；任一
-组件、容器或已启用测试失败时，两张镜像都不推送。全部门禁通过后才产出镜像；
+清理 commit 临时目录。任一组件、主容器或已启用测试失败时都不推送镜像。
+全部门禁通过后才产出镜像；
 `-t` 与 `-m` 统一使用 `*_JD_${COMMIT_ID}` 标签格式。
 
 ```bash
@@ -250,9 +250,9 @@ JD_CI_SKIP_TEST=1 \
 | 分支改动 | 推荐命令前缀 | 实际行为 |
 | --- | --- | --- |
 | SGLang 或 SGL-Kernel 有改动，Mooncake 无改动 | `JD_CI_SKIP_MOONCAKE_BUILD=1` | 重编 SGL-Kernel，继承基础镜像 Mooncake，执行全量回归 |
-| Mooncake 有改动，SGL-Kernel 无改动 | `JD_CI_SKIP_SGL_KERNEL_BUILD=1` | 重编 Mooncake TE/store，继承基础镜像 SGL-Kernel，执行全量回归 |
+| Mooncake 有改动，SGL-Kernel 无改动 | `JD_CI_SKIP_SGL_KERNEL_BUILD=1` | 重编 Mooncake TE，继承基础镜像 SGL-Kernel，执行全量回归 |
 | 两个组件均无改动 | 两个组件 skip 均为 `1` | 继承基础镜像组件，仍执行全量回归 |
-| 只需验证镜像能否打包 | 组件 skip 按实际改动设置，并加 `JD_CI_SKIP_TEST=1` | 不执行回归，生成显式 skip 报告后再经过双容器门禁 |
+| 只需验证镜像能否打包 | 组件 skip 按实际改动设置，并加 `JD_CI_SKIP_TEST=1` | 不执行回归，生成显式 skip 报告后再经过主容器门禁 |
 
 ## 缓存、报告与清理
 
@@ -262,7 +262,6 @@ JD_CI_SKIP_TEST=1 \
 | --- | --- | --- |
 | SGL-Kernel 正式缓存 | `${CI_WORK_DIR}/ci/sglang/sgl-kernel/${BASE_IMAGE_TAG}` | `-r` 更新，`-m` 只读 |
 | Mooncake TE 正式缓存 | `${CI_WORK_DIR}/ci/sglang/mooncake_te/${MOONCAKE_VERSION_TAG}` | `-r` 更新，`-m` 只读 |
-| Mooncake-store 正式缓存 | `${CI_WORK_DIR}/ci/sglang/mooncake_store/${MOONCAKE_VERSION_TAG}` | `-r` 更新，`-m` 只读 |
 | 本次 runner 日志、临时依赖和 `-t` 产物 | `${CI_WORK_DIR}/ci/sglang/jd-ci/runners/${COMMIT_ID:0:9}` | 仅本次 CI 存在，退出时整体清理 |
 
 本次 runner id 固定为 commit id 的前 9 位。runner 目录内按用途隔离：
@@ -270,19 +269,24 @@ JD_CI_SKIP_TEST=1 \
 ```text
 runners/<9-char-commit>/
 ├── logs/
-│   ├── containers/       # 主 SGLang 容器、mooncake-store 容器
-│   ├── builds/           # SGL-Kernel、Mooncake TE/store 编译日志
+│   ├── containers/       # 主 SGLang 容器
+│   ├── builds/           # SGL-Kernel、Mooncake TE 编译日志
 │   └── tests/            # CPU/Mock、Server/API、Operator 独立 case 日志和报告
 ├── work/
-│   ├── containers/       # 两个容器各自的临时目录和缓存
-│   ├── builds/           # 三类编译各自的依赖和中间文件
+│   ├── containers/       # 主容器的临时目录和缓存
+│   ├── builds/           # 两类组件编译各自的依赖和中间文件
 │   └── tests/            # 三类回归各自的临时依赖和缓存
 └── artifacts/                 # 仅 `-t` 使用的临时 wheel
 ```
 
-失败时会在删除前把完整日志转储到流水线 stdout。退出 trap 先停止
-Docker CLI 并删除两个容器，再删除整个 runner 目录。无论成功、失败还是中断，
-日志、报告、临时依赖、编译中间文件和临时产物都不会在磁盘上持续保留。
+失败时会在删除前把完整日志转储到流水线 stdout，并从失败 case、编译日志和
+容器日志中提取简短根因。退出 trap 先停止 Docker CLI 并删除主容器，再删除
+整个 runner 目录；清理完成后，终端最后固定重新输出 `最终失败原因`、失败流水线、
+失败 case、根因日志片段和最终退出码，避免最后一屏只剩清理现场的日志。
+主容器的 stdout 同时保留最近 200 行到当前进程唯一的 `final-state` 缓冲区；即使
+runner 日志目录意外消失，最终摘要仍能回放最后的实际异常，摘要打印前会删除该缓冲区。
+无论成功、失败还是中断，日志、报告、临时依赖、编译中间文件和临时产物都不会在
+磁盘上持续保留。
 
 ## 提交前与流水线机器验证
 

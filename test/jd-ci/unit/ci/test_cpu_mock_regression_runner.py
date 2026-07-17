@@ -58,9 +58,7 @@ class TestCPUAndMockRegressionRunner(CustomTestCase):
         script = (REPO_ROOT / "test/jd-ci/run_jd_ci.sh").read_text(encoding="utf-8")
 
         self.assertEqual(script.count("'${MOONCAKE_TE_WORK_DIR}/compile' 'te'"), 1)
-        self.assertEqual(
-            script.count("'${MOONCAKE_STORE_WORK_DIR}/compile' 'store'"), 1
-        )
+        self.assertNotIn("MOONCAKE_STORE_WORK_DIR", script)
         self.assertEqual(
             script.count("bash '${SOURCE_PATH}/test/jd-ci/env/build_sgl_kernel.sh'"),
             1,
@@ -75,11 +73,10 @@ class TestCPUAndMockRegressionRunner(CustomTestCase):
             'if [[ ${EXIT_CODE} -eq 0 && "${PUBLISH_IMAGES}" == "1" ]]'
         )
         self.assertIn(publish_condition, script)
-        self.assertLess(
-            script.index("STORE_EXIT_CODE="), script.index(publish_condition)
-        )
-        self.assertIn('docker commit \\', script)
+        self.assertEqual(script.count("docker commit"), 1)
+        self.assertEqual(script.count("docker push"), 1)
         self.assertIn('docker push "${CLOUD_IMAGE}"', script)
+        self.assertNotIn("MSTORE_CLOUD_IMAGE", script)
 
     def test_cpu_mock_runs_fixed_jd_manifest_not_upstream_suites(self):
         script = RUNNER.read_text(encoding="utf-8")

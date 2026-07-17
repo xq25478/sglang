@@ -15,13 +15,13 @@ print_usage() {
   -m, --merge        快速复用正式缓存产出镜像。
                      任意分支都可以复用对应版本主分支的正式缓存；
                      缓存缺失立即失败，不执行 JD CI 回归，
-                     产出带当前 commit 标识的 SGLang 和 Mooncake-store 镜像。
+                     产出带当前 commit 标识的 SGLang 镜像。
                      兼容事件名: merge_request__merged
 
   -t, --temp-image   临时分支验证镜像。
                      组件默认在 commit 独立临时目录中编译并安装；
                      可由用户显式跳过组件编译或全部测试；
-                     所有已启用门禁通过后产出两张临时验证镜像并清理临时目录。
+                     所有已启用门禁通过后产出临时 SGLang 镜像并清理临时目录。
 
   -h, --help         显示本帮助并退出。
 
@@ -35,7 +35,7 @@ print_usage() {
   * -r 和 -m 不允许通过上述变量跳过正式流程。
   * -m 允许任意分支只读复用对应版本主分支的正式缓存；cache miss 立即失败。
   * -t 不能在正式分支运行，且不会读取、写入或覆盖正式组件缓存。
-  * -t 的任一组件、容器或测试失败时，不推送两张临时镜像。
+  * -t 的任一组件、容器或测试失败时，不推送临时 SGLang 镜像。
 
 示例:
   test/jd-ci/run_jd_ci.sh -r
@@ -196,17 +196,16 @@ CI_ARTIFACT_ROOT="${CI_WORK_DIR}/ci/sglang/jd-ci"
 CI_RUNNER_ID="${COMMIT_ID}"
 CI_RUN_ID="${CI_RUNNER_ID}"
 CI_RUNNER_ROOT="${CI_ARTIFACT_ROOT}/runners/${CI_RUNNER_ID}"
+CI_FINAL_STATE_ID="${CI_RUNNER_ID}-$$-${RANDOM}"
+CI_FINAL_STATE_ROOT="${CI_ARTIFACT_ROOT}/final-state/${CI_FINAL_STATE_ID}"
 
 TIMESTAMP=$(date +%Y%m%d%H%M%S)
 CONTAINER_NAME="SGLANG_CI_BASE_IMAGE_${BASE_IMAGE_TAG}-BRANCH_${BRANCH_NAME_FOR_DOCKER}-COMMIT_${COMMIT_ID}-RUN_${CI_RUN_ID}"
 CONTAINER_NAME=${CONTAINER_NAME,,} # 转小写
 echo "[SGLang CI] CONTAINER_NAME=${CONTAINER_NAME}"
 
-# mooncake-store container
-MSTORE_IMAGE_TAG=$(docker run --rm --entrypoint bash "${BASE_IMAGE}" -c "pip list 2>/dev/null | grep -i '^mooncake-transfer-engine' | awk '{print \$2}' | head -1")
-MOONCAKE_VERSION_TAG="v${MSTORE_IMAGE_TAG}"
-MSTORE_CONTAINER="SGLANG_CI_BASE_IMAGE_MSTORE_${MSTORE_IMAGE_TAG}-BRANCH_${BRANCH_NAME_FOR_DOCKER}-COMMIT_${COMMIT_ID}-RUN_${CI_RUN_ID}"
-MSTORE_CONTAINER=${MSTORE_CONTAINER,,} # 转小写
+MOONCAKE_VERSION=$(docker run --rm --entrypoint bash "${BASE_IMAGE}" -c "pip list 2>/dev/null | grep -i '^mooncake-transfer-engine' | awk '{print \$2}' | head -1")
+MOONCAKE_VERSION_TAG="v${MOONCAKE_VERSION}"
 
 CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/sglang:${BASE_IMAGE_TAG}_JD_${COMMIT_ID}"
 CLOUD_IMAGE=${CLOUD_IMAGE,,} # 转小写
@@ -227,7 +226,6 @@ JD_CI_DUMP_LOG_MAX_BYTES="${JD_CI_DUMP_LOG_MAX_BYTES:-0}"
 JD_CI_TEMP_ARTIFACT_ROOT=""
 PERSISTENT_SGL_KERNEL_CACHE_HOST="${CI_WORK_DIR}/ci/sglang/sgl-kernel/${BASE_IMAGE_TAG}"
 PERSISTENT_MOONCAKE_ENGINE_CACHE_HOST="${CI_WORK_DIR}/ci/sglang/mooncake_te/${MOONCAKE_VERSION_TAG}"
-PERSISTENT_MOONCAKE_STORE_WHEEL_CACHE_HOST="${CI_WORK_DIR}/ci/sglang/mooncake_store/${MOONCAKE_VERSION_TAG}"
 case "${CI_MODE}" in
     review|merge)
         JD_CI_ARTIFACT_SCOPE="persistent"
@@ -240,14 +238,12 @@ case "${CI_MODE}" in
         fi
         WHEEL_CACHE_HOST="${PERSISTENT_SGL_KERNEL_CACHE_HOST}"
         MOONCAKE_ENGINE_CACHE_HOST="${PERSISTENT_MOONCAKE_ENGINE_CACHE_HOST}"
-        MOONCAKE_STORE_WHEEL_CACHE_HOST="${PERSISTENT_MOONCAKE_STORE_WHEEL_CACHE_HOST}"
         ;;
     temp-image)
         JD_CI_ARTIFACT_SCOPE="temporary"
         JD_CI_TEMP_ARTIFACT_ROOT="${CI_RUNNER_ROOT}/artifacts"
         WHEEL_CACHE_HOST="${JD_CI_TEMP_ARTIFACT_ROOT}/sgl-kernel/${BASE_IMAGE_TAG}"
         MOONCAKE_ENGINE_CACHE_HOST="${JD_CI_TEMP_ARTIFACT_ROOT}/mooncake_te/${MOONCAKE_VERSION_TAG}"
-        MOONCAKE_STORE_WHEEL_CACHE_HOST="${JD_CI_TEMP_ARTIFACT_ROOT}/mooncake_store/${MOONCAKE_VERSION_TAG}"
         if [[ "${JD_CI_SKIP_SGL_KERNEL_BUILD}" == "1" ]]; then
             SGL_KERNEL_ARTIFACT_SCOPE="base-image"
         else
@@ -271,7 +267,6 @@ fi
 echo "[SGLang CI] WHEEL_CACHE_BASE=${WHEEL_CACHE_HOST}"
 echo "[SGLang CI] MOONCAKE_VERSION_TAG=${MOONCAKE_VERSION_TAG}"
 echo "[SGLang CI] MOONCAKE_TE_CACHE_BASE=${MOONCAKE_ENGINE_CACHE_HOST}"
-echo "[SGLang CI] MOONCAKE_STORE_CACHE_BASE=${MOONCAKE_STORE_WHEEL_CACHE_HOST}"
 
 if [[ "${CI_MODE}" == "merge" ]]; then
     MOONCAKE_FORCE_REBUILD=0
@@ -295,19 +290,15 @@ CI_CONTAINER_LOGS_DIR="${CI_LOGS_DIR}/containers"
 CI_BUILD_LOGS_DIR="${CI_LOGS_DIR}/builds"
 CI_TEST_LOGS_DIR="${CI_LOGS_DIR}/tests"
 MAIN_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/sglang.log"
-MSTORE_PIPELINE_LOG="${CI_CONTAINER_LOGS_DIR}/mooncake-store.log"
 SGL_KERNEL_BUILD_LOG="${CI_BUILD_LOGS_DIR}/sgl-kernel.log"
 MOONCAKE_TE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-te.log"
-MOONCAKE_STORE_BUILD_LOG="${CI_BUILD_LOGS_DIR}/mooncake-store.log"
+FINAL_MAIN_TAIL_LOG="${CI_FINAL_STATE_ROOT}/containers/sglang.log"
 
 CI_RUNNER_WORK_DIR="${CI_RUNNER_ROOT}/work"
 MAIN_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/sglang"
-MSTORE_CONTAINER_WORK_DIR="${CI_RUNNER_WORK_DIR}/containers/mooncake-store"
 MAIN_CONTAINER_TMP_DIR="${MAIN_CONTAINER_WORK_DIR}/tmp"
-MSTORE_CONTAINER_TMP_DIR="${MSTORE_CONTAINER_WORK_DIR}/tmp"
 SGL_KERNEL_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/sgl-kernel"
 MOONCAKE_TE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-te"
-MOONCAKE_STORE_WORK_DIR="${CI_RUNNER_WORK_DIR}/builds/mooncake-store"
 CPU_MOCK_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/cpu-mock"
 SERVER_API_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/server-api"
 OPERATOR_TEST_WORK_DIR="${CI_RUNNER_WORK_DIR}/tests/operator"
@@ -316,6 +307,8 @@ CI_RUNNER_CLEANUP_TIMEOUT_SEC="${CI_RUNNER_CLEANUP_TIMEOUT_SEC:-300}"
 DOCKER_CLEANUP_TIMEOUT_SEC="${DOCKER_CLEANUP_TIMEOUT_SEC:-60}"
 ACTIVE_DOCKER_PID=""
 FAILURE_LOGS_DUMPED=0
+FINAL_FAILURE_SUMMARY=""
+MAIN_EXIT_CODE=""
 
 run_with_timeout() {
     local seconds="$1"
@@ -325,6 +318,26 @@ run_with_timeout() {
     else
         "$@"
     fi
+}
+
+capture_recent_output() {
+    local output_file="$1"
+    local max_lines="${2:-200}"
+    awk -v output_file="${output_file}" -v max_lines="${max_lines}" '
+        {
+            print
+            fflush()
+            recent[NR % max_lines] = $0
+        }
+        END {
+            count = NR < max_lines ? NR : max_lines
+            start = NR - count + 1
+            for (line_number = start; line_number <= NR; line_number++) {
+                print recent[line_number % max_lines] > output_file
+            }
+            close(output_file)
+        }
+    '
 }
 
 rm_ci_runner_dir() {
@@ -354,6 +367,20 @@ cleanup_ci_runner_dir() {
         return 1
     else
         echo "[SGLang CI] ${label} runner 目录已删除: ${CI_RUNNER_ROOT}"
+    fi
+}
+
+cleanup_ci_final_state_dir() {
+    if [[ ! "${CI_FINAL_STATE_ID}" =~ ^[0-9a-f]{9}-[0-9]+-[0-9]+$ ]] \
+        || [[ "${CI_FINAL_STATE_ROOT:-}" != "${CI_ARTIFACT_ROOT}/final-state/${CI_FINAL_STATE_ID}" ]]; then
+        echo "[SGLang CI] WARN: 拒绝清理非预期 final-state 目录: ${CI_FINAL_STATE_ROOT:-<unset>}"
+        return 1
+    fi
+    run_with_timeout "${CI_RUNNER_CLEANUP_TIMEOUT_SEC}" \
+        rm -rf "${CI_FINAL_STATE_ROOT}" 2>/dev/null || true
+    if [[ -d "${CI_FINAL_STATE_ROOT}" ]]; then
+        echo "[SGLang CI] WARN: final-state 目录未完全删除: ${CI_FINAL_STATE_ROOT}"
+        return 1
     fi
 }
 
@@ -396,7 +423,9 @@ cleanup_on_exit() {
     trap - EXIT INT TERM
     stop_active_docker_cli
     cleanup_container_by_name "${CONTAINER_NAME}" "主容器"
-    cleanup_container_by_name "${MSTORE_CONTAINER}" "mooncake-store 容器"
+    if [[ ${status} -ne 0 ]]; then
+        capture_ci_failure_summary "${status}"
+    fi
     if [[ ${status} -ne 0 && ${FAILURE_LOGS_DUMPED} -eq 0 ]]; then
         dump_ci_failure_logs
     fi
@@ -404,9 +433,56 @@ cleanup_on_exit() {
         echo "[SGLang CI] ERROR: runner 目录清理失败"
         if [[ ${status} -eq 0 ]]; then
             status=1
+            FINAL_FAILURE_SUMMARY="[JD CI FAILURE] overall_exit_code=1
+[JD CI FAILURE] root_cause=runner 目录清理失败: ${CI_RUNNER_ROOT}"
         fi
     fi
+    if ! cleanup_ci_final_state_dir; then
+        echo "[SGLang CI] ERROR: final-state 目录清理失败"
+        if [[ ${status} -eq 0 ]]; then
+            status=1
+            FINAL_FAILURE_SUMMARY="[JD CI FAILURE] overall_exit_code=1
+[JD CI FAILURE] root_cause=final-state 目录清理失败: ${CI_FINAL_STATE_ROOT}"
+        else
+            FINAL_FAILURE_SUMMARY+=$'\n'"[JD CI FAILURE] cleanup_error=final-state 目录清理失败: ${CI_FINAL_STATE_ROOT}"
+        fi
+    fi
+    if [[ ${status} -ne 0 ]]; then
+        print_final_failure_summary "${status}"
+    fi
     return ${status}
+}
+
+capture_ci_failure_summary() {
+    local status="$1"
+    local summary_args=(
+        --logs-dir "${CI_LOGS_DIR}"
+        --failure-summary
+        --overall-exit-code "${status}"
+        --fallback-logs-dir "${CI_FINAL_STATE_ROOT}"
+    )
+    if [[ -n "${MAIN_EXIT_CODE}" ]]; then
+        summary_args+=(--main-exit-code "${MAIN_EXIT_CODE}")
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        FINAL_FAILURE_SUMMARY="$(
+            python3 "${SOURCE_PATH}/test/jd-ci/report/dump_ci_logs.py" \
+                "${summary_args[@]}" 2>&1
+        )" || true
+    fi
+    if [[ -z "${FINAL_FAILURE_SUMMARY}" ]]; then
+        FINAL_FAILURE_SUMMARY="[JD CI FAILURE] overall_exit_code=${status}
+[JD CI FAILURE] root_cause=失败摘要生成失败，请查看上方完整日志转储"
+    fi
+}
+
+print_final_failure_summary() {
+    local status="$1"
+    echo "[SGLang CI] ========================================"
+    echo "[SGLang CI]  最终失败原因（现场清理已完成）"
+    echo "[SGLang CI] ========================================"
+    printf '%s\n' "${FINAL_FAILURE_SUMMARY}"
+    echo "[SGLang CI] FINAL_STATUS=FAILED exit_code=${status}"
 }
 
 dump_ci_failure_logs() {
@@ -458,26 +534,22 @@ mkdir -p \
     "${CI_CONTAINER_LOGS_DIR}" \
     "${CI_BUILD_LOGS_DIR}" \
     "${CI_TEST_LOGS_DIR}" \
+    "${CI_FINAL_STATE_ROOT}/containers" \
     "${MAIN_CONTAINER_TMP_DIR}" \
-    "${MSTORE_CONTAINER_TMP_DIR}" \
     "${SGL_KERNEL_WORK_DIR}" \
     "${MOONCAKE_TE_WORK_DIR}/compile" \
-    "${MOONCAKE_STORE_WORK_DIR}/compile" \
     "${CPU_MOCK_TEST_WORK_DIR}" \
     "${SERVER_API_TEST_WORK_DIR}" \
     "${OPERATOR_TEST_WORK_DIR}" \
     "${WHEEL_CACHE_HOST}" \
-    "${MOONCAKE_ENGINE_CACHE_HOST}" \
-    "${MOONCAKE_STORE_WHEEL_CACHE_HOST}"
-chmod 1777 "${MAIN_CONTAINER_TMP_DIR}" "${MSTORE_CONTAINER_TMP_DIR}" 2>/dev/null || true
+    "${MOONCAKE_ENGINE_CACHE_HOST}"
+chmod 1777 "${MAIN_CONTAINER_TMP_DIR}" 2>/dev/null || true
 echo "[SGLang CI] CI_RUNNER_ID=${CI_RUNNER_ID}"
 echo "[SGLang CI] CI_RUNNER_ROOT=${CI_RUNNER_ROOT}"
 echo "[SGLang CI] CI_LOGS_DIR=${CI_LOGS_DIR}"
 echo "[SGLang CI] MAIN_PIPELINE_LOG=${MAIN_PIPELINE_LOG}"
-echo "[SGLang CI] MSTORE_PIPELINE_LOG=${MSTORE_PIPELINE_LOG}"
 echo "[SGLang CI] SGL_KERNEL_BUILD_LOG=${SGL_KERNEL_BUILD_LOG}"
 echo "[SGLang CI] MOONCAKE_TE_BUILD_LOG=${MOONCAKE_TE_BUILD_LOG}"
-echo "[SGLang CI] MOONCAKE_STORE_BUILD_LOG=${MOONCAKE_STORE_BUILD_LOG}"
 echo "[SGLang CI] CI_RUNNER_WORK_DIR=${CI_RUNNER_WORK_DIR}"
 
 # 构建镜像信息
@@ -650,7 +722,7 @@ run_docker_attached docker run \
             jd_ci_failed=0
 
             echo '[JD CI] ========================================'
-            echo '[JD CI]  CPU and Mock Regression: 固定累积 JD CPU/mock 回归（GPU 隐藏）'
+            echo '[JD CI]  CPU and Mock Regression: 固定累积 JD CPU/mock 回归（GPU 保持可见）'
             echo '[JD CI] ========================================'
             run_with_isolated_workspace '${CPU_MOCK_TEST_WORK_DIR}' \
                 bash '${SOURCE_PATH}/test/jd-ci/pipeline/run_cpu_mock_regression.sh' \
@@ -702,131 +774,18 @@ run_docker_attached docker run \
         else
             echo '[JD CI] merge 模式: 任意分支跳过测试，只安装对应版本主分支的正式缓存并打包镜像'
         fi
-    " 2>&1 | tee "${MAIN_PIPELINE_LOG}"
+    " 2>&1 | tee "${MAIN_PIPELINE_LOG}" \
+        | capture_recent_output "${FINAL_MAIN_TAIL_LOG}"
 
 MAIN_EXIT_CODE=${PIPESTATUS[0]}
 set -e
-
-#############################################################################################
-MSTORE_IMAGE_PREFIX="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/kvcacheai/mooncake"
-MSTORE_IMAGE="${MSTORE_IMAGE_PREFIX}:${MSTORE_IMAGE_TAG}"
-MSTORE_CLOUD_IMAGE="images-infra-cn-east-1-inner.jcr.service.jdcloud.com/kvcacheai/mooncake-store:${MSTORE_IMAGE_TAG}_JD_${COMMIT_ID}"
-MSTORE_CLOUD_IMAGE=${MSTORE_CLOUD_IMAGE,,} # 转小写
-
-set +e
-cleanup_container_by_name "${MSTORE_CONTAINER}" "启动前 mooncake-store 容器"
-
-run_docker_attached docker run \
-    --name "${MSTORE_CONTAINER}" \
-    --platform linux/amd64 \
-    --net=host --pid=host --ipc=host --privileged \
-    --gpus all \
-    --user root \
-    -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-    -e NVIDIA_VISIBLE_DEVICES=all \
-    -e DISPLAY=${DISPLAY:-} \
-    -e WHEEL_CACHE_DIR=/wheels \
-    -e MOONCAKE_WHEEL_CACHE_DIR=/mooncake-store-wheels \
-    -e MOONCAKE_FORCE_REBUILD="${MOONCAKE_FORCE_REBUILD}" \
-    -e MOONCAKE_REQUIRE_CACHE="${MOONCAKE_REQUIRE_CACHE}" \
-    -e BASE_IMAGE_TAG="${MSTORE_IMAGE_TAG}" \
-    -e EVENT_TYPE="${EVENT_TYPE}" \
-    -e SGLANG_KERNEL_TARGET_ARCHS="${SGLANG_KERNEL_TARGET_ARCHS}" \
-    -e JD_LOG_DIR="${CI_LOGS_DIR}/helpers/mooncake-store" \
-    -e CI_TMP_DIR="${MSTORE_CONTAINER_WORK_DIR}" \
-    -e TMPDIR="${MSTORE_CONTAINER_TMP_DIR}" \
-    -e TMP="${MSTORE_CONTAINER_TMP_DIR}" \
-    -e TEMP="${MSTORE_CONTAINER_TMP_DIR}" \
-    -e CUDA_CACHE_PATH="${MSTORE_CONTAINER_WORK_DIR}/cuda-cache" \
-    -e MOONCAKE_TMP_DIR="${MOONCAKE_STORE_WORK_DIR}/tmp" \
-    -e UV_CACHE_DIR="${MSTORE_CONTAINER_WORK_DIR}/uv-cache" \
-    -e PIP_CACHE_DIR="${MSTORE_CONTAINER_WORK_DIR}/pip-cache" \
-    -e XDG_CACHE_HOME="${MSTORE_CONTAINER_WORK_DIR}/xdg-cache" \
-    -e TORCH_EXTENSIONS_DIR="${MSTORE_CONTAINER_WORK_DIR}/torch-extensions" \
-    -e TRITON_CACHE_DIR="${MSTORE_CONTAINER_WORK_DIR}/triton-cache" \
-    -e TORCHINDUCTOR_CACHE_DIR="${MSTORE_CONTAINER_WORK_DIR}/torchinductor-cache" \
-    -e GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null' \
-    -v "${CI_USER_SSH_DIR}:/root/.ssh:ro" \
-    -v /sys/kernel/debug:/sys/kernel/debug \
-    -v "${MSTORE_CONTAINER_TMP_DIR}:/tmp" \
-    -v /mnt/nas/:/mnt/nas/ \
-    -v "${CI_WORK_DIR}:${CI_WORK_DIR}" \
-    -v "${WHEEL_CACHE_HOST}:/wheels" \
-    -v "${MOONCAKE_STORE_WHEEL_CACHE_HOST}:/mooncake-store-wheels" \
-    -v "${SOURCE_PATH}:${SOURCE_PATH}" \
-    -w "${SOURCE_PATH}" \
-    --entrypoint /bin/bash \
-    "${MSTORE_IMAGE}" \
-    -c "
-        set -euo pipefail
-        echo '[JD CI] CI 容器启动成功!'
-        echo '[JD CI] CI 工作路径:' \$(pwd)
-        mkdir -p \
-            '${MSTORE_CONTAINER_TMP_DIR}' \
-            '${MOONCAKE_STORE_WORK_DIR}/tmp' \
-            '${MOONCAKE_STORE_WORK_DIR}/cuda-cache' \
-            '${MOONCAKE_STORE_WORK_DIR}/uv-cache' \
-            '${MOONCAKE_STORE_WORK_DIR}/pip-cache' \
-            '${MOONCAKE_STORE_WORK_DIR}/xdg-cache' \
-            '${MOONCAKE_STORE_WORK_DIR}/torch-extensions' \
-            '${MOONCAKE_STORE_WORK_DIR}/triton-cache' \
-            '${MOONCAKE_STORE_WORK_DIR}/torchinductor-cache'
-        chmod 1777 '${MSTORE_CONTAINER_TMP_DIR}' 2>/dev/null || true
-
-        # ---------- 共享环境 ----------
-        source "${SOURCE_PATH}/test/jd-ci/env/setup_logger.sh" "jd_ci_env"
-        # Fix git dubious ownership in mounted CI directories
-        git config --global --add safe.directory "${SOURCE_PATH}" 2>/dev/null || true
-        # ---------- pip 镜像 ----------
-        pip config set global.index-url https://mirrors.jd.com/pypi/web/simple 2>/dev/null || true
-        pip config set global.trusted-host mirrors.jd.com 2>/dev/null || true
-
-        # ---------- 编译 ----------
-        if [[ '${JD_CI_SKIP_MOONCAKE_BUILD}' == '1' ]]; then
-            echo '[JD CI] 跳过 mooncake 编译 (JD_CI_SKIP_MOONCAKE_BUILD=1)'
-        else
-            echo '[JD CI] 开始 mooncake 编译'
-            echo '[JD CI] mooncake-store wheel cache: /mooncake-store-wheels'
-            echo '[JD CI] MOONCAKE_FORCE_REBUILD='\${MOONCAKE_FORCE_REBUILD}
-            echo '[JD CI] MOONCAKE_REQUIRE_CACHE='\${MOONCAKE_REQUIRE_CACHE}
-            set -o pipefail
-            env \
-                TMPDIR='${MOONCAKE_STORE_WORK_DIR}/tmp' \
-                TMP='${MOONCAKE_STORE_WORK_DIR}/tmp' \
-                TEMP='${MOONCAKE_STORE_WORK_DIR}/tmp' \
-                CUDA_CACHE_PATH='${MOONCAKE_STORE_WORK_DIR}/cuda-cache' \
-                UV_CACHE_DIR='${MOONCAKE_STORE_WORK_DIR}/uv-cache' \
-                PIP_CACHE_DIR='${MOONCAKE_STORE_WORK_DIR}/pip-cache' \
-                XDG_CACHE_HOME='${MOONCAKE_STORE_WORK_DIR}/xdg-cache' \
-                TORCH_EXTENSIONS_DIR='${MOONCAKE_STORE_WORK_DIR}/torch-extensions' \
-                TRITON_CACHE_DIR='${MOONCAKE_STORE_WORK_DIR}/triton-cache' \
-                TORCHINDUCTOR_CACHE_DIR='${MOONCAKE_STORE_WORK_DIR}/torchinductor-cache' \
-                MOONCAKE_TMP_DIR='${MOONCAKE_STORE_WORK_DIR}/tmp' \
-                bash '${SOURCE_PATH}/test/jd-ci/env/build_mooncake.sh' \
-                '${MOONCAKE_STORE_WORK_DIR}/compile' 'store' \
-                | tee '${MOONCAKE_STORE_BUILD_LOG}'
-            set +o pipefail
-        fi
-    " 2>&1 | tee "${MSTORE_PIPELINE_LOG}"
-STORE_EXIT_CODE=${PIPESTATUS[0]}
-set -e
-
-########################################################################################################
-
-EXIT_CODE=0
-if [ ${MAIN_EXIT_CODE} -ne 0 ]; then
+EXIT_CODE=${MAIN_EXIT_CODE}
+if [ ${EXIT_CODE} -ne 0 ]; then
     echo "[SGLang CI] 主 SGLang 流水线失败，退出码: ${MAIN_EXIT_CODE}"
-    EXIT_CODE=${MAIN_EXIT_CODE}
-fi
-if [ ${STORE_EXIT_CODE} -ne 0 ]; then
-    echo "[SGLang CI] mooncake-store 流水线失败，退出码: ${STORE_EXIT_CODE}"
-    if [ ${EXIT_CODE} -eq 0 ]; then
-        EXIT_CODE=${STORE_EXIT_CODE}
-    fi
 fi
 
 if [[ ${EXIT_CODE} -eq 0 && "${PUBLISH_IMAGES}" == "1" ]]; then
-    echo "[SGLang CI] ${CI_MODE} 所有已启用门禁通过，开始生成两张镜像..."
+    echo "[SGLang CI] ${CI_MODE} 所有已启用门禁通过，开始生成 SGLang 镜像..."
     docker commit \
         -c "WORKDIR /sgl-workspace/sglang" \
         -c 'ENTRYPOINT ["/sgl-workspace/entrypoint.sh"]' \
@@ -834,22 +793,12 @@ if [[ ${EXIT_CODE} -eq 0 && "${PUBLISH_IMAGES}" == "1" ]]; then
         -c "ENV LD_PRELOAD=/sgl-workspace/fake_dns.so" \
         -c "ENV MC_IB_PCI_RELAXED_ORDERING=1" \
         "${CONTAINER_NAME}" "${CLOUD_IMAGE}"
-    docker commit \
-        -c "WORKDIR /sgl-workspace/sglang" \
-        -c 'ENTRYPOINT ["/sgl-workspace/entrypoint.sh"]' \
-        -c 'CMD ["/bin/bash"]' \
-        -c "ENV LD_PRELOAD=/sgl-workspace/fake_dns.so" \
-        -c "ENV MC_IB_PCI_RELAXED_ORDERING=1" \
-        "${MSTORE_CONTAINER}" "${MSTORE_CLOUD_IMAGE}"
-
     docker push "${CLOUD_IMAGE}"
-    docker push "${MSTORE_CLOUD_IMAGE}"
     echo "[SGLang CI] SGLang 云上仓库镜像地址: ${CLOUD_IMAGE}"
-    echo "[SGLang CI] mooncake-store AI Infra 云上仓库镜像地址: ${MSTORE_CLOUD_IMAGE}"
 elif [[ ${EXIT_CODE} -eq 0 ]]; then
     echo "[SGLang CI] review 模式完成，不创建或推送镜像。"
 else
-    echo "[SGLang CI] 流水线门禁失败，不创建或推送两张镜像。"
+    echo "[SGLang CI] 流水线门禁失败，不创建或推送 SGLang 镜像。"
 fi
 
 if [ ${EXIT_CODE} -eq 0 ]; then
