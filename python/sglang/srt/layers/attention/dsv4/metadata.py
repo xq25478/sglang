@@ -119,34 +119,44 @@ class PagedIndexerMetadata:
         init=False, repr=False, default=None
     )
 
+    def build_deep_gemm_metadata(self, c4_seq_lens: torch.Tensor) -> torch.Tensor:
+        """Build schedule metadata for exactly the supplied query rows."""
+        import deep_gemm
+
+        use_jit_indexer = (
+            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
+            or c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
+        )
+        if use_jit_indexer:
+            from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
+        else:
+            from deep_gemm import get_paged_mqa_logits_metadata
+
+        c4_seq_lens = c4_seq_lens.to(torch.int32)
+        if c4_seq_lens.dim() == 1:
+            c4_seq_lens = c4_seq_lens.unsqueeze(-1)
+        metadata = get_paged_mqa_logits_metadata(
+            c4_seq_lens,
+            self.c4_page_size,
+            deep_gemm.get_num_sms(),
+        )
+        assert isinstance(metadata, torch.Tensor)
+        return metadata
+
     def __post_init__(self):
+        # These are eager-prefill-only caches. A metadata object is shared by
+        # all model layers for one batch, so planning each chunk once avoids
+        # repeating the same host/JIT work at every sparse-attention layer.
+        self._deep_gemm_chunk_metadata = {}
+        self._topk_chunk_metadata = {}
+
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
             or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
         ):
             self.deep_gemm_metadata = None
         else:
-            import deep_gemm
-
-            use_jit_indexer = (
-                envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get()
-                or self.c4_seq_lens.numel() > _LARGE_INDEXER_QUERY_THRESHOLD
-            )
-            if use_jit_indexer:
-                from sglang.jit_kernel.dsv4 import get_paged_mqa_logits_metadata
-            else:
-                from deep_gemm import get_paged_mqa_logits_metadata
-
-            _c4 = self.c4_seq_lens.to(torch.int32)
-            if _c4.dim() == 1:
-                _c4 = _c4.unsqueeze(-1)
-            self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                _c4,
-                self.c4_page_size,
-                deep_gemm.get_num_sms(),
-            )
-
-            assert isinstance(self.deep_gemm_metadata, torch.Tensor)
+            self.deep_gemm_metadata = self.build_deep_gemm_metadata(self.c4_seq_lens)
 
         from sglang.jit_kernel.dsv4 import plan_topk_v2
 
@@ -156,6 +166,28 @@ class PagedIndexerMetadata:
             self.topk_metadata = torch.empty((0,))
 
         assert self.page_size == 256, "the system hardcodes page_size=256"
+
+    def get_deep_gemm_chunk_metadata(
+        self, start: int, end: int, c4_seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        key = (start, end)
+        metadata = self._deep_gemm_chunk_metadata.get(key)
+        if metadata is None:
+            metadata = self.build_deep_gemm_metadata(c4_seq_lens)
+            self._deep_gemm_chunk_metadata[key] = metadata
+        return metadata
+
+    def get_topk_chunk_metadata(
+        self, start: int, end: int, c4_seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        key = (start, end)
+        metadata = self._topk_chunk_metadata.get(key)
+        if metadata is None:
+            from sglang.jit_kernel.dsv4 import plan_topk_v2
+
+            metadata = plan_topk_v2(c4_seq_lens)
+            self._topk_chunk_metadata[key] = metadata
+        return metadata
 
     @property
     def c4_page_size(self) -> int:
@@ -185,6 +217,8 @@ class PagedIndexerMetadata:
             assign_fields=assign_fields,
         )
         self.nonpaged_plan = None
+        self._deep_gemm_chunk_metadata.clear()
+        self._topk_chunk_metadata.clear()
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

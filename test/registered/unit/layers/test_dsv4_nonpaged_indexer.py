@@ -7,7 +7,10 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4.indexer import FP8_DTYPE, C4IndexerBackendMixin
-from sglang.srt.layers.attention.dsv4.metadata import NonPagedIndexerPlan
+from sglang.srt.layers.attention.dsv4.metadata import (
+    NonPagedIndexerPlan,
+    PagedIndexerMetadata,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -18,6 +21,169 @@ _INDEXER = "sglang.srt.layers.attention.dsv4.indexer"
 
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
+    def test_logits_chunk_rows_follow_memory_budget(self):
+        get_chunk_rows = C4IndexerBackendMixin._get_mqa_logits_chunk_rows
+
+        self.assertEqual(
+            get_chunk_rows(num_q=1024, num_k=1024, logits_budget_bytes=1),
+            1024,
+        )
+
+        num_q = 65_280
+        num_k = 86_016
+        budget = 4 * 1024**3
+        expected = budget // (num_k * 4)
+        self.assertEqual(
+            get_chunk_rows(
+                num_q=num_q,
+                num_k=num_k,
+                logits_budget_bytes=budget,
+            ),
+            expected,
+        )
+        self.assertEqual(
+            get_chunk_rows(
+                num_q=num_q,
+                num_k=num_k,
+                logits_budget_bytes=num_q * num_k * 4,
+            ),
+            num_q,
+        )
+
+    def test_logits_budget_uses_static_headroom_and_is_cached(self):
+        C4IndexerBackendMixin._mqa_logits_budget_bytes.clear()
+        mem_get_info = MagicMock(return_value=(500, 1000))
+        try:
+            with (
+                envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.override(0.2),
+                patch(
+                    f"{_INDEXER}.get_global_server_args",
+                    return_value=SimpleNamespace(mem_fraction_static=0.7),
+                ),
+                patch(f"{_INDEXER}.get_is_capture_mode", return_value=False),
+                patch(
+                    "torch.cuda.get_device_properties",
+                    return_value=SimpleNamespace(total_memory=1000),
+                ),
+                patch("torch.cuda.mem_get_info", mem_get_info),
+            ):
+                first = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(0)
+                second = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(0)
+        finally:
+            C4IndexerBackendMixin._mqa_logits_budget_bytes.clear()
+
+        self.assertEqual(first, 60)
+        self.assertEqual(second, first)
+        mem_get_info.assert_called_once_with(0)
+
+    def test_chunked_topk_matches_full_topk(self):
+        batch_size = 7
+        max_seq_len = 128
+        topk = 8
+        scores = torch.arange(
+            batch_size * max_seq_len, dtype=torch.float32
+        ).reshape(batch_size, max_seq_len)
+        seq_lens = torch.tensor([128, 127, 96, 65, 64, 63, 32], dtype=torch.int32)
+        page_tables = torch.arange(batch_size * 2, dtype=torch.int32).reshape(
+            batch_size, 2
+        )
+        full_pages = torch.full((batch_size, topk), -1, dtype=torch.int32)
+        full_raw = torch.full_like(full_pages, -1)
+        chunked_pages = torch.full_like(full_pages, -1)
+        chunked_raw = torch.full_like(full_pages, -1)
+
+        with envs.SGLANG_TOPK_TRANSFORM_512_TORCH.override(True):
+            C4IndexerBackendMixin._transform_indexer_topk(
+                logits=scores,
+                c4_seq_lens=seq_lens,
+                page_table=page_tables,
+                out_page_indices=full_pages,
+                c4_page_size=64,
+                raw_indices=full_raw,
+                topk_metadata=None,
+            )
+            for start, end in ((0, 3), (3, 5), (5, 7)):
+                C4IndexerBackendMixin._transform_indexer_topk(
+                    logits=scores[start:end],
+                    c4_seq_lens=seq_lens[start:end],
+                    page_table=page_tables[start:end],
+                    out_page_indices=chunked_pages[start:end],
+                    c4_page_size=64,
+                    raw_indices=chunked_raw[start:end],
+                    topk_metadata=None,
+                )
+
+        torch.testing.assert_close(chunked_pages, full_pages)
+        torch.testing.assert_close(chunked_raw, full_raw)
+
+    def test_deep_gemm_metadata_is_replanned_for_exact_chunk(self):
+        metadata = PagedIndexerMetadata.__new__(PagedIndexerMetadata)
+        metadata.page_size = 256
+        planned = torch.tensor([17], dtype=torch.int32)
+        get_metadata = MagicMock(return_value=planned)
+        deep_gemm = SimpleNamespace(
+            get_num_sms=MagicMock(return_value=132),
+            get_paged_mqa_logits_metadata=get_metadata,
+        )
+        c4_seq_lens = torch.tensor([63, 64, 65], dtype=torch.int64)
+
+        with (
+            envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.override(False),
+            patch.dict(sys.modules, {"deep_gemm": deep_gemm}),
+        ):
+            actual = metadata.build_deep_gemm_metadata(c4_seq_lens)
+
+        self.assertIs(actual, planned)
+        call = get_metadata.call_args
+        torch.testing.assert_close(
+            call.args[0], c4_seq_lens.to(torch.int32).unsqueeze(-1)
+        )
+        self.assertEqual(call.args[1:], (64, 132))
+
+    def test_chunk_metadata_is_cached_per_query_range(self):
+        metadata = PagedIndexerMetadata.__new__(PagedIndexerMetadata)
+        metadata._deep_gemm_chunk_metadata = {}
+        metadata._topk_chunk_metadata = {}
+        deep_gemm_plan = MagicMock(
+            side_effect=lambda seq_lens: seq_lens.new_tensor([seq_lens.numel()])
+        )
+        metadata.build_deep_gemm_metadata = deep_gemm_plan
+        topk_plan = MagicMock(
+            side_effect=lambda seq_lens: seq_lens.new_tensor([seq_lens.numel()])
+        )
+        c4_seq_lens = torch.tensor([60, 61, 62, 63], dtype=torch.int32)
+
+        with patch("sglang.jit_kernel.dsv4.plan_topk_v2", topk_plan):
+            first_deep_gemm = metadata.get_deep_gemm_chunk_metadata(
+                0, 2, c4_seq_lens[:2]
+            )
+            second_deep_gemm = metadata.get_deep_gemm_chunk_metadata(
+                0, 2, c4_seq_lens[:2]
+            )
+            first_topk = metadata.get_topk_chunk_metadata(0, 2, c4_seq_lens[:2])
+            second_topk = metadata.get_topk_chunk_metadata(0, 2, c4_seq_lens[:2])
+
+        self.assertIs(first_deep_gemm, second_deep_gemm)
+        self.assertIs(first_topk, second_topk)
+        deep_gemm_plan.assert_called_once()
+        topk_plan.assert_called_once()
+
+    def test_chunk_metadata_cache_is_cleared_when_batch_is_copied(self):
+        metadata = PagedIndexerMetadata.__new__(PagedIndexerMetadata)
+        metadata.nonpaged_plan = MagicMock()
+        metadata._deep_gemm_chunk_metadata = {(0, 2): MagicMock()}
+        metadata._topk_chunk_metadata = {(0, 2): MagicMock()}
+
+        with (
+            patch("sglang.srt.layers.attention.dsv4.metadata.is_hip", return_value=False),
+            patch("sglang.srt.layers.attention.dsv4.metadata.copy_metadata"),
+        ):
+            metadata.copy_(MagicMock())
+
+        self.assertIsNone(metadata.nonpaged_plan)
+        self.assertEqual(metadata._deep_gemm_chunk_metadata, {})
+        self.assertEqual(metadata._topk_chunk_metadata, {})
+
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
