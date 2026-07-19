@@ -45,14 +45,18 @@ class TestRegisterToBootstrap(CustomTestCase):
 
     @patch("sglang.srt.disaggregation.common.conn.time")
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
-    def test_all_retries_exhausted(self, mock_put, mock_time):
+    def test_all_retries_exhausted_raises(self, mock_put, mock_time):
         mock_time.monotonic.return_value = 0.0
         fail_resp = MagicMock()
         fail_resp.status_code = 503
         mock_put.return_value = fail_resp
 
         mgr = self._make_manager()
-        mgr.register_to_bootstrap()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "failed to register to bootstrap server after 5 retries",
+        ):
+            mgr.register_to_bootstrap()
 
         self.assertEqual(mock_put.call_count, 5)
         # Sleep is only called between attempts, not after the final failure
@@ -104,7 +108,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.return_value = fail_resp
 
         mgr = self._make_manager()
-        mgr.register_to_bootstrap()
+        with self.assertRaises(RuntimeError):
+            mgr.register_to_bootstrap()
 
         # With monotonic() = 0.0, jitter factor = 0.75 + 0.25 * (0.0 % 1) = 0.75
         # delay = min(1.0 * 2^attempt, 30.0) * 0.75
@@ -129,7 +134,8 @@ class TestRegisterToBootstrap(CustomTestCase):
         mock_put.return_value = fail_resp
 
         mgr = self._make_manager()
-        mgr.register_to_bootstrap()
+        with self.assertRaises(RuntimeError):
+            mgr.register_to_bootstrap()
 
         max_delay = 30.0
         for sleep_call in mock_time.sleep.call_args_list:

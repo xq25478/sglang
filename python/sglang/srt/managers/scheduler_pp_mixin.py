@@ -249,6 +249,7 @@ class SchedulerPPMixin:
                 self.process_prefill_chunk()
                 batch = self.get_new_batch_prefill()
                 batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                self._prepare_dspark_hidden_capture_for_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -305,6 +306,9 @@ class SchedulerPPMixin:
                     next_release_rids = self._pp_recv_pyobj_from_prev_stage()
                 self._pp_commit_comm_work(send_release_work)
                 # post-process the coming microbatch
+                self._disagg_optimistic_polls_by_rid = (
+                    self._poll_optimistic_prefill_batch(self.mbs[next_mb_id])
+                )
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     self._pp_process_batch_result(
@@ -797,12 +801,9 @@ class SchedulerPPMixin:
     def _pp_pd_get_bootstrapped_ids(self: Scheduler):
         # communicate pre-consensus bootstrapp reqs
         if self.pp_group.is_first_rank:
-            # First rank, pop the bootstrap reqs from the bootstrap queue
-            good_bootstrapped_rids, bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            # Probe local credits without reserving resources before consensus.
+            good_bootstrapped_rids, bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
@@ -810,11 +811,8 @@ class SchedulerPPMixin:
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
-            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = self.get_rids(
-                self.disagg_prefill_bootstrap_queue.queue,
-                True,
-                [KVPoll.WaitingForInput],
-                [KVPoll.Failed],
+            curr_good_bootstrapped_rids, curr_bad_bootstrapped_rids = (
+                self.disagg_prefill_bootstrap_queue.get_ready_bootstrapped_rids_for_pp()
             )
             good_bootstrapped_rids = list(
                 set(prev_good_bootstrapped_rids) & set(curr_good_bootstrapped_rids)
@@ -827,22 +825,14 @@ class SchedulerPPMixin:
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler):
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
-            transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            transferred_rids = self.get_transferred_rids()
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
             # 2. get the current stage's transferred reqs info
-            curr_transferred_rids = self.get_rids(
-                self.disagg_prefill_inflight_queue,
-                True,
-                [KVPoll.Success, KVPoll.Failed],
-            )
+            curr_transferred_rids = self.get_transferred_rids()
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
                 set(prev_transferred_rids) & set(curr_transferred_rids)
@@ -986,6 +976,14 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+        if (
+            batch.dspark_hidden_capture_layer_ids
+            and result.logits_output is not None
+            and result.logits_output.hidden_states is not None
+        ):
+            tensor_dict["dspark_aux_hidden_states_0"] = (
+                result.logits_output.hidden_states
+            )
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1118,9 +1116,18 @@ class SchedulerPPMixin:
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=batch.input_ids)
         )
+        dspark_aux_hidden = {
+            key: value
+            for key, value in pp_outputs.tensors.items()
+            if key.startswith("dspark_aux_hidden_states_")
+        }
+
+        batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
+            pp_hidden_states_proxy_tensors=(
+                PPProxyTensors(dspark_aux_hidden) if dspark_aux_hidden else None
+            ),
             next_token_ids=pp_outputs["next_token_ids"],
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
@@ -1286,6 +1293,7 @@ class SchedulerPPMixin:
             [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
+            keys=[req.rid if is_send else req.req.rid for req in req_queue],
         )
         rids: List = []
         for poll_statuses in poll_statuses_group:

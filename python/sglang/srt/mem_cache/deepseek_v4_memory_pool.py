@@ -48,6 +48,22 @@ def get_compress_state_ring_size(
         return 8 if compress_ratio == 4 else 128
 
 
+def should_use_speculative_state_ring(server_args) -> bool:
+    """Return whether DSV4 state rings must match a speculative decode peer.
+
+    A disaggregated DSpark Prefill does not instantiate the draft worker, so
+    ``speculative_algorithm`` is unset on that role even though its Decode peer
+    uses speculative C4/C128 ring strides. Hidden-state capture identifies this
+    asymmetric P/D topology and both roles must address identical byte ranges.
+    """
+    if getattr(server_args, "speculative_algorithm", None) is not None:
+        return True
+    return (
+        getattr(server_args, "disaggregation_mode", None) == "prefill"
+        and bool(envs.SGLANG_DSPARK_PD_TARGET_LAYER_IDS.get())
+    )
+
+
 class DeepSeekV4SingleKVPool(KVCache):
     def __init__(
         self,
@@ -476,6 +492,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_hisparse: bool = False,
         online_mtp_max_draft_tokens: int = 0,
         num_req_slots: Optional[int] = None,
+        use_speculative_state_ring: Optional[bool] = None,
     ):
         super().__init__(
             swa_size,
@@ -507,6 +524,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
+        # ``get_ring_size`` is used immediately below to normalize C128 state
+        # capacity, so resolve the P/D-compatible policy before the first use.
+        self.use_speculative_state_ring = use_speculative_state_ring
         c128_ring_size = self.get_ring_size(128)
         if ONLINE_C128:
             # Request-scoped online C128 state is indexed by req_pool_idx.
@@ -653,9 +673,15 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_ring_size(self, compress_ratio: int) -> int:
-        server_args = get_global_server_args()
-        is_speculative = server_args.speculative_algorithm is not None
-        return get_compress_state_ring_size(compress_ratio, is_speculative)
+        use_speculative_state_ring = self.use_speculative_state_ring
+        if use_speculative_state_ring is None:
+            # Backward-compatible fallback for direct/test construction.
+            use_speculative_state_ring = should_use_speculative_state_ring(
+                get_global_server_args()
+            )
+        return get_compress_state_ring_size(
+            compress_ratio, use_speculative_state_ring
+        )
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self.full_to_swa_index_mapping is not None

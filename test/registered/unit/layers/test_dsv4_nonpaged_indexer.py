@@ -50,31 +50,43 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             num_q,
         )
 
-    def test_logits_budget_uses_static_headroom_and_is_cached(self):
-        C4IndexerBackendMixin._mqa_logits_budget_bytes.clear()
-        mem_get_info = MagicMock(return_value=(500, 1000))
-        try:
-            with (
-                envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.override(0.2),
-                patch(
-                    f"{_INDEXER}.get_global_server_args",
-                    return_value=SimpleNamespace(mem_fraction_static=0.7),
-                ),
-                patch(f"{_INDEXER}.get_is_capture_mode", return_value=False),
-                patch(
-                    "torch.cuda.get_device_properties",
-                    return_value=SimpleNamespace(total_memory=1000),
-                ),
-                patch("torch.cuda.mem_get_info", mem_get_info),
-            ):
-                first = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(0)
-                second = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(0)
-        finally:
-            C4IndexerBackendMixin._mqa_logits_budget_bytes.clear()
+    def test_logits_budget_tracks_each_batch_free_memory(self):
+        mem_get_info = MagicMock(
+            side_effect=[(500, 1000), (200, 1000), (500, 1000)]
+        )
+        batch_budgets = [{}, {}, {}]
+        with (
+            envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.override(0.2),
+            patch(
+                f"{_INDEXER}.get_global_server_args",
+                return_value=SimpleNamespace(mem_fraction_static=0.7),
+            ),
+            patch(f"{_INDEXER}.get_is_capture_mode", return_value=False),
+            patch(
+                "torch.cuda.get_device_properties",
+                return_value=SimpleNamespace(total_memory=1000),
+            ),
+            patch("torch.cuda.mem_get_info", mem_get_info),
+        ):
+            first = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(
+                0, batch_budgets[0]
+            )
+            first_reused = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(
+                0, batch_budgets[0]
+            )
+            lower = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(
+                0, batch_budgets[1]
+            )
+            recovered = C4IndexerBackendMixin._get_mqa_logits_budget_bytes(
+                0, batch_budgets[2]
+            )
 
         self.assertEqual(first, 60)
-        self.assertEqual(second, first)
-        mem_get_info.assert_called_once_with(0)
+        self.assertEqual(first_reused, first)
+        self.assertEqual(lower, 40)
+        self.assertEqual(recovered, 60)
+        self.assertEqual(mem_get_info.call_count, 3)
+        mem_get_info.assert_called_with(0)
 
     def test_chunked_topk_matches_full_topk(self):
         batch_size = 7
@@ -173,6 +185,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         metadata.nonpaged_plan = MagicMock()
         metadata._deep_gemm_chunk_metadata = {(0, 2): MagicMock()}
         metadata._topk_chunk_metadata = {(0, 2): MagicMock()}
+        metadata._mqa_logits_batch_budget_bytes = {0: 60}
 
         with (
             patch("sglang.srt.layers.attention.dsv4.metadata.is_hip", return_value=False),
@@ -183,6 +196,7 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
         self.assertIsNone(metadata.nonpaged_plan)
         self.assertEqual(metadata._deep_gemm_chunk_metadata, {})
         self.assertEqual(metadata._topk_chunk_metadata, {})
+        self.assertEqual(metadata._mqa_logits_batch_budget_bytes, {})
 
     def _is_eligible(self, **overrides):
         backend = SimpleNamespace(hisparse_coordinator=None)

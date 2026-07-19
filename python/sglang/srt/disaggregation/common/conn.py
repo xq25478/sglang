@@ -158,6 +158,7 @@ class CommonKVManager(BaseKVManager):
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_lock = threading.Lock()
+        self._socket_send_locks: Dict[str, threading.Lock] = {}
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
 
@@ -179,6 +180,7 @@ class CommonKVManager(BaseKVManager):
             self.register_to_bootstrap()
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
+            self.req_to_dspark_hidden_meta: Dict[int, dict] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -450,9 +452,12 @@ class CommonKVManager(BaseKVManager):
                 0.75 + 0.25 * (time.monotonic() % 1)
             )
             time.sleep(delay)
-        logger.error(
-            f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
+        message = (
+            "Prefill instance failed to register to bootstrap server after "
+            f"{max_retries} retries"
         )
+        logger.error(message)
+        raise RuntimeError(message)
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
         with self._socket_lock:
@@ -492,6 +497,21 @@ class CommonKVManager(BaseKVManager):
                 zmq.EVENT_DISCONNECTED
             )
             return sock
+
+    def _send_multipart(
+        self, endpoint: str, frames: List[bytes], is_ipv6: bool = False
+    ) -> None:
+        """Send one complete multipart message without sharing a socket concurrently."""
+        with self._socket_lock:
+            send_lock = self._socket_send_locks.setdefault(
+                endpoint, threading.Lock()
+            )
+
+        # ZeroMQ sockets are not thread-safe. Keep reconnect and the complete
+        # multipart send under one endpoint-scoped lock so frames from status,
+        # AUX_DATA, staging, and abort notifications cannot interleave.
+        with send_lock:
+            self._connect(endpoint, is_ipv6=is_ipv6).send_multipart(frames)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -932,6 +952,8 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
+        if hasattr(self.kv_mgr, "req_to_dspark_hidden_meta"):
+            self.kv_mgr.req_to_dspark_hidden_meta.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "transfer_infos"):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 
@@ -1070,6 +1092,9 @@ class CommonKVReceiver(BaseKVReceiver):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
+                bootstrap_info["target_cp_rank"] = int(prefill_cp_rank)
+                bootstrap_info["target_tp_rank"] = int(target_tp_rank)
+                bootstrap_info["target_pp_rank"] = int(target_pp_rank)
                 return bootstrap_info
             else:
                 logger.error(
@@ -1174,6 +1199,7 @@ class CommonKVReceiver(BaseKVReceiver):
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
         decode_prefix_len: Optional[int] = None,
+        spec_metadata: Optional[dict] = None,
     ):
         raise NotImplementedError
 
@@ -1198,8 +1224,7 @@ class CommonKVReceiver(BaseKVReceiver):
             and hasattr(self, "bootstrap_infos")
             and self.bootstrap_infos is not None
         ):
-            self._send_abort_notification()
-            self.abort_notified = True
+            self.abort_notified = self._send_abort_notification()
         return KVPoll.Failed
 
     def failure_exception(self):
@@ -1217,15 +1242,25 @@ class CommonKVReceiver(BaseKVReceiver):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
-        if (
-            not self.abort_notified
-            and hasattr(self, "bootstrap_infos")
-            and self.bootstrap_infos is not None
-        ):
-            self._send_abort_notification()
-            self.abort_notified = True
+        self.notify_prefill_abort()
 
-    def _send_abort_notification(self):
+    def notify_prefill_abort(self) -> bool:
+        """Notify prefill without creating a decode-side failure record.
+
+        A receiver without bootstrap routing has not exposed any prefill-side
+        transfer state to notify, so that case is already complete. Returns
+        ``False`` only when a concrete destination send fails.
+        """
+        if self.abort_notified:
+            return True
+        if not hasattr(self, "bootstrap_infos") or self.bootstrap_infos is None:
+            self.abort_notified = True
+            return True
+        self.abort_notified = self._send_abort_notification()
+        return self.abort_notified
+
+    def _send_abort_notification(self) -> bool:
+        all_sent = True
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:
@@ -1244,9 +1279,11 @@ class CommonKVReceiver(BaseKVReceiver):
                     f"to {bootstrap_info.get('rank_ip', 'unknown')}:{bootstrap_info.get('rank_port', 'unknown')}"
                 )
             except Exception as e:
+                all_sent = False
                 logger.debug(
                     f"Failed to send abort notification for room {self.bootstrap_room}: {e}"
                 )
+        return all_sent
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):

@@ -54,11 +54,52 @@ class TestOperatorRegistry(CustomTestCase):
     def test_resolves_every_fixed_operator_case_without_groups(self):
         specs = resolve_operator_specs()
 
-        self.assertEqual(len(specs), 8)
         self.assertEqual(
             {spec.role for spec in specs}, {"correctness", "performance"}
         )
         self.assertEqual(validate_operator_pairs(specs), [])
+
+    def test_registry_contains_moe_fused_gate_pair(self):
+        specs = resolve_operator_specs()
+
+        self.assertEqual(
+            {
+                (
+                    spec.name,
+                    spec.operator,
+                    spec.role,
+                    spec.commits,
+                    spec.min_gpus,
+                    spec.timeout_seconds,
+                    spec.command,
+                    spec.assertion,
+                )
+                for spec in specs
+                if spec.operator == "moe_fused_gate"
+            },
+            {
+                (
+                    "jd-moe-fused-gate-correctness",
+                    "moe_fused_gate",
+                    "correctness",
+                    ("1625f1cbcd97c6e99acf70904f84112b8dfe713a",),
+                    1,
+                    300,
+                    ("python3", "test/jd-ci/operators/test_moe_fused_gate.py"),
+                    "Real MoE fused-gate dispatch and Triton paths match the Torch reference",
+                ),
+                (
+                    "jd-moe-fused-gate-performance",
+                    "moe_fused_gate",
+                    "performance",
+                    ("1625f1cbcd97c6e99acf70904f84112b8dfe713a",),
+                    1,
+                    300,
+                    ("python3", "test/jd-ci/operators/bench_moe_fused_gate.py"),
+                    "DSV4 MoE fused-gate stays within its relative gate against the legacy CUDA reference",
+                ),
+            },
+        )
 
     def test_registry_contains_only_jd_test_paths(self):
         commands = "\n".join(" ".join(spec.command) for spec in resolve_operator_specs())

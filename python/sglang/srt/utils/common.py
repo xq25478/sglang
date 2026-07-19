@@ -2268,12 +2268,14 @@ def set_prometheus_multiproc_dir():
 
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_base_dir = os.environ["PROMETHEUS_MULTIPROC_DIR"]
+        os.makedirs(prometheus_multiproc_base_dir, exist_ok=True)
         prometheus_multiproc_dir = tempfile.TemporaryDirectory(
-            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
+            dir=prometheus_multiproc_base_dir
         )
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
-        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
@@ -2382,7 +2384,22 @@ def _get_fastapi_request_path(request) -> Tuple[str, bool]:
     for route in request.app.routes:
         match, child_scope = route.matches(request.scope)
         if match == Match.FULL:
-            return route.path, True
+            path = getattr(route, "path", None)
+            if path is not None:
+                return path, True
+
+            # FastAPI 0.139+ keeps included routers as lazy route containers
+            # instead of flattening their children into app.routes. Resolve
+            # the effective child so metric labels still use the normalized
+            # route template rather than a high-cardinality request URL.
+            effective_route_contexts = getattr(route, "effective_route_contexts", None)
+            if callable(effective_route_contexts):
+                for route_context in effective_route_contexts():
+                    child_match, _ = route_context.matches(request.scope)
+                    if child_match == Match.FULL:
+                        child_path = getattr(route_context, "path", None)
+                        if child_path:
+                            return child_path, True
 
     return request.url.path, False
 

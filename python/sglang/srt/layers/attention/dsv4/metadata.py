@@ -149,6 +149,7 @@ class PagedIndexerMetadata:
         # repeating the same host/JIT work at every sparse-attention layer.
         self._deep_gemm_chunk_metadata = {}
         self._topk_chunk_metadata = {}
+        self._mqa_logits_batch_budget_bytes = {}
 
         if (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
@@ -219,6 +220,7 @@ class PagedIndexerMetadata:
         self.nonpaged_plan = None
         self._deep_gemm_chunk_metadata.clear()
         self._topk_chunk_metadata.clear()
+        self._mqa_logits_batch_budget_bytes.clear()
 
 
 def maybe_copy_inplace(dst, *, src) -> None:

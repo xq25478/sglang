@@ -362,7 +362,6 @@ class C4IndexerBackendMixin:
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
     _MQA_LOGITS_TOTAL_MEM_FRACTION = 0.3
-    _mqa_logits_budget_bytes: Dict[int, int] = {}
 
     def __init__(self):
         super().__init__()
@@ -373,8 +372,10 @@ class C4IndexerBackendMixin:
         return envs.SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION.get()
 
     @classmethod
-    def _get_mqa_logits_budget_bytes(cls, device_index: int) -> int:
-        cached_budget = cls._mqa_logits_budget_bytes.get(device_index)
+    def _get_mqa_logits_budget_bytes(
+        cls, device_index: int, batch_budget_bytes: Dict[int, int]
+    ) -> int:
+        cached_budget = batch_budget_bytes.get(device_index)
         if cached_budget is not None:
             return cached_budget
 
@@ -391,18 +392,19 @@ class C4IndexerBackendMixin:
             )
         static_budget = max(1, static_budget)
 
-        # Do not cache a capture-time estimate. The first eager prefill records
-        # the real free-memory budget without adding a sync to every layer.
+        # Capture paths cannot query live free memory. Eager prefill caches one
+        # live snapshot per batch so all indexer layers reuse the same budget
+        # without carrying a stale value across later batches.
         if get_is_capture_mode():
-            return static_budget
-
-        free_mem, _ = torch.cuda.mem_get_info(device_index)
-        budget_bytes = min(
-            int(free_mem * cls._mqa_logits_free_mem_fraction()),
-            static_budget,
-        )
+            budget_bytes = static_budget
+        else:
+            free_mem, _ = torch.cuda.mem_get_info(device_index)
+            budget_bytes = min(
+                int(free_mem * cls._mqa_logits_free_mem_fraction()),
+                static_budget,
+            )
         budget_bytes = max(1, budget_bytes)
-        cls._mqa_logits_budget_bytes[device_index] = budget_bytes
+        batch_budget_bytes[device_index] = budget_bytes
         return budget_bytes
 
     @classmethod
@@ -941,7 +943,10 @@ class C4IndexerBackendMixin:
             chunk_rows = self._get_mqa_logits_chunk_rows(
                 num_q=query_rows,
                 num_k=max_num_keys,
-                logits_budget_bytes=self._get_mqa_logits_budget_bytes(device_index),
+                logits_budget_bytes=self._get_mqa_logits_budget_bytes(
+                    device_index,
+                    indexer_metadata._mqa_logits_batch_budget_bytes,
+                ),
             )
 
         is_chunked = chunk_rows < query_rows

@@ -751,6 +751,10 @@ class Req(ReqDllmMixin):
         #   `ScheduleBatch.maybe_evict_swa`; KV in range [0, cache_protected_len) is freed during radix cache eviction.
         # - Chunk cache: KV in range [0, swa_evicted_seqlen) is freed manually in `ScheduleBatch.maybe_evict_swa`.
         self.swa_evicted_seqlen = 0
+        # Number of newest prefix rows owned by the previous chunked-prefill
+        # batch. They may still be read by the overlap stream and must not be
+        # reused by the next allocation.
+        self.swa_prefill_overlap_protected_len = 0
         # Tokens in [0, swa_evict_floor) are protected from SWA window eviction.
         # This is used by prefill-aware SWA models such as Unlimited-OCR to keep prompt/image KV visible during decode.
         self.swa_evict_floor: int = 0
@@ -963,10 +967,16 @@ class Req(ReqDllmMixin):
         # Per-request count of accepted draft tokens (excludes the bonus token).
         self.spec_num_correct_drafts = 0
 
+        self.spec_num_block_accept_tokens = 0
+
+        self.spec_num_cap_tokens = 0
+
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
         # Example: histogram[0] = 5 means 5 steps with 0 accepted tokens, histogram[3] = 10 means 10 steps with 3 accepted tokens.
         self.spec_correct_drafts_histogram: List[int] = []
+
+        self.spec_cap_lens_histogram: List[int] = []
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0
@@ -1087,6 +1097,14 @@ class Req(ReqDllmMixin):
                 [0] * (num_correct_drafts - len(self.spec_correct_drafts_histogram) + 1)
             )
         self.spec_correct_drafts_histogram[num_correct_drafts] += 1
+
+    def update_spec_cap_lens_histogram(self, cap_len: int):
+        cap_len = int(cap_len)
+        if len(self.spec_cap_lens_histogram) <= cap_len:
+            self.spec_cap_lens_histogram.extend(
+                [0] * (cap_len - len(self.spec_cap_lens_histogram) + 1)
+            )
+        self.spec_cap_lens_histogram[cap_len] += 1
 
     def extend_image_inputs(self, image_inputs):
         if self.multimodal_inputs is None:
@@ -1228,6 +1246,15 @@ class Req(ReqDllmMixin):
         max_prefix_len = input_len - 1
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+
+        # DSpark PD needs target-layer hidden states for a suffix of the prompt.
+        # A HiCache/radix hit beyond this boundary would skip the target forward
+        # and leave those hidden rows unavailable to the decode worker.  Keep the
+        # cached prefix, but force the required suffix through prefill again.
+        dspark_recompute_start = getattr(self, "dspark_prefill_recompute_start", None)
+        if dspark_recompute_start is not None:
+            dspark_recompute_start = max(0, min(int(dspark_recompute_start), input_len))
+            max_prefix_len = min(max_prefix_len, dspark_recompute_start)
         return max(max_prefix_len, 0)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
@@ -1419,11 +1446,6 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
-        if self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
-
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
         # Sanitize out-of-range / NaN token ids before any decode.
@@ -1437,6 +1459,10 @@ class Req(ReqDllmMixin):
             return
 
         if self._check_token_based_finish(new_accepted_tokens):
+            return
+
+        if self.grammar is not None and self.grammar.is_terminated():
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
             return
 
     def reset_for_retract(self):
@@ -1473,6 +1499,7 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
         self.swa_evicted_seqlen = 0
+        self.swa_prefill_overlap_protected_len = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
@@ -1783,6 +1810,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
+    spec_verify_tier_num_tokens: int = -1
 
     # For processing logprobs
     return_logprob: bool = False
@@ -1828,6 +1856,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_spec_verify_tier_num_tokens: Optional[List[int]] = None
 
     # === Compound crossing to ForwardBatch (carry their own device tensors) ===
     # Sampling info
@@ -1841,6 +1870,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     seq_lens_cpu_cache: torch.Tensor = None
     capture_hidden_mode: Optional[CaptureHiddenMode] = None
     return_hidden_states_before_norm: bool = False
+    dspark_hidden_capture_layer_ids: Optional[List[int]] = None
 
     @classmethod
     def init_new(
@@ -2855,7 +2885,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
-            seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_cpu=(
+                self.seq_lens_cpu.clone() if self.seq_lens_cpu is not None else None
+            ),
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -2864,12 +2896,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,
             forward_iter=self.forward_iter,
+            dspark_hidden_capture_layer_ids=(
+                self.dspark_hidden_capture_layer_ids[:]
+                if self.dspark_hidden_capture_layer_ids is not None
+                else None
+            ),
         )
 
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
-            server_args = get_global_server_args()
 
             release_leaf_lock = (
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
@@ -2908,14 +2944,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
-                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                        # The previous chunk may still be running. Do not reuse
+                        # any of its SWA rows until its result is resolved.
                         if req.extend_batch_idx < 2:
                             continue
                         else:
-                            pre_len = (
-                                pre_len - server_args.chunked_prefill_size
-                                if server_args.chunked_prefill_size > 0
-                                else pre_len
+                            pre_len = max(
+                                0,
+                                pre_len - req.swa_prefill_overlap_protected_len,
                             )
                             self._evict_swa(req, pre_len)
                     else:

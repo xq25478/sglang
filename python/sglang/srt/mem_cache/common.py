@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import numpy as np
 import torch
@@ -50,12 +50,18 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
+def kv_to_page_indices(
+    kv_indices: Union[np.ndarray, torch.Tensor], page_size: int
+) -> np.ndarray:
     # The page is guaranteed to be full except the last page.
-    if page_size == 1:
-        return kv_indices
+    page_indices = kv_indices[::page_size]
+    if page_size > 1:
+        page_indices = page_indices // page_size
 
-    return kv_indices[::page_size] // page_size
+    # Keep token->page striding on device and copy only the compact page list.
+    if isinstance(page_indices, torch.Tensor):
+        return page_indices.cpu().numpy()
+    return page_indices
 
 
 def kv_to_page_num(num_kv_indices: int, page_size: int):
@@ -64,6 +70,44 @@ def kv_to_page_num(num_kv_indices: int, page_size: int):
 
 def page_align_floor(length: int, page_size: int) -> int:
     return (length // page_size) * page_size
+
+
+def compute_swa_eviction_floor(req: Req, page_size: int) -> int:
+    assert (
+        req.cache_protected_len % page_size == 0
+    ), "cache_protected_len must be page aligned"
+    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
+    if page_size > 1 and evict_floor > req.cache_protected_len:
+        evict_floor = -(-evict_floor // page_size) * page_size
+    return evict_floor
+
+
+def compute_swa_eviction_frontier(
+    req: Req,
+    pre_len: int,
+    *,
+    sliding_window_size: int,
+    page_size: int,
+    is_chunk_cache: bool = False,
+) -> int:
+    """Return the exclusive sequence boundary safe to free from the SWA pool.
+
+    Keep this calculation side-effect free so the prefill admission policy can
+    account for rows that ``alloc_for_extend`` will reclaim. Without that
+    look-ahead, a long chunked prefill can fill the SWA pool and be parked
+    forever before the allocator gets a chance to perform the reclamation.
+    """
+    evict_floor = compute_swa_eviction_floor(req, page_size)
+    current_frontier = max(req.swa_evicted_seqlen, evict_floor)
+    if is_chunk_cache:
+        evict_threshold = pre_len - sliding_window_size
+    else:
+        evict_threshold = pre_len - max(sliding_window_size, page_size)
+
+    new_frontier = max(current_frontier, evict_threshold)
+    if page_size > 1:
+        new_frontier = (new_frontier // page_size) * page_size
+    return max(current_frontier, new_frontier)
 
 
 def free_swa_out_of_window_slots(
@@ -77,31 +121,16 @@ def free_swa_out_of_window_slots(
     is_chunk_cache: bool = False,
 ) -> None:
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
-    assert (
-        req.cache_protected_len % page_size == 0
-    ), "cache_protected_len must be page aligned"
-    evict_floor = max(req.cache_protected_len, getattr(req, "swa_evict_floor", 0))
-    if page_size > 1 and evict_floor > req.cache_protected_len:
-        evict_floor = -(-evict_floor // page_size) * page_size
-    req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, evict_floor)
-
-    if is_chunk_cache:
-        # Chunk cache builds no radix tree, so no tombstone-leaf concern; evict
-        # up to the window boundary (the trailing floor keeps it page-aligned).
-        evict_threshold = pre_len - sliding_window_size
-    else:
-        # Radix cache: keep max(window, page). The trailing floor page-aligns the
-        # frontier, and subtracting at least one page keeps it below the insert
-        # boundary (page_floor(seq_len)) so the last leaf is never all-tombstone.
-        # No extra page margin is needed.
-        evict_threshold = pre_len - max(sliding_window_size, page_size)
-    new_swa_evicted_seqlen = max(
-        req.swa_evicted_seqlen,
-        evict_threshold,
+    req.swa_evicted_seqlen = max(
+        req.swa_evicted_seqlen, compute_swa_eviction_floor(req, page_size)
     )
-
-    if page_size > 1:
-        new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
+    new_swa_evicted_seqlen = compute_swa_eviction_frontier(
+        req,
+        pre_len,
+        sliding_window_size=sliding_window_size,
+        page_size=page_size,
+        is_chunk_cache=is_chunk_cache,
+    )
 
     if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
         free_slots = req_to_token_pool.req_to_token[

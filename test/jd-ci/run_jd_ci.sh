@@ -683,6 +683,9 @@ run_docker_attached docker run \
         mkdir -p /sgl-workspace
         cp '${IMAGE_ENTRYPOINT_SCRIPT}' /sgl-workspace/entrypoint.sh
         chmod +x /sgl-workspace/entrypoint.sh
+        bash '${SOURCE_PATH}/test/jd-ci/image/install_dspark_sps_table.sh' \
+            '${SOURCE_PATH}/deepseek-v4-flash-0731-sps-2d-1p-4gpu-1d-4gpu-g2-flashinfer-cutlass.json' \
+            '/deepseek-v4-flash-0731-sps-2d-1p-4gpu-1d-4gpu-g2-flashinfer-cutlass.json'
 
         # ---------- 编译 ----------
 
@@ -793,6 +796,8 @@ if [[ ${EXIT_CODE} -eq 0 && "${PUBLISH_IMAGES}" == "1" ]]; then
         -c "ENV LD_PRELOAD=/sgl-workspace/fake_dns.so" \
         -c "ENV MC_IB_PCI_RELAXED_ORDERING=1" \
         "${CONTAINER_NAME}" "${CLOUD_IMAGE}"
+    docker run --rm --entrypoint /bin/bash "${CLOUD_IMAGE}" -lc \
+        "echo 'f529eaa58c1ad62ddb5eacc8c40e2fbb13e8979e8f0c519c3aca33a67dc64752  /deepseek-v4-flash-0731-sps-2d-1p-4gpu-1d-4gpu-g2-flashinfer-cutlass.json' | sha256sum -c -"
     docker push "${CLOUD_IMAGE}"
     echo "[SGLang CI] SGLang 云上仓库镜像地址: ${CLOUD_IMAGE}"
 elif [[ ${EXIT_CODE} -eq 0 ]]; then

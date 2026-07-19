@@ -52,6 +52,7 @@ from sglang.srt.disaggregation.utils import (
     _is_fake_transfer,
     get_dsv4_c128_state_indices,
     get_kv_class,
+    is_aborted,
     is_dsv4_c128_online_enabled,
     is_mla_backend,
     poll_and_all_reduce,
@@ -59,6 +60,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
     setup_state_kv_args,
 )
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
@@ -99,9 +101,105 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
+def _resolve_dspark_target_layer_ids(model_runner) -> List[int]:
+    """Resolve the same DSpark PD layer override used during pool creation."""
+    env_target_layer_ids = envs.SGLANG_DSPARK_PD_TARGET_LAYER_IDS.get()
+    spec_aux_config = getattr(model_runner, "spec_aux_config", None)
+    target_layer_ids = (
+        env_target_layer_ids
+        or getattr(model_runner, "dflash_or_dspark_target_layer_ids", None)
+        or getattr(spec_aux_config, "dflash_target_layer_ids", None)
+        or []
+    )
+    return [int(layer_id) for layer_id in target_layer_ids]
+
+
+def _resolve_dspark_hidden_transfer_range(
+    scheduler: Scheduler,
+    *,
+    prompt_len: int,
+    decode_prefix_len: int,
+) -> Tuple[int, int, Optional[int]]:
+    """Return the minimal target-hidden suffix required by the draft cache."""
+    prompt_len = int(prompt_len)
+    decode_prefix_len = int(decode_prefix_len)
+    hidden_start = decode_prefix_len
+    draft_context_window = None
+
+    draft_worker = getattr(scheduler, "draft_worker", None)
+    get_window_size = getattr(draft_worker, "get_pd_hidden_transfer_window_size", None)
+    if get_window_size is not None:
+        resolved_window = get_window_size()
+        if resolved_window is not None and int(resolved_window) > 0:
+            draft_context_window = int(resolved_window)
+            logger.info_once(
+                "DSpark PD target-hidden transfer is limited to the draft KV "
+                "context window: rows=%d",
+                draft_context_window,
+            )
+            hidden_start = max(decode_prefix_len, prompt_len - draft_context_window)
+
+    return hidden_start, prompt_len - hidden_start, draft_context_window
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
+
+
+def _dspark_hidden_debug_summary(hidden: torch.Tensor) -> dict:
+    sample = hidden.detach()
+    if sample.numel() == 0:
+        return {"shape": list(sample.shape), "sum": 0.0, "absmax": 0.0, "l2": 0.0}
+    flat = sample.reshape(-1)
+    head = flat[: min(8, flat.numel())].float().cpu().tolist()
+    sample_f = sample.float()
+    return {
+        "shape": list(sample.shape),
+        "sum": round(float(sample_f.sum().item()), 6),
+        "absmax": round(float(sample_f.abs().max().item()), 6),
+        "l2": round(float(torch.linalg.vector_norm(sample_f).item()), 6),
+        "head": [round(float(x), 6) for x in head],
+    }
+
+
+def _validate_dspark_hidden_tensor(
+    hidden: torch.Tensor, rid: str, hidden_start: int
+) -> bool:
+    if not envs.SGLANG_DSPARK_DEBUG_DUMP.get():
+        return hidden.numel() > 0
+    sample = hidden.detach().float()
+    if sample.numel() == 0:
+        logger.warning(
+            "Invalid DSpark PD hidden tensor: empty hidden transfer "
+            f"rid={rid}, hidden_start={hidden_start}"
+        )
+        return False
+    if not bool(torch.isfinite(sample).all().item()):
+        logger.warning(
+            "Invalid DSpark PD hidden tensor: NaN/Inf detected "
+            f"rid={rid}, hidden_start={hidden_start}, "
+            f"summary={_dspark_hidden_debug_summary(hidden)}"
+        )
+        return False
+    absmax = float(sample.abs().max().item())
+    l2_norm = float(torch.linalg.vector_norm(sample).item())
+    if absmax == 0.0 or l2_norm == 0.0:
+        logger.warning(
+            "Invalid DSpark PD hidden tensor: all-zero hidden transfer "
+            f"rid={rid}, hidden_start={hidden_start}, "
+            f"summary={_dspark_hidden_debug_summary(hidden)}"
+        )
+        return False
+    if absmax > 1.0e4 or l2_norm > 1.0e8:
+        logger.warning(
+            "Invalid DSpark PD hidden tensor: abnormal norm "
+            f"rid={rid}, hidden_start={hidden_start}, "
+            f"absmax={absmax:.6g}, l2={l2_norm:.6g}, "
+            f"summary={_dspark_hidden_debug_summary(hidden)}"
+        )
+        return False
+    return True
 
 
 class DecodeReqToTokenPool:
@@ -142,6 +240,10 @@ class DecodeReqToTokenPool:
             )
 
         self.free_slots = list(range(1, self._alloc_size))
+        # Slot-reuse generation counter; mirrors ReqToTokenPool. Required even
+        # here: HybridMambaDecodeReqToTokenPool borrows this __init__ while
+        # inheriting ReqToTokenPool.alloc, which bumps it.
+        self.req_generation = torch.zeros(self._alloc_size, dtype=torch.int64)
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -170,6 +272,7 @@ class DecodeReqToTokenPool:
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
+                self.req_generation[r.req_pool_idx] += 1
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
@@ -180,6 +283,7 @@ class DecodeReqToTokenPool:
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
+        self.req_generation.zero_()
 
 
 class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
@@ -255,6 +359,12 @@ class DecodeRequest:
     kv_receiver: CommonKVReceiver
     waiting_for_input: bool = False
     metadata_buffer_index: int = -1
+    dspark_hidden_dst_indices: Optional[List[int]] = None
+    dspark_hidden_dst_indices_by_pp: Optional[Dict[int, List[int]]] = None
+    dspark_hidden_pp_slices: Optional[Dict[int, dict]] = None
+    dspark_hidden_start: int = 0
+    abort_notify_attempts: int = 0
+    abort_notify_next_attempt_time: float = 0.0
 
     # HiCache Status
     prefix_match: Optional[DecodePrefixMatch] = None
@@ -322,10 +432,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.pending_reqs: List[DecodeRequest] = []
+        self.pending_abort_notifications: List[DecodeRequest] = []
         self._ensure_retry_count: Dict[str, int] = {}
         self._max_ensure_retries: int = 15  # scheduling cycles
         self._ensure_last_attempt_time: Dict[str, float] = {}
         self._ensure_retry_interval: float = 1.0  # seconds
+        self._last_dspark_hidden_recv_credit_warning_time = 0.0
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -333,6 +445,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 "(e.g. GQA, MHA). MLA models should not set this flag."
             )
         self.kv_manager = self._init_kv_manager()
+        self.transfer_queue.kv_manager = self.kv_manager
         if self.enable_staging:
             self.transfer_queue._init_staging_handler(self.kv_manager)
 
@@ -353,6 +466,141 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and self.token_to_kv_pool_allocator.page_size > 1
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
+
+    @staticmethod
+    def _notify_prefill_abort(receiver) -> bool:
+        notify_prefill_abort = getattr(receiver, "notify_prefill_abort", None)
+        if notify_prefill_abort is None:
+            receiver.abort()
+            return True
+        result = notify_prefill_abort()
+        if result is None:
+            # Compatibility for transfer backends/tests whose notification API
+            # predates the boolean delivery acknowledgement.
+            return bool(getattr(receiver, "abort_notified", True))
+        return bool(result)
+
+    def _clear_aborted_receiver(self, decode_req: DecodeRequest) -> None:
+        receiver = decode_req.kv_receiver
+        if receiver is None:
+            return
+        try:
+            receiver.clear()
+        except Exception:
+            logger.exception(
+                "Failed to clear receiver after pending decode abort: "
+                "rid=%s bootstrap_room=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+            )
+        decode_req.kv_receiver = None
+
+    def _enqueue_abort_notification_retry(
+        self, decode_req: DecodeRequest, *, attempts: int = 1
+    ) -> None:
+        decode_req.abort_notify_attempts = max(
+            decode_req.abort_notify_attempts, attempts
+        )
+        decode_req.abort_notify_next_attempt_time = (
+            time.monotonic() + self._ensure_retry_interval
+        )
+        pending = getattr(self, "pending_abort_notifications", None)
+        if pending is None:
+            pending = self.pending_abort_notifications = []
+        if all(id(req) != id(decode_req) for req in pending):
+            pending.append(decode_req)
+
+    def _retry_pending_abort_notifications(self) -> None:
+        pending = getattr(self, "pending_abort_notifications", None)
+        if not pending:
+            return
+
+        now = time.monotonic()
+        remaining = []
+        completed_ids = set()
+        for decode_req in pending:
+            receiver = decode_req.kv_receiver
+            if receiver is None:
+                completed_ids.add(id(decode_req))
+                continue
+            if now < decode_req.abort_notify_next_attempt_time:
+                remaining.append(decode_req)
+                continue
+
+            try:
+                notified = self._notify_prefill_abort(receiver)
+            except Exception:
+                notified = False
+                logger.exception(
+                    "Failed to retry prefill abort notification: "
+                    "rid=%s bootstrap_room=%s attempt=%s",
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                    decode_req.abort_notify_attempts + 1,
+                )
+
+            decode_req.abort_notify_attempts += 1
+            if notified:
+                self._clear_aborted_receiver(decode_req)
+                completed_ids.add(id(decode_req))
+                continue
+
+            if decode_req.abort_notify_attempts >= self._max_ensure_retries:
+                logger.error(
+                    "Giving up prefill abort notification after %s attempts: "
+                    "rid=%s bootstrap_room=%s",
+                    decode_req.abort_notify_attempts,
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                )
+                self._clear_aborted_receiver(decode_req)
+                completed_ids.add(id(decode_req))
+                continue
+
+            decode_req.abort_notify_next_attempt_time = (
+                now + self._ensure_retry_interval
+            )
+            remaining.append(decode_req)
+
+        self.pending_abort_notifications = remaining
+        if completed_ids:
+            self.pending_reqs = [
+                req for req in self.pending_reqs if id(req) not in completed_ids
+            ]
+
+    def _fail_prealloc_request(
+        self, decode_req: DecodeRequest, message: str, prefix_len: int
+    ) -> None:
+        """Fail locally and notify prefill so its bootstrap entry is drained."""
+        logger.error(message)
+        prepare_abort(
+            decode_req.req,
+            message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        self.scheduler.output_streamer.stream_output(
+            [decode_req.req], decode_req.req.return_logprob
+        )
+        if prefix_len > 0:
+            self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+
+        receiver = decode_req.kv_receiver
+        if receiver is not None:
+            try:
+                notified = self._notify_prefill_abort(receiver)
+            except Exception:
+                notified = False
+                logger.exception(
+                    "Failed to notify prefill about decode preallocation failure: "
+                    "rid=%s bootstrap_room=%s",
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                )
+            if notified:
+                self._clear_aborted_receiver(decode_req)
+            else:
+                self._enqueue_abort_notification_retry(decode_req)
+        self.transfer_queue._release_dspark_hidden_rows(decode_req)
 
     def _swa_tail_len(self, seq_len: int) -> int:
         if not self._uses_swa_tail_prealloc() or seq_len <= 0:
@@ -449,6 +697,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             req_to_token_pool=getattr(self, "req_to_token_pool", None),
+            dspark_hidden_pool=getattr(
+                self.metadata_buffers, "dspark_hidden_pool", None
+            ),
         )
 
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
@@ -689,7 +940,27 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
             else:
-                raise ValueError(f"Unexpected poll case: {poll}")
+                error_message = (
+                    "Decode handshake returned an unexpected poll state: "
+                    f"poll={poll}, rid={decode_req.req.rid}, "
+                    f"bootstrap_room={decode_req.req.bootstrap_room}"
+                )
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                try:
+                    decode_req.kv_receiver.abort()
+                except Exception:
+                    logger.exception(
+                        "Failed to abort receiver after unexpected handshake state: "
+                        "rid=%s",
+                        decode_req.req.rid,
+                    )
+                if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
 
     def _ensure_prefill_info(
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
@@ -784,6 +1055,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
         """Pop the preallocated requests from the pending queue (FIFO)."""
         self._resolve_pending_reqs()
+        self._retry_pending_abort_notifications()
         self._update_handshake_waiters(rids_to_check)
 
         failed_reqs = []
@@ -829,13 +1101,30 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
-            if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
+            if is_aborted(decode_req.req):
+                if decode_req.req.finished_reason is None:
+                    decode_req.req.update_finish_state()
                 self.scheduler.output_streamer.stream_output(
                     [decode_req.req],
                     decode_req.req.return_logprob,
                 )
-                decode_req.kv_receiver.clear()
-                decode_req.kv_receiver = None
+                receiver = decode_req.kv_receiver
+                if receiver is not None:
+                    try:
+                        notified = self._notify_prefill_abort(receiver)
+                    except Exception:
+                        notified = False
+                        logger.exception(
+                            "Failed to notify prefill about pending decode abort: "
+                            "rid=%s bootstrap_room=%s",
+                            decode_req.req.rid,
+                            decode_req.req.bootstrap_room,
+                        )
+                    if notified:
+                        self._clear_aborted_receiver(decode_req)
+                    else:
+                        self._enqueue_abort_notification_retry(decode_req)
+                self.transfer_queue._release_dspark_hidden_rows(decode_req)
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
@@ -960,12 +1249,169 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         self.tree_cache.dec_lock_ref(decode_req.req.last_node)
                     break
 
+            dspark_hidden_dst_indices = None
+            dspark_hidden_dst_indices_by_pp = None
+            dspark_hidden_pp_slices = None
+            (
+                dspark_hidden_start,
+                dspark_hidden_len,
+                dspark_draft_context_window,
+            ) = _resolve_dspark_hidden_transfer_range(
+                self.scheduler,
+                prompt_len=origin_input_len,
+                decode_prefix_len=total_prefix_len,
+            )
+            state_types = self.kv_manager.kv_args.state_types
+            if (
+                self.scheduler.spec_algorithm.is_dspark()
+                and not _is_fake_transfer(decode_req.req, self.scheduler.server_args)
+                and StateType.DSPARK_HIDDEN in state_types
+                and dspark_hidden_len > 0
+            ):
+                dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+                if dspark_pool is None:
+                    message = (
+                        "DSpark decode requires a hidden row pool for PD metadata "
+                        "transfer, but none was initialized."
+                    )
+                    self._fail_prealloc_request(decode_req, message, prefix_len)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                model_runner = self.scheduler.tp_worker.model_runner
+                target_layer_ids = _resolve_dspark_target_layer_ids(model_runner)
+                if not target_layer_ids:
+                    message = (
+                        "DSpark decode could not infer target layer ids for PD "
+                        "hidden transfer."
+                    )
+                    self._fail_prealloc_request(decode_req, message, prefix_len)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                target_pp_ranks = list(
+                    getattr(decode_req.kv_receiver, "target_pp_ranks", None) or [0]
+                )
+                pp_size = max(target_pp_ranks) + 1 if target_pp_ranks else 1
+                pp_slices = {}
+                slice_start = 0
+                for pp_rank in range(pp_size):
+                    pp_start, pp_end = get_pp_indices(
+                        self.scheduler.model_config.num_hidden_layers,
+                        pp_rank,
+                        pp_size,
+                    )
+                    local_layer_ids = [
+                        layer_id
+                        for layer_id in target_layer_ids
+                        if pp_start <= layer_id < pp_end
+                    ]
+                    slice_len = len(local_layer_ids) * int(
+                        self.scheduler.model_config.hidden_size
+                    )
+                    pp_slices[pp_rank] = {
+                        "pp_rank": int(pp_rank),
+                        "layer_ids": [int(x) for x in local_layer_ids],
+                        "slice_start": int(slice_start),
+                        "slice_len": int(slice_len),
+                        "dst_indices": [],
+                    }
+                    slice_start += slice_len
+                if slice_start != len(target_layer_ids) * int(
+                    self.scheduler.model_config.hidden_size
+                ):
+                    message = (
+                        "DSpark PP slice layout does not cover all target layers: "
+                        f"target_layer_ids={target_layer_ids}, pp_size={pp_size}"
+                    )
+                    self._fail_prealloc_request(decode_req, message, prefix_len)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                non_empty_slices = [
+                    (int(pp_rank), pp_slice)
+                    for pp_rank, pp_slice in pp_slices.items()
+                    if int(pp_slice.get("slice_len", 0)) > 0
+                ]
+                full_hidden_size = int(dspark_pool.hidden_size)
+                fixed_pool_supported = (
+                    len(non_empty_slices) == 1
+                    and int(non_empty_slices[0][1].get("slice_start", 0)) == 0
+                    and int(non_empty_slices[0][1].get("slice_len", 0))
+                    == full_hidden_size
+                )
+                if not fixed_pool_supported:
+                    message = (
+                        "DSpark fixed decode hidden row pool requires the current "
+                        "PP layout to have exactly one non-empty slice covering the "
+                        "full hidden width. Split target layers across PP ranks are "
+                        "not supported yet: "
+                        f"rid={decode_req.req.rid}, pp_slices={pp_slices}"
+                    )
+                    self._fail_prealloc_request(decode_req, message, prefix_len)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                if dspark_hidden_len > dspark_pool.size:
+                    message = (
+                        "DSpark decode hidden rows exceed receive pool capacity: "
+                        f"rid={decode_req.req.rid}, hidden_len={dspark_hidden_len}, "
+                        f"pool_size={dspark_pool.size}. Increase "
+                        "SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS."
+                    )
+                    self._fail_prealloc_request(decode_req, message, prefix_len)
+                    failed_reqs.append(decode_req)
+                    indices_to_remove.add(i)
+                    continue
+
+                allocated_hidden_indices = dspark_pool.alloc(dspark_hidden_len)
+                if allocated_hidden_indices is None:
+                    if prefix_len > 0:
+                        self.tree_cache.dec_lock_ref(decode_req.req.last_node)
+                    now = time.monotonic()
+                    if now - self._last_dspark_hidden_recv_credit_warning_time > 30:
+                        logger.warning(
+                            "DSpark decode hidden pool blocked prealloc: "
+                            "rid=%s hidden_len=%d free_rows=%d pool_rows=%d "
+                            "prealloc_queue=%d transfer_queue=%d",
+                            decode_req.req.rid,
+                            dspark_hidden_len,
+                            dspark_pool.available_size(),
+                            dspark_pool.size,
+                            len(self.queue),
+                            len(self.transfer_queue.queue),
+                        )
+                        self._last_dspark_hidden_recv_credit_warning_time = now
+                    continue
+
+                dspark_hidden_dst_indices_by_pp = {}
+                for pp_rank, pp_slice in pp_slices.items():
+                    if int(pp_slice.get("slice_len", 0)) <= 0:
+                        pp_slice["dst_indices"] = []
+                        dspark_hidden_dst_indices_by_pp[int(pp_rank)] = []
+                        continue
+                    pp_slice["dst_indices"] = [int(x) for x in allocated_hidden_indices]
+                    dspark_hidden_dst_indices_by_pp[int(pp_rank)] = [
+                        int(x) for x in allocated_hidden_indices
+                    ]
+                dspark_hidden_pp_slices = pp_slices
+                if pp_size == 1:
+                    dspark_hidden_dst_indices = dspark_hidden_dst_indices_by_pp.get(0)
+
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,
                 prefix_len,
                 total_prefix_len,
             )
+            decode_req.dspark_hidden_dst_indices = dspark_hidden_dst_indices
+            decode_req.dspark_hidden_dst_indices_by_pp = dspark_hidden_dst_indices_by_pp
+            decode_req.dspark_hidden_pp_slices = dspark_hidden_pp_slices
+            decode_req.dspark_hidden_start = dspark_hidden_start
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1094,8 +1540,59 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     state_indices.append(_swa_ring_payload())
                 elif st == StateType.C128_STATE:
                     state_indices.append(_c128_state_payload())
+                elif st == StateType.DSPARK_HIDDEN:
+                    first_slice_indices = None
+                    if dspark_hidden_dst_indices_by_pp:
+                        first_slice_indices = next(
+                            iter(dspark_hidden_dst_indices_by_pp.values())
+                        )
+                    state_indices.append(
+                        None
+                        if first_slice_indices is None
+                        else np.asarray(first_slice_indices, dtype=np.int32)
+                    )
                 else:
                     state_indices.append(None)
+            if state_indices and not any(
+                idx is not None and len(idx) > 0 for idx in state_indices
+            ):
+                state_indices = None
+
+            spec_metadata = None
+            if dspark_hidden_dst_indices_by_pp is not None:
+                model_runner = self.scheduler.tp_worker.model_runner
+                target_layer_ids = _resolve_dspark_target_layer_ids(model_runner)
+                spec_metadata = {
+                    "dspark_hidden": True,
+                    "decode_radix_cache_enabled": bool(
+                        self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+                    ),
+                    "hidden_start": int(dspark_hidden_start),
+                    "hidden_len": int(dspark_hidden_len),
+                    "draft_context_window": (
+                        int(dspark_draft_context_window)
+                        if dspark_draft_context_window is not None
+                        else None
+                    ),
+                    "dst_indices": (
+                        [int(x) for x in dspark_hidden_dst_indices]
+                        if dspark_hidden_dst_indices is not None
+                        else []
+                    ),
+                    "pp_slices": {
+                        str(pp_rank): {
+                            **pp_slice,
+                            "dst_indices": [
+                                int(x) for x in pp_slice.get("dst_indices", [])
+                            ],
+                        }
+                        for pp_rank, pp_slice in (dspark_hidden_pp_slices or {}).items()
+                    },
+                    "hidden_size": int(
+                        self.metadata_buffers.dspark_hidden_pool.hidden_size
+                    ),
+                    "target_layer_ids": [int(x) for x in target_layer_ids],
+                }
 
             decode_req.metadata_buffer_index = (
                 self.req_to_metadata_buffer_idx_allocator.alloc()
@@ -1107,6 +1604,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.metadata_buffer_index,
                 state_indices,
                 decode_prefix_len=total_prefix_len,
+                spec_metadata=spec_metadata,
             )
             if (
                 self.transfer_queue.enable_staging
@@ -1123,6 +1621,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
+
+        if failed_reqs:
+            failed_ids = {id(r) for r in failed_reqs}
+            self.pending_reqs = [
+                r for r in self.pending_reqs if id(r) not in failed_ids
+            ]
 
         return preallocated_reqs, failed_reqs
 
@@ -1504,6 +2008,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self.spec_algorithm = scheduler.spec_algorithm
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.staging_handler = None
+        self.kv_manager = None
 
     def add(self, decode_req: DecodeRequest) -> None:
         self.queue.append(decode_req)
@@ -1518,8 +2023,52 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 ):
                     self.staging_handler.register_decode_req(dr.req.bootstrap_room, dr)
 
+    def _release_dspark_hidden_rows(self, decode_req: DecodeRequest) -> None:
+        indices_by_pp = decode_req.dspark_hidden_dst_indices_by_pp
+        indices = decode_req.dspark_hidden_dst_indices
+        pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+        if pool is not None:
+            if indices_by_pp is not None:
+                seen = set()
+                for pp_indices in indices_by_pp.values():
+                    key = tuple(int(idx) for idx in pp_indices)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    pool.free(pp_indices)
+            elif indices is not None:
+                pool.free(indices)
+        decode_req.dspark_hidden_dst_indices = None
+        decode_req.dspark_hidden_dst_indices_by_pp = None
+        decode_req.dspark_hidden_pp_slices = None
+
+    def _abort_dspark_hidden_commit(
+        self, decode_req: DecodeRequest, message: str
+    ) -> None:
+        """Abort one invalid DSpark hidden transfer without killing decode."""
+        logger.error(message)
+        prepare_abort(
+            decode_req.req,
+            message,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+        receiver = decode_req.kv_receiver
+        if receiver is not None:
+            try:
+                receiver.clear()
+            except Exception:
+                logger.exception(
+                    "Failed to clear receiver after DSpark hidden commit failure: "
+                    "rid=%s bootstrap_room=%s",
+                    decode_req.req.rid,
+                    decode_req.req.bootstrap_room,
+                )
+            decode_req.kv_receiver = None
+        self._release_dspark_hidden_rows(decode_req)
+
     def _commit_transfer_to_req(self, decode_req: DecodeRequest):
         idx = decode_req.metadata_buffer_index
+        metadata = self.metadata_buffers.get_buf(idx)
         (
             output_id,
             cached_tokens,
@@ -1531,7 +2080,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_topk_index,
             output_hidden_states,
             output_bootstrap_room,
-        ) = self.metadata_buffers.get_buf(idx)
+        ) = metadata[:10]
+        output_dspark_prefill_tail_hidden_states = None
+        output_dspark_prefill_tail_valid_mask = None
+        if len(metadata) >= 12:
+            output_dspark_prefill_tail_hidden_states = metadata[10]
+            output_dspark_prefill_tail_valid_mask = metadata[11]
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()
@@ -1560,6 +2114,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+            self._release_dspark_hidden_rows(decode_req)
             return
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
@@ -1579,6 +2134,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
             decode_req.kv_receiver.clear()
             decode_req.kv_receiver = None
+            self._release_dspark_hidden_rows(decode_req)
             return
 
         self._commit_hicache_local_restore_to_req(decode_req)
@@ -1605,6 +2161,146 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.req.output_topk_p = output_topk_p
             decode_req.req.output_topk_index = output_topk_index
             decode_req.req.hidden_states_tensor = output_hidden_states
+            if decode_req.dspark_hidden_dst_indices_by_pp is not None:
+                dspark_pool = getattr(self.metadata_buffers, "dspark_hidden_pool", None)
+                if dspark_pool is None:
+                    self._abort_dspark_hidden_commit(
+                        decode_req,
+                        "DSpark hidden row pool disappeared on decode: "
+                        f"rid={decode_req.req.rid}",
+                    )
+                    return
+                pp_slices = decode_req.dspark_hidden_pp_slices or {}
+                hidden_dst_indices = next(
+                    (
+                        indices
+                        for indices in decode_req.dspark_hidden_dst_indices_by_pp.values()
+                        if indices
+                    ),
+                    [],
+                )
+                raw_hidden_len = len(hidden_dst_indices)
+                hidden_start = int(decode_req.dspark_hidden_start)
+                prefill_cached_len = int(cached_tokens[0].item())
+                received_hidden_start = min(
+                    max(hidden_start, prefill_cached_len),
+                    hidden_start + raw_hidden_len,
+                )
+                hidden_offset = received_hidden_start - hidden_start
+                hidden_len = raw_hidden_len - hidden_offset
+                full_hidden_size = sum(
+                    int(pp_slice.get("slice_len", 0)) for pp_slice in pp_slices.values()
+                )
+                non_empty_slices = []
+                for (
+                    pp_rank,
+                    dst_indices,
+                ) in decode_req.dspark_hidden_dst_indices_by_pp.items():
+                    pp_slice = pp_slices.get(pp_rank) or pp_slices.get(str(pp_rank))
+                    if not pp_slice:
+                        continue
+                    slice_start = int(pp_slice.get("slice_start", 0))
+                    slice_len = int(pp_slice.get("slice_len", 0))
+                    if slice_len <= 0:
+                        continue
+                    non_empty_slices.append((slice_start, slice_len, dst_indices))
+                intervals = sorted(
+                    (slice_start, slice_start + slice_len, len(dst_indices))
+                    for slice_start, slice_len, dst_indices in non_empty_slices
+                )
+                cursor = 0
+                layout_error = None
+                for slice_start, slice_end, dst_len in intervals:
+                    if slice_start != cursor:
+                        layout_error = (
+                            "gap or overlap in PP hidden slices: "
+                            f"expected_start={cursor}, actual_start={slice_start}"
+                        )
+                        break
+                    if dst_len != raw_hidden_len:
+                        layout_error = (
+                            "hidden destination row count mismatch: "
+                            f"rows={dst_len}, expected={raw_hidden_len}"
+                        )
+                        break
+                    cursor = slice_end
+                if layout_error is None and cursor != full_hidden_size:
+                    layout_error = (
+                        "PP hidden slices do not cover the full hidden width: "
+                        f"covered={cursor}, expected={full_hidden_size}"
+                    )
+                if layout_error is not None:
+                    self._abort_dspark_hidden_commit(
+                        decode_req,
+                        "Invalid DSpark hidden PP metadata on decode: "
+                        f"rid={decode_req.req.rid}, {layout_error}",
+                    )
+                    return
+                if (
+                    len(non_empty_slices) == 1
+                    and non_empty_slices[0][0] == 0
+                    and non_empty_slices[0][1] == full_hidden_size
+                ):
+                    _, _, dst_indices = non_empty_slices[0]
+                    hidden = dspark_pool.read(
+                        dst_indices[hidden_offset : hidden_offset + hidden_len]
+                    )
+                else:
+                    hidden_device = torch.device(getattr(dspark_pool, "device", "cpu"))
+                    hidden = torch.empty(
+                        (hidden_len, full_hidden_size),
+                        dtype=dspark_pool.dtype,
+                        device=hidden_device,
+                    )
+                    for slice_start, slice_len, dst_indices in non_empty_slices:
+                        slice_hidden = dspark_pool.read(
+                            dst_indices[hidden_offset : hidden_offset + hidden_len]
+                        )[:, slice_start : slice_start + slice_len]
+                        hidden[:, slice_start : slice_start + slice_len].copy_(
+                            slice_hidden
+                        )
+                valid_dspark_hidden = _validate_dspark_hidden_tensor(
+                    hidden, decode_req.req.rid, received_hidden_start
+                )
+                if valid_dspark_hidden:
+                    decode_req.req.prefill_tail_hidden_states_tensor = hidden
+                    decode_req.req.prefill_tail_valid_mask = torch.ones(
+                        (hidden.shape[0],), dtype=torch.bool, device=hidden.device
+                    )
+                    decode_req.req.prefill_tail_hidden_start = received_hidden_start
+                else:
+                    self._abort_dspark_hidden_commit(
+                        decode_req,
+                        "Invalid DSpark hidden tensor received on decode: "
+                        f"rid={decode_req.req.rid}, "
+                        f"hidden_start={received_hidden_start}",
+                    )
+                    return
+            else:
+                if (
+                    output_dspark_prefill_tail_hidden_states is not None
+                    and output_dspark_prefill_tail_valid_mask is not None
+                    and bool(output_dspark_prefill_tail_valid_mask.any().item())
+                ):
+                    valid_dspark_hidden = _validate_dspark_hidden_tensor(
+                        output_dspark_prefill_tail_hidden_states,
+                        decode_req.req.rid,
+                        0,
+                    )
+                    if not valid_dspark_hidden:
+                        self._abort_dspark_hidden_commit(
+                            decode_req,
+                            "Invalid legacy DSpark hidden tensor received on decode: "
+                            f"rid={decode_req.req.rid}",
+                        )
+                        return
+                decode_req.req.prefill_tail_hidden_states_tensor = (
+                    output_dspark_prefill_tail_hidden_states
+                )
+                decode_req.req.prefill_tail_valid_mask = (
+                    output_dspark_prefill_tail_valid_mask
+                )
+                decode_req.req.prefill_tail_hidden_start = 0
 
         if decode_req.req.return_logprob:
             decode_req.req.logprob.output_token_logprobs_val.append(
@@ -1722,6 +2418,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                self._release_dspark_hidden_rows(decode_req)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
                 indices_to_remove.add(i)
@@ -1759,7 +2456,36 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             ]:
                 pass
             else:
-                raise ValueError(f"Unexpected poll case: {poll}")
+                error_message = (
+                    "Decode transfer returned an unexpected poll state: "
+                    f"poll={poll}, rid={decode_req.req.rid}, "
+                    f"bootstrap_room={decode_req.req.bootstrap_room}"
+                )
+                logger.error(error_message)
+                prepare_abort(
+                    decode_req.req,
+                    error_message,
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                self.scheduler.output_streamer.stream_output(
+                    [decode_req.req], decode_req.req.return_logprob
+                )
+                self._clean_hicache_prefetch_resources(decode_req)
+                release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
+                self._release_dspark_hidden_rows(decode_req)
+                try:
+                    decode_req.kv_receiver.abort()
+                    decode_req.kv_receiver.clear()
+                except Exception:
+                    logger.exception(
+                        "Failed to close receiver after unexpected transfer state: "
+                        "rid=%s",
+                        decode_req.req.rid,
+                    )
+                decode_req.kv_receiver = None
+                indices_to_remove.add(i)
+                if self.scheduler.metrics_reporter.enable_metrics:
+                    self.scheduler.metrics_collector.increment_transfer_failed_reqs()
 
         for i in indices_to_remove:
             if self.enable_staging and self.staging_handler.is_staging_room(
@@ -1769,11 +2495,20 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     self.queue[i].req.bootstrap_room
                 )
             idx = self.queue[i].metadata_buffer_index
-            assert idx != -1
-            # Reset so the next owner sees actual_room == 0 ("not yet written")
-            # instead of the stale value, avoiding a false-positive mismatch.
-            self.metadata_buffers.bootstrap_room[idx] = 0
-            self.req_to_metadata_buffer_idx_allocator.free(idx)
+            if idx >= 0:
+                # Reset so the next owner sees actual_room == 0 ("not yet written")
+                # instead of the stale value, avoiding a false-positive mismatch.
+                self.metadata_buffers.bootstrap_room[idx] = 0
+                self.req_to_metadata_buffer_idx_allocator.free(idx)
+                self.queue[i].metadata_buffer_index = -1
+            else:
+                logger.error(
+                    "Decode transfer cleanup found no metadata slot: rid=%s "
+                    "bootstrap_room=%s",
+                    self.queue[i].req.rid,
+                    self.queue[i].req.bootstrap_room,
+                )
+            self._release_dspark_hidden_rows(self.queue[i])
 
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
@@ -1783,6 +2518,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        for decode_req in self.queue:
+            self._release_dspark_hidden_rows(decode_req)
         self.queue.clear()
 
     def resume_memory_occupation(self):

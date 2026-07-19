@@ -218,6 +218,22 @@ def compute_local_num_token_non_padded(
     )
 
 
+def compute_round_robin_local_num_token_non_padded(
+    global_num_token_non_padded: torch.Tensor,
+    num_tokens_per_dp: int,
+    cp_rank: int,
+    cp_size: int,
+) -> torch.Tensor:
+    """Count real tokens owned by one round-robin context-parallel rank."""
+    tokens_per_rank = num_tokens_per_dp // cp_size
+    local = torch.div(
+        global_num_token_non_padded + cp_size - 1 - cp_rank,
+        cp_size,
+        rounding_mode="floor",
+    )
+    return torch.clamp(local, 0, tokens_per_rank)
+
+
 @dataclass
 class DSV4OutCacheLoc:
     """Per-forward-pass KV cache allocation for DeepSeek-V4 on NPU.
@@ -434,6 +450,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the carried topk lives on spec_info (see EagleDraftInput.dsa_topk_indices).
     reuse_dsa_topk_indices: Optional[bool] = False
 
+    # DeepSeek-V4 DSpark PD: per-prefill-batch target aux hidden layers to capture.
+    dspark_hidden_capture_layer_ids: Optional[List[int]] = None
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
@@ -710,6 +728,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
+            dspark_hidden_capture_layer_ids=batch.dspark_hidden_capture_layer_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
@@ -936,6 +955,28 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.num_token_non_padded = compute_local_num_token_non_padded(
             global_num_token_non_padded=self.num_token_non_padded,
             num_tokens_per_dp=num_tokens_per_dp,
+        )
+
+    def adjust_num_token_non_padded_for_dsa_cp_round_robin(
+        self, server_args
+    ) -> None:
+        """Make the MegaMoE TopK mask local to a round-robin DSA CP rank."""
+        from sglang.srt.utils.common import require_mlp_tp_gather
+
+        parallel = get_parallel()
+        dp_rank = parallel.attn_dp_rank
+        assert self.global_num_tokens_cpu is not None
+
+        if require_mlp_tp_gather(server_args):
+            num_tokens_per_dp = self.global_num_tokens_cpu[dp_rank]
+        else:
+            num_tokens_per_dp = self.global_num_tokens_cpu[0]
+
+        self.num_token_non_padded = compute_round_robin_local_num_token_non_padded(
+            global_num_token_non_padded=self.num_token_non_padded,
+            num_tokens_per_dp=num_tokens_per_dp,
+            cp_rank=parallel.attn_cp_rank,
+            cp_size=parallel.attn_cp_size,
         )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
@@ -1283,7 +1324,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # padding
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
-        self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
+        if self.lora_ids is not None:
+            self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
 
         seq_len_fill_value = (
             model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -1398,22 +1440,30 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.req_pool_indices = self.req_pool_indices[:bs]
                 if self.seq_lens_cpu is not None:
                     self.seq_lens_cpu = self.seq_lens_cpu[:bs]
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_target_verify():  # verify
                 num_tokens = bs * self.spec_info.draft_token_num
-                logits_output.next_token_logits = logits_output.next_token_logits[
-                    :num_tokens
-                ]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :num_tokens
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
                 bs = bs * self.spec_info.num_tokens_per_req
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_extend() or self.forward_mode.is_idle():
-                logits_output.next_token_logits = logits_output.next_token_logits[:bs]
+                if logits_output.next_token_logits is not None:
+                    logits_output.next_token_logits = logits_output.next_token_logits[
+                        :bs
+                    ]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
 
             if hasattr(self, "hidden_states_backup"):

@@ -52,6 +52,40 @@ class JDCase:
 
 CASES: tuple[JDCase, ...] = (
     JDCase(
+        case_id="jd-dspark-degenerate-sampling",
+        commits=(),
+        category="cpu",
+        command=(
+            "python3",
+            "-m",
+            "pytest",
+            "-q",
+            "test/jd-ci/unit/speculative/test_dspark_degenerate_sampling.py",
+        ),
+        assertion=(
+            "DSpark fast and slow sampling emit a valid token for degenerate "
+            "all-non-finite draft rows"
+        ),
+        tracks_ci_head=True,
+    ),
+    JDCase(
+        case_id="jd-dsv4-cp-megamoe-padding",
+        commits=(),
+        category="cpu",
+        command=(
+            "python3",
+            "-m",
+            "pytest",
+            "-q",
+            "test/jd-ci/unit/speculative/test_dspark_megamoe_cp_padding.py",
+        ),
+        assertion=(
+            "Hopper MegaMoE uses the SM90 backend and localizes TopK padding "
+            "only for actual DSA round-robin CP forwards"
+        ),
+        tracks_ci_head=True,
+    ),
+    JDCase(
         case_id="jd-openai-function-call",
         commits=(
             "96311e38d3a6b3f9be87e638961e3e290553418e",

@@ -61,11 +61,13 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    init_disagg_poll_cpu_groups,
     prepare_abort,
 )
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -157,6 +159,7 @@ from sglang.srt.managers.min_free_slots_delayer import (
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.overlap_utils import (
     RelayPayload,
+    decide_needs_confidence_relay,
     decide_needs_cpu_seq_lens,
     resolve_forward_inputs,
 )
@@ -901,7 +904,7 @@ class Scheduler(
         min_free_slots = resolve_min_free_slots(
             self.server_args.min_free_slots_delay,
             self.max_running_requests,
-            is_dflash=self.spec_algorithm.is_dflash(),
+            is_dflash_family=self.spec_algorithm.is_dflash_family(),
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
@@ -920,6 +923,19 @@ class Scheduler(
         self.attn_cp_cpu_group = self.attn_cp_group.cpu_group
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
+
+        self.disagg_poll_cpu_groups = None
+        self.disagg_request_cpu_groups = None
+        if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
+            (
+                self.disagg_poll_cpu_groups,
+                self.disagg_request_cpu_groups,
+            ) = init_disagg_poll_cpu_groups(
+                self.attn_cp_group,
+                self.attn_tp_group,
+                self.tp_group,
+                self.world_group,
+            )
 
         # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
         # When DP attention is enabled, scope to the attention-TP group; otherwise use
@@ -1153,6 +1169,127 @@ class Scheduler(
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
+    def init_dspark_disaggregation_metadata_config(
+        self,
+    ) -> Tuple[int, int, int, str]:
+        self.dspark_pd_local_capture_layer_ids = []
+        self.dspark_pd_hidden_transfer_window_size = None
+        target_layer_ids = []
+        spec_aux_config = getattr(self.tp_worker.model_runner, "spec_aux_config", None)
+        configured_target_layer_ids = getattr(
+            spec_aux_config, "dflash_target_layer_ids", None
+        )
+        if configured_target_layer_ids:
+            target_layer_ids = [int(x) for x in configured_target_layer_ids]
+
+        env_target_layer_ids = envs.SGLANG_DSPARK_PD_TARGET_LAYER_IDS.get()
+        if env_target_layer_ids:
+            target_layer_ids = [int(x) for x in env_target_layer_ids]
+
+        if not target_layer_ids:
+            try:
+                from sglang.srt.speculative.dspark_components.dspark_config import (
+                    parse_dspark_draft_config,
+                )
+
+                config = parse_dspark_draft_config(
+                    draft_hf_config=self.model_config.hf_config
+                )
+                if config.target_layer_ids:
+                    target_layer_ids = [int(x) for x in config.target_layer_ids]
+            except Exception:
+                logger.debug("Could not infer DSpark target layer ids.", exc_info=True)
+
+        dspark_hidden_pool_size = 0
+        dspark_hidden_size = 0
+        dspark_hidden_device = "cpu"
+        should_configure = self.disaggregation_mode in (
+            DisaggregationMode.DECODE,
+            DisaggregationMode.PREFILL,
+        ) and (
+            self.spec_algorithm.is_dspark()
+            or bool(env_target_layer_ids)
+        )
+        if not should_configure or not target_layer_ids:
+            return 0, 0, 0, dspark_hidden_device
+
+        if self.transfer_backend not in (
+            TransferBackend.MOONCAKE,
+            TransferBackend.FAKE,
+        ):
+            raise NotImplementedError(
+                "DSpark PD hidden transfer is implemented only for "
+                f"Mooncake/Fake backends, got {self.transfer_backend.value}."
+            )
+
+        dspark_hidden_size = len(target_layer_ids) * int(self.model_config.hidden_size)
+        default_pool_rows = max(
+            1,
+            int(self.server_args.max_prefill_buffer_tokens() or 0),
+            int(self.max_prefill_tokens or 0),
+        )
+        architectures = (
+            getattr(getattr(self.model_config, "hf_config", None), "architectures", [])
+            or []
+        )
+        dspark_window_size = getattr(self.model_config, "window_size", None)
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and any("DeepseekV4" in arch for arch in architectures)
+            and dspark_window_size is not None
+            and int(dspark_window_size) > 0
+        ):
+            self.dspark_pd_hidden_transfer_window_size = int(dspark_window_size)
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and any("DeepseekV4" in arch for arch in architectures)
+            and dspark_window_size is not None
+            and int(dspark_window_size) > 0
+        ):
+            # Hidden rows are reserved during bootstrap and share the same
+            # 2*max_running metadata-credit ceiling.  A DSV4 DSpark request
+            # transfers at most one draft attention window, so sizing this
+            # pool to a full prefill chunk wastes over a GiB per rank at 64K.
+            max_hidden_reservations = (
+                2 * int(self.max_running_requests) * int(dspark_window_size)
+            )
+            default_pool_rows = min(default_pool_rows, max_hidden_reservations)
+        pool_rows = envs.SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS.get()
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            recv_pool_rows = envs.SGLANG_DSPARK_PD_HIDDEN_RECV_POOL_TOKENS.get()
+            if recv_pool_rows is not None:
+                pool_rows = recv_pool_rows
+        dspark_hidden_pool_size = max(
+            0, default_pool_rows if pool_rows is None else int(pool_rows)
+        )
+        logger.info(
+            "DSpark PD hidden row pool configured: mode=%s rows=%d " "hidden_width=%d",
+            self.disaggregation_mode.value,
+            dspark_hidden_pool_size,
+            dspark_hidden_size,
+        )
+
+        local_target_layer_ids = list(target_layer_ids)
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            if self.ps.pp_size > 1:
+                pp_start, pp_end = get_pp_indices(
+                    self.model_config.num_hidden_layers,
+                    self.ps.pp_rank,
+                    self.ps.pp_size,
+                )
+                local_target_layer_ids = [
+                    layer_id
+                    for layer_id in target_layer_ids
+                    if pp_start <= layer_id < pp_end
+                ]
+            self.dspark_pd_local_capture_layer_ids = local_target_layer_ids
+            if not local_target_layer_ids:
+                dspark_hidden_pool_size = 0
+
+        if torch.cuda.is_available():
+            dspark_hidden_device = f"cuda:{self.ps.gpu_id}"
+        return 0, dspark_hidden_pool_size, dspark_hidden_size, dspark_hidden_device
+
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
@@ -1185,6 +1322,15 @@ class Scheduler(
             disagg_hidden_size = 16  # minimal padding size for RDMA
             disagg_hidden_states_dtype = torch.float32
 
+        (
+            dspark_prefill_tail_len,
+            dspark_hidden_pool_size,
+            dspark_hidden_size,
+            dspark_hidden_device,
+        ) = self.init_dspark_disaggregation_metadata_config()
+        if dspark_hidden_size:
+            disagg_hidden_size = dspark_hidden_size
+            disagg_hidden_states_dtype = self.model_config.dtype
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
         ):  # *2 for the headroom.
@@ -1197,6 +1343,10 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
+                dspark_hidden_pool_size=dspark_hidden_pool_size,
+                dspark_hidden_size=dspark_hidden_size,
+                dspark_hidden_device=dspark_hidden_device,
             )
 
             # The decode requests polling kv cache
@@ -1242,6 +1392,10 @@ class Scheduler(
                 hidden_size=disagg_hidden_size,
                 hidden_states_dtype=disagg_hidden_states_dtype,
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
+                dspark_prefill_tail_len=dspark_prefill_tail_len,
+                dspark_hidden_pool_size=dspark_hidden_pool_size,
+                dspark_hidden_size=dspark_hidden_size,
+                dspark_hidden_device=dspark_hidden_device,
             )
 
             self.disagg_prefill_bootstrap_queue = PrefillBootstrapQueue(
@@ -1297,11 +1451,23 @@ class Scheduler(
         else:
             attn_backends = (self.tp_worker.model_runner.attn_backend,)
         needs_cpu_seq_lens = decide_needs_cpu_seq_lens(self.server_args, attn_backends)
+        needs_confidence_relay = decide_needs_confidence_relay(self.server_args)
         self.future_map = self.spec_algorithm.create_future_map(
             self.device,
             self.req_to_token_pool,
             needs_cpu_seq_lens=needs_cpu_seq_lens,
+            needs_confidence_relay=needs_confidence_relay,
         )
+
+        self._confidence_budget_prepare = None
+        if (
+            needs_confidence_relay
+            and self.enable_overlap
+            and self.draft_worker is not None
+        ):
+            self._confidence_budget_prepare = (
+                self.draft_worker.get_confidence_budget_prepare()
+            )
 
         if use_mlx():
             # MLX uses its own overlap loop and does not create CUDA streams,
@@ -1770,6 +1936,7 @@ class Scheduler(
             self.scripted_scheduler_hook = None
 
     def init_request_receiver(self) -> None:
+        request_groups = self.disagg_request_cpu_groups
         self.request_receiver = SchedulerRequestReceiver(
             recv_from_tokenizer=self.ipc_channels.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
@@ -1778,11 +1945,23 @@ class Scheduler(
             mm_receiver=self.mm_receiver,
             ps=self.ps,
             tp_group=self.tp_group,
-            tp_cpu_group=self.tp_cpu_group,
+            tp_cpu_group=(
+                request_groups["tp"]
+                if request_groups is not None
+                else self.tp_cpu_group
+            ),
             attn_tp_group=self.attn_tp_group,
-            attn_tp_cpu_group=self.attn_tp_cpu_group,
+            attn_tp_cpu_group=(
+                request_groups["attn_tp"]
+                if request_groups is not None
+                else self.attn_tp_cpu_group
+            ),
             attn_cp_group=self.attn_cp_group,
-            attn_cp_cpu_group=self.attn_cp_cpu_group,
+            attn_cp_cpu_group=(
+                request_groups["cp"]
+                if request_groups is not None
+                else self.attn_cp_cpu_group
+            ),
             world_group=self.world_group,
             server_args=self.server_args,
             model_config=self.model_config,
@@ -2192,8 +2371,12 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
+        if self.spec_algorithm.is_dflash_family():
+            error_msg = validate_dflash_request(
+                req,
+                self.enable_overlap,
+                allow_grammar=self.spec_algorithm.is_dspark(),
+            )
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)
                 self.init_req_max_new_tokens(req)
@@ -2563,13 +2746,27 @@ class Scheduler(
                 self._pending_chunked_abort_req = None
             return
 
-        prepare_abort(req, "Aborted")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
+        abort_reason = req.finished_reason
+        if not isinstance(abort_reason, FINISH_ABORT):
+            pending_abort_reason = req.to_finish
+            if isinstance(pending_abort_reason, FINISH_ABORT):
+                abort_reason = pending_abort_reason
+                req.finished_reason = abort_reason
+            else:
+                prepare_abort(req, "Aborted")
+                abort_reason = req.finished_reason
+        if not isinstance(abort_reason, FINISH_ABORT):
+            raise RuntimeError("chunked abort finalization has no abort reason")
+
+        abort_message = abort_reason.message or "Aborted"
+        req.time_stats.trace_ctx.abort(abort_info={"reason": abort_message})
         req.to_finish = None
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             req.disagg_kv_sender.abort()
             maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
+                req,
+                self.req_to_metadata_buffer_idx_allocator,
+                getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
             )
             req.pending_bootstrap = False
         if self.enable_hicache_storage:
@@ -2581,7 +2778,14 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        self.ipc_channels.send_to_tokenizer.send_output(
+            AbortReq(
+                rid=req.rid,
+                finished_reason=abort_reason.to_json(),
+                abort_message=abort_message,
+            ),
+            req,
+        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3254,6 +3458,8 @@ class Scheduler(
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
                 self.future_map.resolve_seq_lens_cpu(batch)
+                if self._confidence_budget_prepare is not None:
+                    self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
@@ -3813,6 +4019,11 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
+        if self.spec_algorithm.is_dspark() and self.draft_worker is not None:
+            info_record = self.draft_worker.dump_info_records()
+            if info_record is not None:
+                ret["dspark_info_record"] = info_record
+
         # This field is not serializable.
         ret.pop("model_config", None)
 
@@ -3825,6 +4036,8 @@ class Scheduler(
                 "pp_max_micro_batch_size",
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
+                "dspark_force_budget_frac",
+                "dspark_clear_info_records",
             ]
         )
 
@@ -3842,6 +4055,30 @@ class Scheduler(
                 )
                 if_success = False
                 break
+            elif k == "dspark_force_budget_frac":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "set_dspark_forced_budget_frac"
+                ):
+                    logging.warning(
+                        "dspark_force_budget_frac requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+                if v is not None and not (0.0 < float(v) <= 1.0):
+                    logging.warning(
+                        f"dspark_force_budget_frac must be in (0, 1] or null, got {v}."
+                    )
+                    if_success = False
+                    break
+            elif k == "dspark_clear_info_records":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "clear_info_records"
+                ):
+                    logging.warning(
+                        "dspark_clear_info_records requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
 
         if if_success:
             if (
@@ -3856,7 +4093,17 @@ class Scheduler(
             self.metrics_reporter.spec_total_num_accept_tokens = (
                 self.metrics_reporter.spec_total_num_forward_ct
             ) = 0
-            for k, v in server_args_dict.items():
+            # DSpark control keys are worker commands, not server args; route
+            # them to the draft worker and keep them out of the override.
+            remaining = dict(server_args_dict)
+            frac = remaining.pop("dspark_force_budget_frac", None)
+            if "dspark_force_budget_frac" in server_args_dict:
+                self.draft_worker.set_dspark_forced_budget_frac(
+                    None if frac is None else float(frac)
+                )
+            if remaining.pop("dspark_clear_info_records", None):
+                self.draft_worker.clear_info_records()
+            for k, v in remaining.items():
                 setattr(get_global_server_args(), k, v)
             logger.info(f"Global server args updated! {get_global_server_args()=}")
 
@@ -3925,7 +4172,9 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 bootstrap_pending = req.pending_bootstrap
                 maybe_release_metadata_buffer(
-                    req, self.req_to_metadata_buffer_idx_allocator
+                    req,
+                    self.req_to_metadata_buffer_idx_allocator,
+                    getattr(self.disagg_metadata_buffers, "dspark_hidden_pool", None),
                 )
                 if (
                     bootstrap_pending

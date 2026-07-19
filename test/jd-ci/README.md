@@ -163,7 +163,8 @@ bash test/jd-ci/pipeline/run_server_api_regression.sh "$PWD" /tmp/jd-ci
 结束后统一返回非零状态，确保一次 CI 能收集完整的算子回归结果。
 
 当前固定覆盖 optimized RMSNorm、DP-attention compressed all-gather、DSV4
-norm-rope、DSV4 CP sparse-prefill/multi-stream 和 W4A8 dynamic quantization。
+norm-rope、DSV4 CP sparse-prefill/multi-stream、MoE fused-gate，以及 W4A8
+dynamic quantization。
 
 ```bash
 bash test/jd-ci/pipeline/run_operator_regression.sh "$PWD" /tmp/jd-ci

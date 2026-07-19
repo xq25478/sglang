@@ -2,13 +2,20 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
+    DecodeRequest,
     DecodeTransferQueue,
     HiCacheRestoreResult,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    FAKE_BOOTSTRAP_HOST,
+)
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,6 +28,9 @@ class FakeReceiver:
     def __init__(self):
         self.clear_called = False
 
+    def abort(self):
+        pass
+
     def clear(self):
         self.clear_called = True
 
@@ -29,24 +39,119 @@ class FakeReceiver:
 
 
 class TestDecodeQueueCleanup(CustomTestCase):
+    def test_fake_health_transfer_skips_dspark_hidden_metadata(self):
+        receiver = SimpleNamespace(send_metadata=MagicMock())
+        req = SimpleNamespace(
+            rid="HEALTH_CHECK_test",
+            origin_input_ids=[0],
+            output_ids=[],
+            sampling_params=SimpleNamespace(max_new_tokens=1),
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            bootstrap_room=0,
+            req_pool_idx=0,
+            to_finish=None,
+            finished_reason=None,
+            return_logprob=False,
+            time_stats=MagicMock(),
+        )
+        decode_req = DecodeRequest(
+            req=req,
+            kv_receiver=receiver,
+            waiting_for_input=True,
+        )
+
+        dspark_pool = SimpleNamespace(
+            size=8,
+            hidden_size=4,
+            alloc=MagicMock(return_value=[0]),
+        )
+        scheduler = SimpleNamespace(
+            running_batch=SimpleNamespace(reqs=[]),
+            enable_priority_scheduling=False,
+            enable_hisparse=False,
+            enable_decode_hicache=False,
+            server_args=SimpleNamespace(
+                disaggregation_decode_enable_radix_cache=False,
+                disaggregation_transfer_backend="mooncake",
+            ),
+            spec_algorithm=SimpleNamespace(is_dspark=lambda: True),
+            model_config=SimpleNamespace(num_hidden_layers=1, hidden_size=4),
+            tp_worker=SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    dflash_or_dspark_target_layer_ids=[0],
+                    spec_aux_config=None,
+                )
+            ),
+            draft_worker=None,
+            output_streamer=MagicMock(),
+        )
+
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.queue = [decode_req]
+        queue.pending_reqs = []
+        queue.retracted_queue = []
+        queue.scheduler = scheduler
+        queue.transfer_queue = SimpleNamespace(enable_staging=False, queue=[])
+        queue.req_to_token_pool = SimpleNamespace(
+            available_size=MagicMock(return_value=1),
+            req_to_token=torch.tensor([[7]], dtype=torch.int64),
+        )
+        queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
+            available_size=MagicMock(return_value=1),
+            alloc=MagicMock(return_value=0),
+        )
+        queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=1)
+        queue.token_to_kv_pool = MagicMock()
+        queue.metadata_buffers = SimpleNamespace(dspark_hidden_pool=dspark_pool)
+        queue.kv_manager = SimpleNamespace(
+            kv_args=SimpleNamespace(state_types=[StateType.DSPARK_HIDDEN])
+        )
+        queue.tree_cache = MagicMock()
+        queue.num_reserved_decode_tokens = 0
+        queue._last_dspark_hidden_recv_credit_warning_time = 0.0
+        queue._resolve_pending_reqs = MagicMock()
+        queue._retry_pending_abort_notifications = MagicMock()
+        queue._update_handshake_waiters = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=100)
+        queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue._pre_alloc = MagicMock(
+            return_value=torch.tensor([7], dtype=torch.int64)
+        )
+
+        preallocated, failed = queue.pop_preallocated()
+
+        self.assertEqual(preallocated, [decode_req])
+        self.assertEqual(failed, [])
+        dspark_pool.alloc.assert_not_called()
+        self.assertIsNone(decode_req.dspark_hidden_dst_indices)
+        self.assertIsNone(decode_req.dspark_hidden_dst_indices_by_pp)
+        self.assertIsNone(receiver.send_metadata.call_args.args[2])
+        self.assertIsNone(receiver.send_metadata.call_args.kwargs["spec_metadata"])
+
     def test_prealloc_abort_clears_receiver_before_removing_request(self):
         receiver = FakeReceiver()
         req = SimpleNamespace(
             rid="abort-prealloc",
+            bootstrap_room=7,
+            to_finish=None,
             finished_reason=FINISH_ABORT("aborted"),
             return_logprob=False,
         )
-        decode_req = SimpleNamespace(req=req, kv_receiver=receiver)
+        decode_req = DecodeRequest(req=req, kv_receiver=receiver)
 
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.queue = [decode_req]
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue._resolve_pending_reqs = MagicMock()
+        queue._retry_pending_abort_notifications = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
         queue._allocatable_token_budgets = MagicMock(return_value=0)
         queue._hicache_pending_restore_tokens = MagicMock(return_value=0)
+        queue.transfer_queue = MagicMock()
+        queue.transfer_queue.queue = []
 
         scheduler = MagicMock()
         scheduler.running_batch.reqs = []
@@ -78,7 +183,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
             bootstrap_room=7,
             return_logprob=False,
         )
-        decode_req = SimpleNamespace(
+        decode_req = DecodeRequest(
             req=req,
             kv_receiver=receiver,
             metadata_buffer_index=3,

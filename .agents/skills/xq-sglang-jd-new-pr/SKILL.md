@@ -91,6 +91,14 @@ rg -n "<symbol-or-behavior>" python sgl-kernel test/jd-ci
 
 不要只看 subject 或文件名。确认真实调用路径、输入输出、不变量、失败模式、硬件要求，以及上游是否已有相同测试。
 
+### 审计 PR 已有覆盖
+
+- 先审计 PR 已有测试资产，包括新加或修改的 test、benchmark、fixture 和注册逻辑；逐项判断是否命中本次改动，而不是默认直接采用。
+- 把每个 case 的输入与新增 guard、feature gate 和真实 dispatch 条件逐项对照。至少一个 case 必须经过生产调用入口，并用 spy、计数器或其他可观察证据证明命中了目标分支；只直接调用底层 helper 不足以证明接线正确。
+- 改动共享 wrapper、导出符号或公共函数签名时，必须对比 base 公共接口并搜索所有生产调用点；为仍在使用的 scoring mode、grouped 参数、dtype、环境开关和返回约定补兼容性 canary。
+- 性能测试的 candidate 与 reference 必须进入不同的底层实现。沿调用图确认实际 kernel；两个 wrapper 最终落到同一 kernel 的自比 benchmark 无效，必须换成独立实现或明确阻塞。
+- PR 已把 JD-only 文件放到 `test/jd-ci/` 之外时，复用其中有效逻辑后，迁移或删除原位置的重复 JD 测试资产；不得留下重复注册或用目录外测试冒充 JD case。
+
 文档或纯测试 commit 可以明确排除；其余 commit 必须进入映射。
 
 ## 4. 选择最小充分测试

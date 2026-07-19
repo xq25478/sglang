@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import random
+import threading
 from collections import deque
 from contextlib import nullcontext
+from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Tuple, Type, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    overload,
+)
 
 import numpy as np
 import torch
@@ -14,6 +28,8 @@ import torch.distributed as dist
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip, is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.base.conn import KVArgs, StateType
@@ -76,6 +92,104 @@ class DisaggregationMode(Enum):
 #########################
 
 
+DISAGG_POLL_PHASES = (
+    "bootstrap",
+    "pp_bootstrap",
+    "waiting",
+    "optimistic",
+    "inflight",
+    "transferred",
+    "chunked",
+    "pp_queue",
+)
+
+
+def init_disagg_poll_cpu_groups(
+    attn_cp_group,
+    attn_tp_group,
+    tp_group,
+    world_group,
+) -> Tuple[
+    Dict[str, Tuple[dist.ProcessGroup, dist.ProcessGroup]],
+    Dict[str, dist.ProcessGroup],
+]:
+    """Create separate Gloo groups for PD polling and request broadcasts."""
+    local_topology = {
+        "cp": tuple(attn_cp_group.ranks),
+        "attn_tp": tuple(attn_tp_group.ranks),
+        "tp": tuple(tp_group.ranks),
+    }
+    world_size = dist.get_world_size(group=world_group.cpu_group)
+    gathered_topologies: List[Optional[Dict[str, Tuple[int, ...]]]] = [
+        None
+    ] * world_size
+    dist.all_gather_object(
+        gathered_topologies,
+        local_topology,
+        group=world_group.cpu_group,
+    )
+
+    subgroup_ranks = {
+        family: sorted(
+            {
+                topology[family]
+                for topology in gathered_topologies
+                if topology is not None and len(topology[family]) > 1
+            }
+        )
+        for family in ("cp", "attn_tp", "tp")
+    }
+    global_rank = dist.get_rank()
+    original_groups = {
+        "cp": attn_cp_group.cpu_group,
+        "attn_tp": attn_tp_group.cpu_group,
+        "tp": tp_group.cpu_group,
+    }
+
+    def create_role_groups(families: Tuple[str, ...]) -> Dict[str, dist.ProcessGroup]:
+        local_groups = {family: original_groups[family] for family in families}
+        rank_sets = sorted(
+            {ranks for family in families for ranks in subgroup_ranks[family]}
+        )
+        for ranks in rank_sets:
+            process_group = dist.new_group(ranks=list(ranks), backend="gloo")
+            if global_rank in ranks:
+                for family in families:
+                    if tuple(local_topology[family]) == ranks:
+                        local_groups[family] = process_group
+        return local_groups
+
+    poll_groups = create_role_groups(("cp", "attn_tp"))
+    request_groups = create_role_groups(("cp", "attn_tp", "tp"))
+    phase_groups = {
+        phase: (poll_groups["cp"], poll_groups["attn_tp"])
+        for phase in DISAGG_POLL_PHASES
+    }
+
+    logger.info(
+        "Initialized isolated disaggregation CPU groups: phases=%d "
+        "cp_subgroups=%d attn_tp_subgroups=%d tp_subgroups=%d",
+        len(DISAGG_POLL_PHASES),
+        len(subgroup_ranks["cp"]),
+        len(subgroup_ranks["attn_tp"]),
+        len(subgroup_ranks["tp"]),
+    )
+    return phase_groups, request_groups
+
+
+def get_disagg_poll_cpu_groups(
+    scheduler,
+    phase: str,
+) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
+    """Return the isolated poll groups, with a unit-test-safe fallback."""
+    if phase not in DISAGG_POLL_PHASES:
+        raise ValueError(f"Unknown disaggregation poll phase: {phase}")
+    phase_groups = getattr(scheduler, "disagg_poll_cpu_groups", None)
+    if phase_groups is not None:
+        return phase_groups[phase]
+    return scheduler.attn_cp_cpu_group, scheduler.attn_tp_cpu_group
+
+
 def _get_failure_prob() -> float:
     try:
         return float(envs.SGLANG_TEST_DISAGG_FAILURE_PROB.get())
@@ -124,6 +238,7 @@ def poll_and_all_reduce(
     decode_reqs=None,
     metadata_buffers: Optional[MetadataBuffers] = None,
     server_args: Optional[ServerArgs] = None,
+    local_failed_mask: Optional[List[bool]] = None,
 ):
     # at a certain prob, the poll is failed to simulate failure
     polls = _poll_with_failure_injection(pollers)
@@ -135,6 +250,16 @@ def poll_and_all_reduce(
         and server_args is not None
     ):
         _apply_metadata_gate(polls, decode_reqs, metadata_buffers, server_args)
+    if local_failed_mask is not None:
+        if len(local_failed_mask) != len(polls):
+            raise ValueError(
+                "local_failed_mask must have the same length as pollers: "
+                f"{len(local_failed_mask)} != {len(polls)}"
+            )
+        polls = [
+            KVPoll.Failed if locally_failed else poll
+            for poll, locally_failed in zip(polls, local_failed_mask)
+        ]
     tensor_to_reduce = torch.tensor(polls, dtype=torch.uint8, device="cpu")
     dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
     return tensor_to_reduce.tolist()
@@ -144,10 +269,44 @@ def poll_and_all_reduce_attn_cp_tp_group(
     pollers,
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
+    local_failed_mask: Optional[List[bool]] = None,
+    keys: Optional[List[str]] = None,
+    phase: Optional[str] = None,
 ):
+    if keys is not None:
+        if len(keys) != len(pollers):
+            raise ValueError(
+                "keys must have the same length as pollers: "
+                f"{len(keys)} != {len(pollers)}"
+            )
+
+        polls = _poll_with_failure_injection(pollers)
+        if local_failed_mask is not None:
+            if len(local_failed_mask) != len(polls):
+                raise ValueError(
+                    "local_failed_mask must have the same length as pollers: "
+                    f"{len(local_failed_mask)} != {len(polls)}"
+                )
+            polls = [
+                KVPoll.Failed if locally_failed else poll
+                for poll, locally_failed in zip(polls, local_failed_mask)
+            ]
+
+        return all_reduce_attn_cp_tp_keyed_values(
+            polls,
+            keys,
+            attn_cp_cpu_group,
+            attn_tp_cpu_group,
+            phase=phase,
+        )
+
     # First sync across attn-tp ranks so all TP participants for a given (dp, cp)
     # shard observe the same status transitions.
-    polls = poll_and_all_reduce(pollers, attn_tp_cpu_group)
+    polls = poll_and_all_reduce(
+        pollers,
+        attn_tp_cpu_group,
+        local_failed_mask=local_failed_mask,
+    )
 
     # Then sync across attn-cp ranks, so all TPxCP participants in one DP shard
     # converge to the same global status.
@@ -158,6 +317,130 @@ def poll_and_all_reduce_attn_cp_tp_group(
         group=attn_cp_cpu_group,
     )
     return tensor_to_reduce.tolist()
+
+
+def all_reduce_attn_cp_tp_keyed_values(
+    values: List[int],
+    keys: List[str],
+    attn_cp_cpu_group: dist.ProcessGroup,
+    attn_tp_cpu_group: dist.ProcessGroup,
+    phase: Optional[str] = None,
+) -> List[int]:
+    """MIN-reduce byte-sized values after aligning participants by request id."""
+    if len(values) != len(keys):
+        raise ValueError(
+            "values must have the same length as keys: " f"{len(values)} != {len(keys)}"
+        )
+
+    local_keys = list(keys)
+    values_by_key = dict(zip(local_keys, values))
+    values_by_key = _all_reduce_keyed_polls(
+        values_by_key,
+        attn_tp_cpu_group,
+        phase=phase,
+    )
+    values_by_key = _all_reduce_keyed_polls(
+        values_by_key,
+        attn_cp_cpu_group,
+        phase=phase,
+    )
+    return [values_by_key.get(key, KVPoll.Failed) for key in local_keys]
+
+
+def _poll_keys_signature(keys: List[str], phase: Optional[str] = None) -> torch.Tensor:
+    """Return a fixed-size signature for the phase and ordered request ids."""
+    phase_digest = hashlib.blake2b(
+        (phase or "legacy").encode("utf-8"), digest_size=8
+    ).digest()
+    digest = hashlib.blake2b(digest_size=16)
+    for key in keys:
+        encoded = key.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, byteorder="little", signed=False))
+        digest.update(encoded)
+    raw = digest.digest()
+    return torch.tensor(
+        [
+            int.from_bytes(phase_digest, byteorder="little", signed=True),
+            len(keys),
+            int.from_bytes(raw[:8], byteorder="little", signed=True),
+            int.from_bytes(raw[8:], byteorder="little", signed=True),
+        ],
+        dtype=torch.int64,
+        device="cpu",
+    )
+
+
+def _all_reduce_keyed_polls(
+    polls_by_key: Dict[str, int],
+    gloo_group: dist.ProcessGroup,
+    phase: Optional[str] = None,
+) -> Dict[str, int]:
+    """Reduce poll states after aligning variable per-rank queues by request id.
+
+    Queue membership and ordering can briefly diverge when an abort or transfer
+    completion becomes visible on one CP rank first. A positional all-reduce is
+    unsafe in that window: different lengths abort Gloo, while equal-length
+    reorderings silently combine statuses for unrelated requests.
+
+    The common path exchanges only a fixed-size signature. If signatures differ,
+    request ids are gathered and reduced in a deterministic union order. A key
+    missing on any participant is treated as Failed so the surviving copies are
+    drained instead of being scheduled with incomplete CP/TP participation.
+    """
+    world_size = dist.get_world_size(group=gloo_group)
+    if world_size <= 1:
+        return polls_by_key
+
+    ordered_keys = list(polls_by_key)
+    signature = _poll_keys_signature(ordered_keys, phase=phase)
+    gathered_signatures = [torch.empty_like(signature) for _ in range(world_size)]
+    dist.all_gather(gathered_signatures, signature, group=gloo_group)
+
+    phase_ids = [
+        int(peer_signature[0].item()) for peer_signature in gathered_signatures
+    ]
+    if any(phase_id != phase_ids[0] for phase_id in phase_ids[1:]):
+        raise RuntimeError(
+            "Disaggregation poll phase mismatch across ranks: "
+            f"local_phase={phase or 'legacy'}, phase_ids={phase_ids}"
+        )
+
+    signatures_match = all(
+        torch.equal(signature, peer_signature) for peer_signature in gathered_signatures
+    )
+    if signatures_match:
+        reduce_keys = ordered_keys
+    else:
+        gathered_keys: List[Optional[List[str]]] = [None] * world_size
+        dist.all_gather_object(gathered_keys, ordered_keys, group=gloo_group)
+        reduce_keys = sorted(
+            {
+                key
+                for peer_keys in gathered_keys
+                if peer_keys is not None
+                for key in peer_keys
+            }
+        )
+        logger.warning(
+            "Disaggregation poll queues diverged across ranks; aligning by request "
+            "id and failing missing entries: phase=%s local=%d "
+            "peer_lengths=%s union=%d",
+            phase or "legacy",
+            len(ordered_keys),
+            [len(peer_keys or []) for peer_keys in gathered_keys],
+            len(reduce_keys),
+        )
+
+    if not reduce_keys:
+        return {}
+
+    tensor_to_reduce = torch.tensor(
+        [polls_by_key.get(key, KVPoll.Failed) for key in reduce_keys],
+        dtype=torch.uint8,
+        device="cpu",
+    )
+    dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=gloo_group)
+    return dict(zip(reduce_keys, tensor_to_reduce.tolist()))
 
 
 def poll_and_all_reduce_with_staging(
@@ -219,6 +502,190 @@ class ReqToMetadataIdxAllocator:
         self.free_slots.append(free_index)
 
 
+class DSparkHiddenRowPool:
+    """Compact row pool for DSpark PD hidden-state transfer."""
+
+    def __init__(
+        self,
+        size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: str = "cpu",
+    ):
+        self.size = max(0, int(size))
+        self.hidden_size = int(hidden_size)
+        self.dtype = dtype
+        self.device = device
+        self.buffer = torch.zeros(
+            (self.size, self.hidden_size), dtype=dtype, device=device
+        )
+        self.free_slots = deque(range(self.size))
+        self.lock = threading.Lock()
+
+    def available_size(self) -> int:
+        with self.lock:
+            return len(self.free_slots)
+
+    def alloc(self, n: int) -> Optional[List[int]]:
+        n = int(n)
+        if n <= 0:
+            return []
+        with self.lock:
+            if n > len(self.free_slots):
+                return None
+
+            free_sorted = sorted(self.free_slots)
+            run_len = 1
+            for prev, cur in zip(free_sorted, free_sorted[1:]):
+                if cur == prev + 1:
+                    run_len += 1
+                else:
+                    run_len = 1
+                if run_len >= n:
+                    first = cur - n + 1
+                    indices = list(range(first, first + n))
+                    selected = set(indices)
+                    self.free_slots = deque(
+                        slot for slot in self.free_slots if slot not in selected
+                    )
+                    return indices
+
+            if n == 1:
+                return [self.free_slots.popleft()]
+            return [self.free_slots.popleft() for _ in range(n)]
+
+    def free(self, indices: Optional[List[int]]) -> None:
+        if not indices:
+            return
+        with self.lock:
+            existing = set(self.free_slots)
+            to_free = []
+            for idx in (int(i) for i in indices):
+                if 0 <= idx < self.size and idx not in existing:
+                    to_free.append(idx)
+                    existing.add(idx)
+            self.free_slots.extend(to_free)
+
+    def write(self, indices: List[int], hidden: torch.Tensor) -> None:
+        if not indices:
+            return
+        if hidden.shape[0] != len(indices):
+            raise ValueError(
+                "DSpark hidden row count mismatch: "
+                f"hidden={hidden.shape[0]}, indices={len(indices)}"
+            )
+        if hidden.shape[-1] > self.hidden_size:
+            raise ValueError(
+                "DSpark hidden width exceeds row pool width: "
+                f"hidden={hidden.shape[-1]}, pool={self.hidden_size}"
+            )
+        hidden = hidden.to(device=self.device, dtype=self.dtype, non_blocking=True)
+        hidden_width = hidden.shape[-1]
+        first = int(indices[0])
+        contiguous = all(int(idx) == first + i for i, idx in enumerate(indices))
+        if contiguous:
+            dst = self.buffer[first : first + len(indices)]
+            if hidden_width < self.hidden_size:
+                dst.zero_()
+            dst[:, :hidden_width].copy_(hidden)
+            return
+
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        if hidden_width < self.hidden_size:
+            self.buffer[index_tensor, :] = 0
+        self.buffer[index_tensor, :hidden_width] = hidden
+
+    def read(self, indices: List[int]) -> torch.Tensor:
+        if not indices:
+            return torch.empty(
+                (0, self.hidden_size), dtype=self.dtype, device=self.device
+            )
+        index_tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        return self.buffer[index_tensor].clone()
+
+    def get_state_buf_infos(self):
+        if self.size <= 0:
+            return [], [], []
+        return [self.buffer.data_ptr()], [self.buffer.nbytes], [self.buffer[0].nbytes]
+
+
+@dataclass
+class DSparkHiddenTransferPlan:
+    row_count: int
+    item_len: int
+    row_chunks: List[Dict[str, Any]]
+
+    @classmethod
+    def build(cls, row_count: int, item_len: int) -> "DSparkHiddenTransferPlan":
+        row_count = int(row_count)
+        item_len = int(item_len)
+        if row_count <= 0:
+            return cls(row_count=0, item_len=item_len, row_chunks=[])
+        return cls(
+            row_count=row_count,
+            item_len=item_len,
+            row_chunks=[{"row_start": 0, "row_len": row_count}],
+        )
+
+    def to_dynamic_dst(self, ptr: int = 0) -> Dict[str, Any]:
+        return {
+            "ptr": int(ptr),
+            "nbytes": int(self.row_count * self.item_len),
+            "item_len": int(self.item_len),
+            "row_count": int(self.row_count),
+            "row_chunks": [dict(chunk) for chunk in self.row_chunks],
+        }
+
+    @staticmethod
+    def trim_dynamic_dst(
+        dynamic_dst: Dict[str, Any],
+        *,
+        offset: int,
+        new_row_count: int,
+        old_row_count: int,
+    ) -> Dict[str, Any]:
+        new_dynamic_dst = dict(dynamic_dst)
+        item_len = int(new_dynamic_dst.get("item_len", 0))
+        offset = int(offset)
+        new_row_count = int(new_row_count)
+        old_row_count = int(old_row_count)
+        old_chunks = [dict(chunk) for chunk in new_dynamic_dst.get("row_chunks") or []]
+
+        new_dynamic_dst["row_count"] = new_row_count
+        new_dynamic_dst["nbytes"] = int(new_row_count * item_len)
+
+        if old_chunks and "ptr" in old_chunks[0]:
+            new_chunks = []
+            for old_chunk in old_chunks:
+                chunk_start = int(old_chunk.get("row_start", 0))
+                chunk_len = int(old_chunk.get("row_len", 0))
+                chunk_end = chunk_start + chunk_len
+                overlap_start = max(chunk_start, offset)
+                overlap_end = min(chunk_end, old_row_count)
+                if overlap_end <= overlap_start:
+                    continue
+                new_chunks.append(
+                    {
+                        "row_start": int(overlap_start - offset),
+                        "row_len": int(overlap_end - overlap_start),
+                        "ptr": int(old_chunk["ptr"])
+                        + int(overlap_start - chunk_start) * item_len,
+                        "nbytes": int((overlap_end - overlap_start) * item_len),
+                    }
+                )
+            new_dynamic_dst["row_chunks"] = new_chunks
+            new_dynamic_dst["ptr"] = int(new_chunks[0]["ptr"]) if new_chunks else 0
+            return new_dynamic_dst
+
+        if item_len > 0:
+            new_dynamic_dst["ptr"] = (
+                int(new_dynamic_dst.get("ptr", 0)) + offset * item_len
+            )
+        plan = DSparkHiddenTransferPlan.build(new_row_count, item_len)
+        new_dynamic_dst["row_chunks"] = plan.row_chunks
+        return new_dynamic_dst
+
+
 class MetadataBuffers:
     def __init__(
         self,
@@ -227,8 +694,21 @@ class MetadataBuffers:
         hidden_states_dtype: torch.dtype,
         max_top_logprobs_num: int = 128,
         custom_mem_pool: torch.cuda.MemPool = None,
+        dspark_prefill_tail_len: int = 0,
+        dspark_hidden_pool_size: int = 0,
+        dspark_hidden_size: int = 0,
+        dspark_hidden_device: str = "cpu",
     ):
         self.custom_mem_pool = custom_mem_pool
+        self.dspark_prefill_tail_len = max(0, int(dspark_prefill_tail_len))
+        self.dspark_hidden_pool: Optional[DSparkHiddenRowPool] = None
+        if dspark_hidden_pool_size > 0 and dspark_hidden_size > 0:
+            self.dspark_hidden_pool = DSparkHiddenRowPool(
+                dspark_hidden_pool_size,
+                dspark_hidden_size,
+                hidden_states_dtype,
+                device=dspark_hidden_device,
+            )
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -276,6 +756,19 @@ class MetadataBuffers:
             self.output_hidden_states = torch.zeros(
                 (size, hidden_size), dtype=hidden_states_dtype, device=device
             )
+            self.output_dspark_prefill_tail_hidden_states = None
+            self.output_dspark_prefill_tail_valid_mask = None
+            if self.dspark_prefill_tail_len > 0:
+                self.output_dspark_prefill_tail_hidden_states = torch.zeros(
+                    (size, self.dspark_prefill_tail_len, hidden_size),
+                    dtype=hidden_states_dtype,
+                    device=device,
+                )
+                self.output_dspark_prefill_tail_valid_mask = torch.zeros(
+                    (size, self.dspark_prefill_tail_len),
+                    dtype=torch.bool,
+                    device=device,
+                )
             # Request validation: store bootstrap_room to detect metadata corruption
             self.bootstrap_room = torch.zeros(
                 (size, 8), dtype=bootstrap_room_dtype, device=device
@@ -318,10 +811,18 @@ class MetadataBuffers:
             self.output_hidden_states[0].nbytes,
             self.bootstrap_room[0].nbytes,
         ]
+        if self.output_dspark_prefill_tail_hidden_states is not None:
+            extra_bufs = (
+                self.output_dspark_prefill_tail_hidden_states,
+                self.output_dspark_prefill_tail_valid_mask,
+            )
+            ptrs.extend(buf.data_ptr() for buf in extra_bufs)
+            data_lens.extend(buf.nbytes for buf in extra_bufs)
+            item_lens.extend(buf[0].nbytes for buf in extra_bufs)
         return ptrs, data_lens, item_lens
 
     def get_buf(self, idx: int):
-        return (
+        ret = (
             self.output_ids[idx].clone(),
             self.cached_tokens[idx].clone(),
             self.output_token_logprobs_val[idx].clone(),
@@ -333,6 +834,12 @@ class MetadataBuffers:
             self.output_hidden_states[idx].clone(),
             self.bootstrap_room[idx].clone(),
         )
+        if self.output_dspark_prefill_tail_hidden_states is not None:
+            ret += (
+                self.output_dspark_prefill_tail_hidden_states[idx].clone(),
+                self.output_dspark_prefill_tail_valid_mask[idx].clone(),
+            )
+        return ret
 
     def set_buf(self, req: Req):
 
@@ -399,6 +906,55 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
+        if self.output_dspark_prefill_tail_hidden_states is not None:
+            self.output_dspark_prefill_tail_hidden_states[
+                req.metadata_buffer_index
+            ].zero_()
+            self.output_dspark_prefill_tail_valid_mask[
+                req.metadata_buffer_index
+            ].zero_()
+            tail_hidden = getattr(req, "prefill_tail_hidden_states_tensor", None)
+            tail_mask = getattr(req, "prefill_tail_valid_mask", None)
+            if tail_hidden is not None and tail_mask is not None:
+                tail_len = min(
+                    int(tail_hidden.shape[0]),
+                    int(self.output_dspark_prefill_tail_hidden_states.shape[1]),
+                )
+                if tail_len > 0:
+                    self.output_dspark_prefill_tail_hidden_states[
+                        req.metadata_buffer_index, :tail_len
+                    ].copy_(tail_hidden[:tail_len].to(self.output_hidden_states.device))
+                    self.output_dspark_prefill_tail_valid_mask[
+                        req.metadata_buffer_index, :tail_len
+                    ].copy_(tail_mask[:tail_len].to(self.output_hidden_states.device))
+
+    def ensure_dspark_hidden_pool(
+        self,
+        *,
+        size: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: str = "cpu",
+    ) -> DSparkHiddenRowPool:
+        if self.dspark_hidden_pool is None:
+            self.dspark_hidden_pool = DSparkHiddenRowPool(
+                size=size,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                device=device,
+            )
+        elif self.dspark_hidden_pool.hidden_size != int(hidden_size):
+            raise ValueError(
+                "DSpark hidden pool hidden_size mismatch: "
+                f"existing={self.dspark_hidden_pool.hidden_size}, "
+                f"requested={hidden_size}"
+            )
+        return self.dspark_hidden_pool
+
+    def get_dspark_hidden_state_buf_infos(self):
+        if self.dspark_hidden_pool is None:
+            return [], [], []
+        return self.dspark_hidden_pool.get_state_buf_infos()
 
 
 #########################
@@ -660,6 +1216,7 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: int = None,
     req_to_token_pool=None,
+    dspark_hidden_pool: Optional[DSparkHiddenRowPool] = None,
 ) -> None:
     """Populate ``kv_args`` state-buffer fields from the given pool.
     Shared by prefill and decode bootstrap paths so the state_type dispatch
@@ -756,6 +1313,95 @@ def setup_state_kv_args(
                 append_state_component(
                     kv_args, StateType.DSA, data_ptrs, data_lens, item_lens
                 )
+
+    if dspark_hidden_pool is not None:
+        data_ptrs, data_lens, item_lens = dspark_hidden_pool.get_state_buf_infos()
+        if data_ptrs:
+            append_state_component(
+                kv_args,
+                StateType.DSPARK_HIDDEN,
+                data_ptrs,
+                data_lens,
+                item_lens,
+            )
+
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    # DSV4 NextN shares the target allocator, so target and draft use the same
+    # local SWA indices. Keep draft buffers in a separate positional component
+    # to avoid mixing them into the target's heterogeneous state layout, while
+    # reusing the existing SWA transport dispatch. NPU has a different paged
+    # state layout and is intentionally left unchanged.
+    if (
+        not is_npu()
+        and isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        and isinstance(draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+    ):
+        if not draft_token_to_kv_pool.compression_ratios or not all(
+            ratio == 0 for ratio in draft_token_to_kv_pool.compression_ratios
+        ):
+            raise RuntimeError(
+                "DSV4 draft state transfer expects SWA-only NextN layers"
+            )
+        if token_to_kv_pool._unified_kv != draft_token_to_kv_pool._unified_kv:
+            raise RuntimeError(
+                "DSV4 target and draft pools must use the same unified-KV mode"
+            )
+
+        if token_to_kv_pool._unified_kv:
+            target_geometry = (
+                token_to_kv_pool.unified_swa_window,
+                token_to_kv_pool.unified_swa_ring_size,
+                token_to_kv_pool.unified_swa_pages,
+            )
+            draft_geometry = (
+                draft_token_to_kv_pool.unified_swa_window,
+                draft_token_to_kv_pool.unified_swa_ring_size,
+                draft_token_to_kv_pool.unified_swa_pages,
+            )
+            if target_geometry != draft_geometry:
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share SWA ring geometry: "
+                    f"target={target_geometry}, draft={draft_geometry}"
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_unified_swa_ring_buf_infos()
+            )
+            draft_state_type = StateType.SWA_RING
+        else:
+            if (
+                token_to_kv_pool.full_to_swa_index_mapping
+                is not draft_token_to_kv_pool.full_to_swa_index_mapping
+            ):
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share the SWA index mapping"
+                )
+            target_geometry = (
+                token_to_kv_pool.page_size,
+                token_to_kv_pool.sliding_window,
+            )
+            draft_geometry = (
+                draft_token_to_kv_pool.page_size,
+                draft_token_to_kv_pool.sliding_window,
+            )
+            if target_geometry != draft_geometry:
+                raise RuntimeError(
+                    "DSV4 target and draft pools must share paged SWA geometry: "
+                    f"target={target_geometry}, draft={draft_geometry}"
+                )
+            draft_ptrs, draft_lens, draft_item_lens = (
+                draft_token_to_kv_pool.get_state_buf_infos()
+            )
+            draft_state_type = StateType.SWA
+
+        if draft_ptrs:
+            append_state_component(
+                kv_args,
+                draft_state_type,
+                draft_ptrs,
+                draft_lens,
+                draft_item_lens,
+            )
 
     if (
         StateType.MAMBA not in kv_args.state_types

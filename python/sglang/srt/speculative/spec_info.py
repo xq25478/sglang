@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
     from sglang.srt.speculative.ngram_worker import NGRAMWorker
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
 class SpeculativeAlgorithm(Enum):
@@ -33,6 +34,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    DSPARK = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     FROZEN_KV_MTP = auto()
@@ -109,6 +111,12 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dspark(self) -> bool:
+        return self == SpeculativeAlgorithm.DSPARK
+
+    def is_dflash_family(self) -> bool:
+        return self.is_dflash() or self.is_dspark()
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -116,7 +124,13 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_target_verify_for_draft(self) -> bool:
-        return self.is_dflash()
+        return self.is_dflash_family()
+
+    def supports_ragged_verify(self) -> bool:
+        """Whether this algorithm's verify step may carry a RaggedVerifyLayout
+        (per-request verify lengths); gates the token-bucket-keyed verify
+        graphs in the decode cuda graph runner."""
+        return self.is_dspark()
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -134,10 +148,17 @@ class SpeculativeAlgorithm(Enum):
         device: torch.device,
         req_to_token_pool,
         needs_cpu_seq_lens: bool = True,
+        needs_confidence_relay: bool = False,
     ) -> FutureMap:
         from sglang.srt.managers.overlap_utils import FutureMap
 
-        return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
+        return FutureMap(
+            device,
+            self,
+            req_to_token_pool,
+            needs_cpu_seq_lens,
+            needs_confidence_relay,
+        )
 
     def build_disagg_draft_input(
         self,
@@ -154,6 +175,87 @@ class SpeculativeAlgorithm(Enum):
             return build_eagle_disagg_draft_input(
                 batch, server_args, last_tokens_tensor, future_map
             )
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            tails = [
+                getattr(req, "prefill_tail_hidden_states_tensor", None)
+                for req in batch.reqs
+            ]
+            masks = [getattr(req, "prefill_tail_valid_mask", None) for req in batch.reqs]
+            starts = [
+                int(getattr(req, "prefill_tail_hidden_start", 0))
+                for req in batch.reqs
+            ]
+            valid_lens = [
+                int(tail.shape[0])
+                if tail is not None and mask is not None and tail.numel() > 0
+                else 0
+                for tail, mask in zip(tails, masks, strict=True)
+            ]
+            if any(valid_lens):
+                valid_indices = [
+                    i for i, valid_len in enumerate(valid_lens) if valid_len > 0
+                ]
+                if len(valid_indices) == 1:
+                    i = valid_indices[0]
+                    prefill_tail_hidden_states = tails[i][
+                        : valid_lens[i]
+                    ].to(batch.device, non_blocking=True)
+                else:
+                    prefill_tail_hidden_states = torch.cat(
+                        [
+                            tail[:valid_len].to(batch.device, non_blocking=True)
+                            for tail, valid_len in zip(tails, valid_lens, strict=True)
+                            if tail is not None and valid_len > 0
+                        ],
+                        dim=0,
+                    )
+                # In the ragged representation this field stores row counts.
+                prefill_tail_valid_mask = torch.tensor(
+                    valid_lens, dtype=torch.int64, device=batch.device
+                )
+                prefill_tail_start_positions = torch.tensor(
+                    starts, dtype=torch.int64, device=batch.device
+                )
+            else:
+                prefill_tail_hidden_states = None
+                prefill_tail_valid_mask = None
+                prefill_tail_start_positions = None
+
+            spec_info = make_next_draft_input(
+                bonus_tokens=last_tokens_tensor,
+                new_seq_lens=batch.seq_lens,
+                prefill_tail_hidden_states=prefill_tail_hidden_states,
+                prefill_tail_valid_mask=prefill_tail_valid_mask,
+                prefill_tail_start_positions=prefill_tail_start_positions,
+                prefill_tail_hidden_projected=False,
+            )
+            if any(valid_lens):
+                for req in batch.reqs:
+                    req.prefill_tail_hidden_states_tensor = None
+                    req.prefill_tail_valid_mask = None
+                    req.prefill_tail_hidden_start = 0
+            if batch.enable_overlap:
+                from sglang.srt.managers.overlap_utils import RelayPayload
+
+                spec_info.future_indices = batch.req_pool_indices
+                future_map.publish(spec_info.future_indices, batch.seq_lens)
+                future_map.stash(
+                    spec_info.future_indices,
+                    RelayPayload(bonus_tokens=last_tokens_tensor),
+                )
+            return spec_info
+        if self.is_dflash_family():
+            from sglang.srt.speculative.dflash_disaggregation import (
+                build_dflash_disagg_draft_input,
+            )
+
+            return build_dflash_disagg_draft_input(
+                batch, server_args, last_tokens_tensor, future_map
+            )
         return None
 
     def need_topk(self) -> bool:
@@ -166,13 +268,22 @@ class SpeculativeAlgorithm(Enum):
         """
         from sglang.srt.arg_groups.speculative_hook import (
             _handle_dflash,
+            _handle_dspark,
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
         )
 
+        # Validate for every algorithm at startup: the metrics paths read the
+        # ragged-verify mode env and must not be where a typo'd value raises.
+        from sglang.srt.speculative.ragged_verify import read_ragged_verify_mode
+
+        read_ragged_verify_mode()
+
         if self.is_dflash():
             _handle_dflash(server_args)
+        elif self.is_dspark():
+            _handle_dspark(server_args)
         elif self.is_frozen_kv_mtp():
             _handle_frozen_kv_mtp(server_args)
         elif self.is_eagle() or self.is_standalone():
@@ -188,6 +299,8 @@ class SpeculativeAlgorithm(Enum):
         # graph support. We can use it for target verify, or we can use it for
         # other cases which is not target verify but fixed length prefill.
         # Here, we expose this interface to allow the other use cases.
+        if self.is_dspark() and is_draft_worker:
+            return num_draft_tokens - 1
         return num_draft_tokens
 
     def create_worker(
@@ -203,6 +316,13 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
+
+        if self.is_dspark():
+            from sglang.srt.speculative.dspark_components.dspark_worker_v2 import (
+                DSparkWorkerV2,
+            )
+
+            return DSparkWorkerV2
 
         if self.is_frozen_kv_mtp():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
@@ -254,6 +374,14 @@ class SpecInputType(IntEnum):
 
 
 class SpecInput(ABC):
+    # Per-request verify lengths for the ragged-verify graphs (see
+    # sglang.srt.speculative.ragged_verify); verify inputs of algorithms with
+    # supports_ragged_verify() override it per step. Must stay a class-level
+    # default, not an __init__ assignment: dataclass subclasses declare it as
+    # a field and run __post_init__ -> super().__init__ *after* field
+    # assignment, so an init-time default would clobber the passed layout.
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+
     def __init__(self, spec_input_type: SpecInputType):
         self.spec_input_type = spec_input_type
 
@@ -324,7 +452,7 @@ def create_dummy_verify_input(
                 seq_lens_sum=None,
                 seq_lens_cpu=None,
             )
-    elif spec_algorithm.is_dflash():
+    elif spec_algorithm.is_dflash_family():
         from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
         # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.

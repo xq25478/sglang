@@ -205,6 +205,18 @@ class CompressorPrefillPlan(NamedTuple):
         num_q_tokens: int,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
+        # DP-attention idle ranks can legitimately have no query tokens.  The
+        # JIT planner does not accept an empty launch, so return the correctly
+        # shaped empty plan without entering the extension.
+        if num_q_tokens == 0:
+            device = req_pool_indices.device
+            return CompressorPrefillPlan(
+                compress_ratio,
+                torch.empty((0, 16), dtype=torch.uint8, device=device),
+                torch.empty((0, 8), dtype=torch.uint8, device=device),
+                None,
+            )
+
         is_gpu_input = seq_lens.device.type == "cuda"
         pin_buffer = torch.empty(
             0 if is_gpu_input else num_q_tokens * _PREFILL_PLAN_BYTES,

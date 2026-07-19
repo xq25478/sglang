@@ -687,6 +687,10 @@ class ModelRunnerKVCacheMixin:
                 c4_state_pool_size = self.c4_state_pool_size
                 c128_state_pool_size = self.c128_state_pool_size
 
+            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+                should_use_speculative_state_ring,
+            )
+
             self.token_to_kv_pool = pool_cls(
                 max_num_reqs=self.max_running_requests,
                 # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
@@ -715,6 +719,9 @@ class ModelRunnerKVCacheMixin:
                 enable_hisparse=self.enable_hisparse,
                 online_mtp_max_draft_tokens=(
                     self.server_args.max_speculative_num_draft_tokens or 0
+                ),
+                use_speculative_state_ring=should_use_speculative_state_ring(
+                    self.server_args
                 ),
             )
         elif current_platform.is_out_of_tree() and not self.mambaish_config:

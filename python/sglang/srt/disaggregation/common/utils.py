@@ -3,7 +3,7 @@ import dataclasses
 import struct
 import threading
 from collections import deque
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -12,6 +12,57 @@ from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
 )
+
+
+class DSparkHiddenReleaseGuard:
+    """Coordinate exactly-once hidden-row release across scheduler and worker.
+
+    The scheduler owns request cleanup while the Mooncake worker owns the
+    asynchronous transfer.  Either side may observe a terminal request first,
+    so both share this guard and compete for a single release claim.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._owner: Optional[str] = None
+        self._worker_finished = False
+
+    def reserve_worker(self) -> bool:
+        """Reserve rows before a transfer chunk becomes scheduler-visible."""
+        with self._lock:
+            if self._owner is not None:
+                return False
+            self._owner = "worker_reserved"
+            return True
+
+    def begin_worker_release(self) -> bool:
+        """Claim the one worker-side free after transfer source use is done."""
+        with self._lock:
+            if self._owner not in (None, "worker_reserved"):
+                return False
+            self._owner = "worker_releasing"
+            return True
+
+    def claim_scheduler(self) -> bool:
+        with self._lock:
+            if self._owner is not None:
+                return False
+            self._owner = "scheduler"
+            return True
+
+    def mark_worker_finished(self) -> None:
+        with self._lock:
+            if self._owner != "worker_releasing":
+                raise RuntimeError(
+                    "DSpark hidden release can finish on the worker only after "
+                    "the worker has begun releasing rows"
+                )
+            self._owner = "worker_finished"
+            self._worker_finished = True
+
+    def worker_finished(self) -> bool:
+        with self._lock:
+            return self._worker_finished
 
 
 @dataclasses.dataclass
@@ -25,6 +76,13 @@ class TransferKVChunk:
     prefill_aux_index: Optional[int]
     state_indices: Optional[List]
     chunk_id: Optional[int] = None
+    kv_sent: bool = False
+    dspark_hidden_packet_idx: int = 0
+    dspark_hidden_sent: bool = False
+    dspark_hidden_released: bool = False
+    dspark_hidden_release_guard: Optional[DSparkHiddenReleaseGuard] = None
+    enqueue_time: float = 0.0
+    source_event: Optional[Any] = None
     trace_ctx: Union[TraceReqContext, TraceNullContext] = dataclasses.field(
         default_factory=TraceNullContext
     )

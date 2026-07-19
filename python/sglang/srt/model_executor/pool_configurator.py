@@ -31,7 +31,10 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+    get_compress_state_ring_size,
+    should_use_speculative_state_ring,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.utils.common import (
     ceil_align,
@@ -154,13 +157,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     * (1 + int(eagle_draft_num_layers) / int(num_layers))
                 )
 
-        # DFLASH: scale cell_size to account for draft model KV cache
-        if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
+        # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
+        if mr.spec_algorithm.is_dflash_family() and not mr.is_draft_worker:
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )
 
-            draft_num_layers = mr.dflash_draft_num_layers
+            draft_num_layers = mr.dflash_family_draft_num_layers
             if (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
@@ -301,6 +304,8 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         ), "Hybrid SWA model must have at least one SWA layer"
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
+        self._sliding_window_size = mr.sliding_window_size
+        self._chunked_prefill_size = mr.server_args.chunked_prefill_size
 
         # Full layer per-token memory (bytes)
         self._full_per_token = (
@@ -374,6 +379,26 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
         # Hybrid: full_tokens = max_total_num_tokens, swa_tokens = full_tokens * ratio
         full_tokens = align_page_size(max_total_num_tokens)
         swa_tokens = align_page_size(int(full_tokens * self._swa_full_tokens_ratio))
+
+        if self._sliding_window_size is not None:
+            floor = self._sliding_window_size + page_size
+            if floor >= swa_tokens:
+                raise RuntimeError(
+                    f"SWA pool ({swa_tokens} tokens) cannot hold one request's minimum "
+                    f"reservation (sliding_window_size {self._sliding_window_size} + "
+                    f"page_size {page_size} = {floor}); no request could ever be scheduled. "
+                    f"Raise --swa-full-tokens-ratio (currently {self._swa_full_tokens_ratio}) "
+                    f"or pass --disable-hybrid-swa-memory."
+                )
+        if self._chunked_prefill_size is not None and self._chunked_prefill_size > 0:
+            if self._chunked_prefill_size + page_size > swa_tokens:
+                logger.warning(
+                    f"--chunked-prefill-size {self._chunked_prefill_size} + page_size "
+                    f"{page_size} exceeds the SWA pool ({swa_tokens} tokens); prefill "
+                    f"chunks will be clamped to the SWA pool, reducing prefill batch "
+                    f"efficiency. Raise --swa-full-tokens-ratio (currently "
+                    f"{self._swa_full_tokens_ratio}) or lower --chunked-prefill-size."
+                )
 
         logger.info(
             f"Use sliding window memory pool. "
@@ -559,8 +584,22 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self.c4_shrink_factor > 1:
             logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
-        self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
-        self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)
+        self.use_speculative_state_ring = should_use_speculative_state_ring(
+            mr.server_args
+        )
+        self.c4_ring_size = get_compress_state_ring_size(
+            4, self.use_speculative_state_ring
+        )
+        self.c128_ring_size = get_compress_state_ring_size(
+            128, self.use_speculative_state_ring
+        )
+        if self.use_speculative_state_ring and not self.is_speculative:
+            logger.info(
+                "DSV4 PD Prefill uses speculative-compatible compressor state "
+                "rings: c4=%s, c128=%s",
+                self.c4_ring_size,
+                self.c128_ring_size,
+            )
 
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)

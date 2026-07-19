@@ -4,7 +4,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -19,7 +20,7 @@ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 logger = logging.getLogger(__name__)
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
-_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+_DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[str, Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -30,6 +31,15 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TRTLLMMLABackend",
     }
 )
+
+
+@dataclass(frozen=True)
+class DFlashGrammarMask:
+    """Grammar constraints for every row of a linear DFlash verify block."""
+
+    vocab_mask: torch.Tensor
+    apply_vocab_mask: Callable[..., None]
+    verify_lens: torch.Tensor
 
 
 if is_cuda() or is_musa():
@@ -112,12 +122,12 @@ def apply_dflash_verify_logits_adjustments(
     next_token_logits: torch.Tensor,
     sampling_info: Any,
     draft_token_num: int,
+    grammar_mask: Optional[DFlashGrammarMask] = None,
 ) -> None:
     """Apply sampling-time logit adjustments for DFlash verify in place.
 
     This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    broadcast its accumulated additive and scaling penalties over the verify rows.
     """
     if sampling_info is None:
         return
@@ -143,7 +153,8 @@ def apply_dflash_verify_logits_adjustments(
             num_tokens_in_batch=draft_token_num,
         )
 
-    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    acc_additive_penalties = getattr(sampling_info, "acc_additive_penalties", None)
+    acc_scaling_penalties = getattr(sampling_info, "acc_scaling_penalties", None)
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     vocab_mask = getattr(sampling_info, "vocab_mask", None)
     logit_bias = getattr(sampling_info, "logit_bias", None)
@@ -156,44 +167,53 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
     if (
-        penalizer is not None and penalizer.is_required and acc_linear_penalties is None
-    ) or vocab_mask is not None:
-        linear_penalty = torch.zeros(
-            (bs, next_token_logits.shape[1]),
-            dtype=torch.float32,
-            device=next_token_logits.device,
+        grammar_mask is not None
+        and grammar_mask.vocab_mask.shape[0] != bs * draft_token_num
+    ):
+        raise ValueError(
+            "grammar mask row count mismatch for DFlash verify adjustments. "
+            f"Expected {bs * draft_token_num}, got {grammar_mask.vocab_mask.shape[0]}."
         )
-        sampling_info.apply_logits_bias(linear_penalty)
-        get_logits_3d().add_(
-            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
-        )
-        return
 
-    if acc_linear_penalties is not None:
-        if (
-            acc_linear_penalties.device != next_token_logits.device
-            or acc_linear_penalties.dtype != next_token_logits.dtype
-        ):
-            acc_linear_penalties = acc_linear_penalties.to(
+    if acc_additive_penalties is not None or acc_scaling_penalties is not None:
+        if acc_additive_penalties is not None:
+            additive = acc_additive_penalties.to(
                 device=next_token_logits.device,
                 dtype=next_token_logits.dtype,
             )
-        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+            get_logits_3d().add_(additive[:, None, :])
+        if acc_scaling_penalties is not None:
+            scaling = acc_scaling_penalties.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+            apply_scaling_penalties(get_logits_3d(), scaling[:, None, :])
+    elif penalizer is not None and penalizer.is_required:
+        penalizer.apply(next_token_logits, repeat=draft_token_num)
 
     if logit_bias is not None:
-        if (
-            logit_bias.device != next_token_logits.device
-            or logit_bias.dtype != next_token_logits.dtype
-        ):
-            logit_bias = logit_bias.to(
-                device=next_token_logits.device,
-                dtype=next_token_logits.dtype,
+        bias = logit_bias.to(
+            device=next_token_logits.device,
+            dtype=next_token_logits.dtype,
+        )
+        get_logits_3d().add_(bias[:, None, :])
+
+    if grammar_mask is not None:
+        grammar_mask.apply_vocab_mask(
+            logits=next_token_logits,
+            vocab_mask=grammar_mask.vocab_mask,
+        )
+    elif vocab_mask is not None:
+        if sampling_info.apply_mask_func is None:
+            raise RuntimeError(
+                "DFlash verify received a vocab mask without an apply callback."
             )
-        get_logits_3d().add_(logit_bias[:, None, :])
+        expanded_mask = torch.repeat_interleave(vocab_mask, draft_token_num, dim=0)
+        sampling_info.apply_mask_func(
+            logits=next_token_logits,
+            vocab_mask=expanded_mask,
+        )
 
 
 def _get_or_create_chain_verify_buffers(
@@ -204,7 +224,7 @@ def _get_or_create_chain_verify_buffers(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    key = (device.index, int(draft_token_num))
+    key = (device.type, device.index, int(draft_token_num))
     cached = _DFLASH_CHAIN_VERIFY_BUFFERS.get(key)
     cap_bs = 0 if cached is None else int(cached["cap_bs"])
     if cap_bs < bs:
@@ -252,6 +272,167 @@ def _get_or_create_chain_verify_buffers(
         predicts,
         accept_index,
         accept_token_num,
+    )
+
+
+def _fill_all_allowed(mask: torch.Tensor) -> None:
+    if mask.dtype == torch.bool:
+        mask.fill_(False)
+    else:
+        mask.fill_(-1)
+
+
+def _grammar_token_is_allowed(mask_row: torch.Tensor, token_id: int) -> bool:
+    if token_id < 0:
+        return False
+    if mask_row.dtype == torch.bool:
+        return token_id < mask_row.numel() and not bool(mask_row[token_id].item())
+
+    word_id, bit_id = divmod(token_id, 32)
+    if word_id >= mask_row.numel():
+        return False
+    return bool(int(mask_row[word_id].item()) & (1 << bit_id))
+
+
+def _req_token_is_stop(req: Req, token_id: int) -> bool:
+    sampling_params = getattr(req, "sampling_params", None)
+    if sampling_params is not None and sampling_params.ignore_eos:
+        return False
+    if token_id in (getattr(sampling_params, "stop_token_ids", None) or ()):
+        return True
+    if token_id in (getattr(req, "eos_token_ids", None) or ()):
+        return True
+    tokenizer = getattr(req, "tokenizer", None)
+    if tokenizer is None:
+        return False
+    if token_id == getattr(tokenizer, "eos_token_id", None):
+        return True
+    return token_id in (getattr(tokenizer, "additional_stop_token_ids", None) or ())
+
+
+def _snapshot_simple_grammar_state(grammar: Any) -> list[tuple[Any, str, Any]]:
+    """Capture scalar wrapper state that rollback implementations may not restore."""
+    snapshot = []
+    current = grammar
+    seen = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for name in (
+            "state",
+            "current_token",
+            "_finished",
+            "tokens_in_think",
+            "tokens_after_end",
+        ):
+            if hasattr(current, name):
+                snapshot.append((current, name, getattr(current, name)))
+        current = getattr(current, "grammar", None)
+    return snapshot
+
+
+def _restore_grammar_after_speculation(
+    grammar: Any,
+    accepted_tokens: int,
+    snapshot: list[tuple[Any, str, Any]],
+) -> None:
+    rollback_error = None
+    if accepted_tokens:
+        rollback = getattr(grammar, "rollback", None)
+        if rollback is not None:
+            try:
+                rollback(accepted_tokens)
+            except NotImplementedError:
+                pass
+            except Exception as exc:  # pragma: no cover - backend-specific failure
+                rollback_error = exc
+    for obj, name, value in snapshot:
+        setattr(obj, name, value)
+    if rollback_error is not None:
+        raise RuntimeError(
+            "Failed to restore grammar after DFlash traversal."
+        ) from rollback_error
+
+
+def generate_dflash_chain_grammar_mask(
+    *,
+    reqs: Sequence[Req],
+    verify_input: Any,
+    verify_tokens: torch.Tensor,
+    vocab_size: int,
+) -> Optional[DFlashGrammarMask]:
+    """Build backend-neutral grammar constraints for a linear verify chain.
+
+    Row ``j`` masks the target logits that predict candidate ``j + 1`` (or the
+    bonus token for the last row). The request grammar is rolled back before
+    returning, so only actually committed output advances its state.
+    """
+    if verify_tokens.ndim != 2:
+        raise ValueError(
+            f"verify_tokens must be 2D, got shape={tuple(verify_tokens.shape)}."
+        )
+    bs, draft_token_num = verify_tokens.shape
+    if len(reqs) != bs:
+        raise ValueError(
+            "req count mismatch for DFlash grammar mask. "
+            f"Expected {bs}, got {len(reqs)}."
+        )
+
+    first_grammar = next((req.grammar for req in reqs if req.grammar is not None), None)
+    if first_grammar is None:
+        verify_input.grammar = None
+        return None
+
+    vocab_mask = first_grammar.allocate_vocab_mask(
+        vocab_size=vocab_size,
+        batch_size=bs * draft_token_num,
+        device="cpu",
+    )
+    if vocab_mask is None:
+        verify_input.grammar = first_grammar
+        return None
+    _fill_all_allowed(vocab_mask)
+
+    verify_tokens_cpu = verify_tokens.detach().to(device="cpu")
+    verify_lens = torch.full((bs,), draft_token_num, dtype=torch.int32)
+    for req_idx, req in enumerate(reqs):
+        grammar = req.grammar
+        if grammar is None:
+            continue
+        row_start = req_idx * draft_token_num
+        snapshot = _snapshot_simple_grammar_state(grammar)
+        accepted_tokens = 0
+        try:
+            if getattr(grammar, "finished", False) or grammar.is_terminated():
+                verify_lens[req_idx] = 1
+                continue
+
+            for row_offset in range(draft_token_num):
+                row = row_start + row_offset
+                grammar.fill_vocab_mask(vocab_mask, row)
+                if row_offset == draft_token_num - 1:
+                    break
+
+                candidate = int(verify_tokens_cpu[req_idx, row_offset + 1].item())
+                if not _grammar_token_is_allowed(vocab_mask[row], candidate):
+                    break
+                grammar.accept_token(candidate)
+                accepted_tokens += 1
+                if grammar.is_terminated() or _req_token_is_stop(req, candidate):
+                    # Cap correct drafts to row_offset, then use this row's
+                    # constrained prediction as the terminal bonus token.
+                    verify_lens[req_idx] = row_offset + 1
+                    break
+        finally:
+            _restore_grammar_after_speculation(grammar, accepted_tokens, snapshot)
+
+    verify_input.grammar = first_grammar
+    moved_mask = first_grammar.move_vocab_mask(vocab_mask, verify_tokens.device)
+    if moved_mask.device != verify_tokens.device:
+        moved_mask = moved_mask.to(verify_tokens.device, non_blocking=True)
+    return DFlashGrammarMask(
+        vocab_mask=moved_mask,
+        apply_vocab_mask=first_grammar.apply_vocab_mask,
+        verify_lens=verify_lens.to(verify_tokens.device, non_blocking=True),
     )
 
 
@@ -673,9 +854,70 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
             dtype=torch.float32,
         )
 
+    target_probs = build_dflash_verify_target_probs(
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+        draft_token_num=draft_token_num,
+        bs=bs,
+        max_top_k=max_top_k,
+        uniform_top_k_value=uniform_top_k_value,
+        use_sparse_topk=use_sparse_topk,
+    )
+    draft_probs = torch.zeros_like(target_probs)
+
+    (
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        predicts,
+        accept_index,
+        accept_token_num,
+    ) = _get_or_create_chain_verify_buffers(
+        bs=bs,
+        draft_token_num=draft_token_num,
+        device=device,
+    )
+    candidates_i64 = (
+        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+    )
+    tree_speculative_sampling_target_only(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates_i64,
+        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+        retrive_index=retrieve_index,
+        retrive_next_token=retrieve_next_token,
+        retrive_next_sibling=retrieve_next_sibling,
+        uniform_samples=uniform_samples,
+        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+        target_probs=target_probs,
+        draft_probs=draft_probs,
+        threshold_single=threshold_single,
+        threshold_acc=threshold_acc,
+        deterministic=True,
+    )
+
+    correct_len = accept_token_num
+    row_ids = torch.arange(bs, dtype=torch.long, device=device)
+    accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
+    bonus = predicts[accept_pos].to(torch.int64)
+    return correct_len, bonus
+
+
+def build_dflash_verify_target_probs(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+    bs: int,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+    use_sparse_topk: bool = True,
+) -> torch.Tensor:
+    device = next_token_logits.device
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    # Build target distribution once over all verify rows.
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
@@ -730,57 +972,19 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
-    target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
-    draft_probs = torch.zeros_like(target_probs)
-
-    (
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        predicts,
-        accept_index,
-        accept_token_num,
-    ) = _get_or_create_chain_verify_buffers(
-        bs=bs,
-        draft_token_num=draft_token_num,
-        device=device,
-    )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
-
-    correct_len = accept_token_num
-    row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
-    bonus = predicts[accept_pos].to(torch.int64)
-    return correct_len, bonus
+    return target_probs.view(bs, draft_token_num, -1).contiguous()
 
 
-def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+def validate_dflash_request(
+    req: Req, enable_overlap: bool, *, allow_grammar: bool = False
+) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."
 
-    if (
+    if not allow_grammar and (
         req.sampling_params.json_schema is not None
         or req.sampling_params.regex is not None
         or req.sampling_params.ebnf is not None
