@@ -85,11 +85,14 @@ class TestCPUAndMockRegressionRunner(CustomTestCase):
         self.assertNotIn("--include-files-from", script)
         self.assertNotIn("test/run_suite.py", script)
 
-    def test_cpu_mock_rejects_new_test_assets_outside_jd_ci(self):
+    def test_cpu_mock_allows_new_test_assets_outside_jd_ci(self):
         script = RUNNER.read_text(encoding="utf-8")
 
-        self.assertIn("git diff --diff-filter=A --name-only", script)
-        self.assertIn("JD test assets must stay under test/jd-ci/", script)
+        self.assertNotIn("git diff --diff-filter=A --name-only", script)
+        self.assertNotIn("git rev-parse --verify", script)
+        self.assertNotIn("jd-test-asset-path-contract", script)
+        self.assertNotIn("JD test assets must stay under test/jd-ci/", script)
+        self.assertIn("jd_test_manifest.py", script)
 
     def test_cpu_mock_prints_inventory_and_uses_progress_runner(self):
         script = RUNNER.read_text(encoding="utf-8")

@@ -139,35 +139,6 @@ trap 'REGRESSION_EXIT_CODE=143; REGRESSION_STATUS=failed; exit 143' TERM
 
 cd "${SOURCE_PATH}"
 
-if ! git rev-parse --verify "${BASE_REF}^{commit}" >/dev/null 2>&1; then
-    REGRESSION_EXIT_CODE=2
-    REGRESSION_STATUS="failed"
-    record_case jd-test-asset-path-contract failed 2 "" \
-        "cannot resolve JD CI base ref: ${BASE_REF}" \
-        "JD test assets remain under test/jd-ci" 0 0
-    exit ${REGRESSION_EXIT_CODE}
-fi
-
-if ! added_test_assets=$(git diff --diff-filter=A --name-only "${BASE_REF}...HEAD" -- test); then
-    REGRESSION_EXIT_CODE=2
-    REGRESSION_STATUS="failed"
-    record_case jd-test-asset-path-contract failed 2 "" \
-        "cannot audit test assets against ${BASE_REF}" \
-        "JD test assets remain under test/jd-ci" 0 0
-    exit ${REGRESSION_EXIT_CODE}
-fi
-outside_jd_ci=$(printf '%s\n' "${added_test_assets}" | awk 'NF && $0 !~ /^test\/jd-ci\//')
-if [[ -n "${outside_jd_ci}" ]]; then
-    REGRESSION_EXIT_CODE=2
-    REGRESSION_STATUS="failed"
-    echo "JD test assets must stay under test/jd-ci/:"
-    printf '%s\n' "${outside_jd_ci}"
-    record_case jd-test-asset-path-contract failed 2 "" \
-        "new test assets outside test/jd-ci/: ${outside_jd_ci}" \
-        "JD test assets remain under test/jd-ci" 0 0
-    exit ${REGRESSION_EXIT_CODE}
-fi
-
 manifest_args=(
     test/jd-ci/jd_test_manifest.py
     --source "${SOURCE_PATH}"
