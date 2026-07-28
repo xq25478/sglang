@@ -5,6 +5,7 @@ import torch
 
 import sglang.srt.model_executor.runner.base_runner as base_runner_module
 import sglang.srt.model_executor.runner.flashinfer_autotune as flashinfer_autotune
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
     FlashInferCutlassMoeQuantInfo,
@@ -100,7 +101,7 @@ def test_route_profile_metadata_uses_parallel_state(monkeypatch):
     runner = SimpleNamespace(
         device="cuda",
         dtype=torch.bfloat16,
-        ps=SimpleNamespace(
+        ps=ParallelState.trivial(
             tp_size=8,
             pp_size=2,
             attn_dp_size=3,
@@ -132,51 +133,10 @@ def test_route_profile_metadata_uses_parallel_state(monkeypatch):
     assert metadata["moe_ep_size"] == 4
 
 
-def test_route_profile_metadata_uses_legacy_model_runner_fields(monkeypatch):
-    import flashinfer
-
-    runner = SimpleNamespace(
-        device="cuda",
-        dtype=torch.bfloat16,
-        tp_size=8,
-        pp_size=2,
-        dp_size=3,
-        moe_ep_size=4,
-        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-        server_args=SimpleNamespace(model_path="/model"),
-    )
-    monkeypatch.setattr(flashinfer, "__version__", "test-version")
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (9, 0))
-    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device: "NVIDIA H20")
-
-    metadata = flashinfer_autotune._flashinfer_w4a8_profile_metadata(
-        runner,
-        _calibration_sample(),
-    )
-
-    assert metadata["tp_size"] == 8
-    assert metadata["pp_size"] == 2
-    assert metadata["dp_size"] == 3
-    assert metadata["moe_ep_size"] == 4
-
-
 def test_route_cache_path_uses_parallel_state_ranks(monkeypatch, tmp_path: Path):
     runner = SimpleNamespace(
-        ps=SimpleNamespace(pp_rank=2, dp_rank=1),
+        ps=ParallelState.trivial(pp_rank=2, dp_rank=1),
     )
-    monkeypatch.setattr(
-        flashinfer_autotune,
-        "flashinfer_autotune_cache_path",
-        lambda _runner: tmp_path / "rank_tp3_pp2_dp1.json",
-    )
-
-    assert flashinfer_autotune.flashinfer_w4a8_route_cache_path(runner) == (
-        tmp_path / "w4a8_route_pp2_dp1.json"
-    )
-
-
-def test_route_cache_path_uses_legacy_model_runner_ranks(monkeypatch, tmp_path: Path):
-    runner = SimpleNamespace(pp_rank=2, dp_rank=1)
     monkeypatch.setattr(
         flashinfer_autotune,
         "flashinfer_autotune_cache_path",
@@ -191,7 +151,6 @@ def test_route_cache_path_uses_legacy_model_runner_ranks(monkeypatch, tmp_path: 
 class _CalibrationRunner:
     def __init__(self, tmp_path: Path):
         self.calls = []
-        self.allocations = []
         self.sample = _calibration_sample()
         self.model_runner = SimpleNamespace(
             device="cuda",
@@ -220,7 +179,6 @@ class _CalibrationRunner:
                 world_size=1,
                 broadcast_object=lambda value, src=0: value,
             ),
-            decode_num_tokens_per_bs=lambda: 5,
         )
         self.cache_path = tmp_path / "route-aware.json"
 
@@ -231,9 +189,6 @@ class _CalibrationRunner:
         num_tokens_per_bs: int = 1,
         allocate_logits_buffer: bool = True,
     ):
-        self.allocations.append(
-            (max_bs, num_tokens_per_bs, allocate_logits_buffer)
-        )
         return SimpleNamespace(
             max_bs=max_bs,
             max_num_tokens=max_bs * num_tokens_per_bs,
@@ -248,20 +203,7 @@ class _CalibrationRunner:
         forward_mode_override=None,
     ):
         self.calls.append((batch_size, num_tokens_override, forward_mode_override))
-        natural_num_tokens = batch_size
-        if forward_mode_override == ForwardMode.DECODE:
-            natural_num_tokens *= self.model_runner.decode_num_tokens_per_bs()
-        if (
-            num_tokens_override is not None
-            and forward_mode_override != ForwardMode.EXTEND
-            and num_tokens_override != natural_num_tokens
-        ):
-            raise ValueError(
-                "num_tokens_override may change the natural token count "
-                "only for EXTEND forwards"
-            )
-        num_tokens = num_tokens_override or natural_num_tokens
-        assert num_tokens <= buffers.max_num_tokens
+        num_tokens = num_tokens_override or batch_size
         topk_ids = (
             torch.arange(num_tokens * 2, dtype=torch.int32).reshape(num_tokens, 2) % 4
         )
@@ -305,12 +247,8 @@ def test_route_calibration_records_decode_and_prefill_shapes(
     set_active_profile(None)
     assert flashinfer_autotune.maybe_calibrate_flashinfer_w4a8(runner)
     assert runner.calls == [
-        (64, None, ForwardMode.DECODE),
+        (64, 64, ForwardMode.DECODE),
         (1, 8192, ForwardMode.EXTEND),
-    ]
-    assert runner.allocations == [
-        (64, 5, False),
-        (1, 8192, False),
     ]
 
 
