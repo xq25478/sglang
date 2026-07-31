@@ -196,6 +196,28 @@ def _allocate_decode_buffers(
     )
 
 
+def _resolve_dummy_forward_shape(
+    model_runner: ModelRunner, forward_mode_override: Optional[ForwardMode]
+) -> Tuple[ForwardMode, int]:
+    if forward_mode_override is not None:
+        forward_mode = forward_mode_override
+    elif model_runner.is_generation:
+        forward_mode = ForwardMode.DECODE
+    else:
+        forward_mode = ForwardMode.EXTEND
+
+    if model_runner.spec_algorithm.is_speculative():
+        if forward_mode_override is None:
+            forward_mode = ForwardMode.TARGET_VERIFY
+        if forward_mode == ForwardMode.TARGET_VERIFY:
+            if model_runner.is_draft_worker:
+                if not model_runner.spec_algorithm.supports_target_verify_for_draft():
+                    raise RuntimeError("This should not happen")
+            return forward_mode, model_runner.decode_num_tokens_per_bs()
+
+    return forward_mode, 1
+
+
 class BaseRunner(ABC):
     def __init__(self, model_runner: ModelRunner) -> None:
         self.model_runner = model_runner
@@ -389,24 +411,10 @@ class BaseRunner(ABC):
         None (only the PP warmup set still carries one).
         """
         mr = self.model_runner
-        if forward_mode_override is not None:
-            capture_forward_mode = forward_mode_override
-        elif mr.is_generation:
-            capture_forward_mode = ForwardMode.DECODE
-        else:
-            capture_forward_mode = ForwardMode.EXTEND
+        capture_forward_mode, num_tokens_per_bs = _resolve_dummy_forward_shape(
+            mr, forward_mode_override
+        )
         capture_hidden_mode = CaptureHiddenMode.NULL
-        num_tokens_per_bs = 1
-        if mr.spec_algorithm.is_speculative():
-            if mr.is_draft_worker:
-                if not mr.spec_algorithm.supports_target_verify_for_draft():
-                    raise RuntimeError("This should not happen")
-            capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = (
-                mr.spec_algorithm.get_num_tokens_per_bs_for_target_verify(
-                    mr.server_args.speculative_num_draft_tokens, mr.is_draft_worker
-                )
-            )
 
         if mr.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL

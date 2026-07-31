@@ -116,6 +116,15 @@ def _find_w4a8_tuning_sample(model_runner):
     raise RuntimeError("No loaded W4A8 FlashInfer-CUTLASS MoE layer was found")
 
 
+def _parallel_attr(model_runner, legacy_name: str, ps_name: str | None = None):
+    """Read parallel metadata across the 0.5.15 and newer runner layouts."""
+    parallel_state = getattr(model_runner, "ps", None)
+    parallel_state_name = ps_name or legacy_name
+    if parallel_state is not None and hasattr(parallel_state, parallel_state_name):
+        return getattr(parallel_state, parallel_state_name)
+    return getattr(model_runner, legacy_name)
+
+
 def _flashinfer_w4a8_profile_metadata(model_runner, sample) -> dict[str, Any]:
     import flashinfer
 
@@ -130,10 +139,10 @@ def _flashinfer_w4a8_profile_metadata(model_runner, sample) -> dict[str, Any]:
         "model_path": str(model_runner.server_args.model_path),
         "model_config_class": (model_runner.model_config.hf_config.__class__.__name__),
         "dtype": str(model_runner.dtype),
-        "tp_size": int(model_runner.ps.tp_size),
-        "pp_size": int(model_runner.ps.pp_size),
-        "dp_size": int(model_runner.ps.attn_dp_size),
-        "moe_ep_size": int(model_runner.ps.moe_ep_size),
+        "tp_size": int(_parallel_attr(model_runner, "tp_size")),
+        "pp_size": int(_parallel_attr(model_runner, "pp_size")),
+        "dp_size": int(_parallel_attr(model_runner, "dp_size", "attn_dp_size")),
+        "moe_ep_size": int(_parallel_attr(model_runner, "moe_ep_size")),
         "w13_shape": list(quant_info.w13_weight.shape),
         "w2_shape": list(quant_info.w2_weight.shape),
         "scale_shapes": [list(scale.shape) for scale in scales],
@@ -149,8 +158,8 @@ def _flashinfer_w4a8_profile_metadata(model_runner, sample) -> dict[str, Any]:
 
 def flashinfer_w4a8_route_cache_path(model_runner) -> Path:
     base_path = flashinfer_autotune_cache_path(model_runner)
-    pp_rank = int(model_runner.ps.pp_rank)
-    dp_rank = int(model_runner.ps.dp_rank or 0)
+    pp_rank = int(_parallel_attr(model_runner, "pp_rank"))
+    dp_rank = int(_parallel_attr(model_runner, "dp_rank") or 0)
     return base_path.parent / f"w4a8_route_pp{pp_rank}_dp{dp_rank}.json"
 
 
@@ -401,16 +410,16 @@ def maybe_calibrate_flashinfer_w4a8(runner) -> bool:
         recorder = RouteRecorder(num_experts=int(sample[1].num_experts))
         from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
 
+        decode_num_tokens_per_bs = int(mr.decode_num_tokens_per_bs())
         decode_buffers = runner._alloc_dummy_decode_buffers(
             max_bs=_W4A8_ROUTE_DECODE_TOKENS,
+            num_tokens_per_bs=decode_num_tokens_per_bs,
             allocate_logits_buffer=False,
         )
         with route_recording(recorder, "decode"), autotune_dummy_run_mode():
             runner._dummy_run(
                 batch_size=_W4A8_ROUTE_DECODE_TOKENS,
                 buffers=decode_buffers,
-                num_tokens_override=_W4A8_ROUTE_DECODE_TOKENS,
-                forward_mode_override=ForwardMode.DECODE,
             )
         del decode_buffers
 
