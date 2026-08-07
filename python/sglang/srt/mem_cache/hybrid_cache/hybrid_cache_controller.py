@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
@@ -23,6 +24,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.mem_cache.cp_cache_layer_split import is_cp_cache_layer_split_pool
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
@@ -192,6 +194,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
         )
+        self._init_layer_split_l2_write_stats()
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
         if transfer_layer_num is not None and transfer_layer_num != self.layer_num:
@@ -206,6 +209,320 @@ class HybridCacheController(BaseHiCacheController):
                 storage_backend_extra_config=storage_backend_extra_config,
                 host_pools=getattr(mem_pool_host, "entries", None),
             )
+
+    @staticmethod
+    def _new_layer_split_l2_write_stats() -> dict[str, int | float]:
+        return {
+            "attempted_write_pages": 0,
+            "successful_write_pages": 0,
+            "host_pool_allocation_failures": 0,
+            "side_pool_allocation_failures": 0,
+            "eviction_shortfall_pages": 0,
+            "abandoned_write_pages": 0,
+            "d2h_submitted_batches": 0,
+            "d2h_completed_batches": 0,
+            "d2h_anchor_pages": 0,
+            "d2h_pool_page_copies": 0,
+            "d2h_gpu_ms": 0.0,
+            "d2h_max_gpu_ms": 0.0,
+            "d2h_enqueue_cpu_ms": 0.0,
+        }
+
+    @staticmethod
+    def _new_layer_split_l2_pool_allocation_stats() -> dict[str, int | float]:
+        return {
+            "initial_allocation_misses": 0,
+            "requested_slots": 0,
+            "eviction_calls": 0,
+            "evicted_slots": 0,
+            "retry_successes": 0,
+            "retry_failures": 0,
+            "evict_retry_cpu_ms": 0.0,
+            "evict_retry_max_cpu_ms": 0.0,
+        }
+
+    def _init_layer_split_l2_write_stats(self) -> None:
+        self._layer_split_l2_write_stats_enabled = (
+            self.write_policy in ("write_through", "write_through_selective")
+            and is_cp_cache_layer_split_pool(self.mem_pool_device)
+            and envs.SGLANG_LOG_HICACHE_LAYER_SPLIT_WRITE_STATS.get()
+        )
+        self._layer_split_l2_write_stats_phase = "cold_fill"
+        self._layer_split_l2_write_stats = {
+            "cold_fill": self._new_layer_split_l2_write_stats(),
+            "saturated": self._new_layer_split_l2_write_stats(),
+        }
+        self._layer_split_l2_pool_allocation_stats: dict[
+            str, dict[str, dict[str, int | float]]
+        ] = {"cold_fill": {}, "saturated": {}}
+        self._layer_split_l2_d2h_pool_page_copies: dict[str, dict[str, int]] = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+        self._layer_split_l2_pending_d2h_timings: list[dict[str, Any]] = []
+        self._layer_split_l2_write_stats_interval_seconds = 10.0
+        self._layer_split_l2_write_stats_last_log_time = time.monotonic()
+        self._layer_split_l2_last_write_failure_reason: Optional[str] = None
+        if not self._layer_split_l2_write_stats_enabled:
+            return
+
+        self._layer_split_l2_write_stats_interval_seconds = (
+            envs.SGLANG_HICACHE_LAYER_SPLIT_WRITE_STATS_INTERVAL_SECONDS.get()
+        )
+        if self._layer_split_l2_write_stats_interval_seconds <= 0:
+            raise ValueError(
+                "SGLANG_HICACHE_LAYER_SPLIT_WRITE_STATS_INTERVAL_SECONDS "
+                "must be positive"
+            )
+        logger.info(
+            "HiCache LayerSplit L2 write statistics enabled: page_size=%s, "
+            "interval_seconds=%s, allocation_retry_timing=True, "
+            "d2h_device_timing=True",
+            self.page_size,
+            self._layer_split_l2_write_stats_interval_seconds,
+        )
+
+    def _record_layer_split_l2_pool_allocation_pressure(
+        self,
+        *,
+        phase: str,
+        pool_name: PoolName,
+        requested_slots: int,
+        evicted_slots: int,
+        retry_success: bool,
+        elapsed_ms: float,
+    ) -> None:
+        if not getattr(self, "_layer_split_l2_write_stats_enabled", False):
+            return
+        phase_stats = self._layer_split_l2_pool_allocation_stats[phase]
+        stats = phase_stats.setdefault(
+            str(pool_name), self._new_layer_split_l2_pool_allocation_stats()
+        )
+        stats["initial_allocation_misses"] += 1
+        stats["requested_slots"] += requested_slots
+        stats["eviction_calls"] += 1
+        stats["evicted_slots"] += evicted_slots
+        stats["retry_successes" if retry_success else "retry_failures"] += 1
+        stats["evict_retry_cpu_ms"] += elapsed_ms
+        stats["evict_retry_max_cpu_ms"] = max(
+            stats["evict_retry_max_cpu_ms"], elapsed_ms
+        )
+
+    @staticmethod
+    def _normalize_evicted_slots(evicted: Any) -> int:
+        if evicted is None:
+            return 0
+        if isinstance(evicted, torch.Tensor):
+            return int(evicted.numel())
+        try:
+            return int(evicted)
+        except (TypeError, ValueError):
+            return 0
+
+    def _record_layer_split_l2_d2h_submit(
+        self,
+        *,
+        phase: str,
+        start_event: Any,
+        finish_event: Any,
+        anchor_pages: int,
+        pool_pages: dict[str, int],
+        enqueue_cpu_ms: float,
+    ) -> None:
+        if not getattr(self, "_layer_split_l2_write_stats_enabled", False):
+            return
+        stats = self._layer_split_l2_write_stats[phase]
+        stats["d2h_submitted_batches"] += 1
+        stats["d2h_anchor_pages"] += anchor_pages
+        stats["d2h_pool_page_copies"] += sum(pool_pages.values())
+        stats["d2h_enqueue_cpu_ms"] += enqueue_cpu_ms
+        phase_pool_pages = self._layer_split_l2_d2h_pool_page_copies[phase]
+        for pool_name, pages in pool_pages.items():
+            phase_pool_pages[pool_name] = phase_pool_pages.get(pool_name, 0) + pages
+        self._layer_split_l2_pending_d2h_timings.append(
+            {
+                "phase": phase,
+                "start_event": start_event,
+                "finish_event": finish_event,
+            }
+        )
+
+    def _poll_layer_split_l2_d2h_timings(self) -> None:
+        if not getattr(self, "_layer_split_l2_write_stats_enabled", False):
+            return
+        pending = []
+        for timing in self._layer_split_l2_pending_d2h_timings:
+            finish_event = timing["finish_event"]
+            query = getattr(finish_event, "query", None)
+            if query is None or not query():
+                pending.append(timing)
+                continue
+            try:
+                elapsed_ms = float(
+                    timing["start_event"].elapsed_time(finish_event)
+                )
+            except (RuntimeError, TypeError, ValueError):
+                logger.debug(
+                    "Failed to read HiCache LayerSplit D2H device timing",
+                    exc_info=True,
+                )
+                continue
+            stats = self._layer_split_l2_write_stats[timing["phase"]]
+            stats["d2h_completed_batches"] += 1
+            stats["d2h_gpu_ms"] += elapsed_ms
+            stats["d2h_max_gpu_ms"] = max(stats["d2h_max_gpu_ms"], elapsed_ms)
+        self._layer_split_l2_pending_d2h_timings = pending
+
+    def begin_layer_split_l2_write(
+        self, num_tokens: int
+    ) -> Optional[tuple[str, int]]:
+        if not getattr(self, "_layer_split_l2_write_stats_enabled", False):
+            return None
+        pages = (num_tokens + self.page_size - 1) // self.page_size
+        phase = self._layer_split_l2_write_stats_phase
+        self._layer_split_l2_write_stats[phase]["attempted_write_pages"] += pages
+        return phase, pages
+
+    def finish_layer_split_l2_write(
+        self,
+        ticket: Optional[tuple[str, int]],
+        *,
+        success: bool,
+        failure_reason: Optional[str] = None,
+    ) -> None:
+        if ticket is None:
+            return
+        phase, pages = ticket
+        stats = self._layer_split_l2_write_stats[phase]
+        if success:
+            stats["successful_write_pages"] += pages
+        else:
+            stats["abandoned_write_pages"] += pages
+            if failure_reason == "host_allocation":
+                stats["host_pool_allocation_failures"] += 1
+            elif failure_reason == "side_pool_allocation":
+                stats["side_pool_allocation_failures"] += 1
+        self._maybe_log_layer_split_l2_write_stats()
+
+    def mark_layer_split_l2_capacity_pressure(self, reason: str) -> None:
+        if not getattr(self, "_layer_split_l2_write_stats_enabled", False):
+            return
+        if self._layer_split_l2_write_stats_phase == "saturated":
+            return
+        self._layer_split_l2_write_stats_phase = "saturated"
+        logger.info(
+            "HiCache LayerSplit L2 capacity pressure observed: reason=%s; "
+            "subsequent write attempts are recorded in phase=saturated",
+            reason,
+        )
+
+    def record_layer_split_l2_eviction_shortfall(
+        self,
+        ticket: Optional[tuple[str, int]],
+        *,
+        required_tokens: int,
+        evicted_tokens: int,
+    ) -> None:
+        if ticket is None:
+            return
+        shortfall_tokens = max(0, required_tokens - evicted_tokens)
+        shortfall_pages = (shortfall_tokens + self.page_size - 1) // self.page_size
+        phase, _ = ticket
+        self._layer_split_l2_write_stats[phase][
+            "eviction_shortfall_pages"
+        ] += shortfall_pages
+
+    def consume_layer_split_l2_write_failure_reason(self) -> Optional[str]:
+        reason = self._layer_split_l2_last_write_failure_reason
+        self._layer_split_l2_last_write_failure_reason = None
+        return reason
+
+    def _maybe_log_layer_split_l2_write_stats(self, *, force: bool = False) -> None:
+        if not getattr(self, "_layer_split_l2_write_stats_enabled", False):
+            return
+        self._poll_layer_split_l2_d2h_timings()
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._layer_split_l2_write_stats_last_log_time
+            < self._layer_split_l2_write_stats_interval_seconds
+        ):
+            return
+        self._layer_split_l2_write_stats_last_log_time = now
+        for phase, stats in self._layer_split_l2_write_stats.items():
+            attempted = stats["attempted_write_pages"]
+            if attempted == 0:
+                continue
+            success_rate = 100.0 * stats["successful_write_pages"] / attempted
+            completed_d2h = stats["d2h_completed_batches"]
+            avg_d2h_gpu_ms = (
+                stats["d2h_gpu_ms"] / completed_d2h if completed_d2h else 0.0
+            )
+            d2h_pool_pages = ";".join(
+                f"{pool_name}:{pages}"
+                for pool_name, pages in sorted(
+                    self._layer_split_l2_d2h_pool_page_copies[phase].items()
+                )
+            )
+            logger.info(
+                "HiCache LayerSplit L2 write stats: phase=%s, "
+                "attempted_write_pages=%s, successful_write_pages=%s, "
+                "success_rate=%.2f%%, host_pool_allocation_failures=%s, "
+                "side_pool_allocation_failures=%s, "
+                "eviction_shortfall_pages=%s, abandoned_write_pages=%s, "
+                "d2h_submitted_batches=%s, d2h_completed_batches=%s, "
+                "d2h_anchor_pages=%s, d2h_pool_page_copies=%s, "
+                "d2h_gpu_ms=%.3f, d2h_avg_gpu_ms=%.3f, "
+                "d2h_max_gpu_ms=%.3f, d2h_enqueue_cpu_ms=%.3f, "
+                "d2h_pending_batches=%s, d2h_pool_pages=%s",
+                phase,
+                attempted,
+                stats["successful_write_pages"],
+                success_rate,
+                stats["host_pool_allocation_failures"],
+                stats["side_pool_allocation_failures"],
+                stats["eviction_shortfall_pages"],
+                stats["abandoned_write_pages"],
+                stats["d2h_submitted_batches"],
+                completed_d2h,
+                stats["d2h_anchor_pages"],
+                stats["d2h_pool_page_copies"],
+                stats["d2h_gpu_ms"],
+                avg_d2h_gpu_ms,
+                stats["d2h_max_gpu_ms"],
+                stats["d2h_enqueue_cpu_ms"],
+                sum(
+                    timing["phase"] == phase
+                    for timing in self._layer_split_l2_pending_d2h_timings
+                ),
+                d2h_pool_pages,
+            )
+            for pool_name, pool_stats in self._layer_split_l2_pool_allocation_stats[
+                phase
+            ].items():
+                events = pool_stats["initial_allocation_misses"]
+                avg_retry_ms = (
+                    pool_stats["evict_retry_cpu_ms"] / events if events else 0.0
+                )
+                logger.info(
+                    "HiCache LayerSplit L2 allocation stats: phase=%s, pool=%s, "
+                    "initial_allocation_misses=%s, requested_slots=%s, "
+                    "eviction_calls=%s, evicted_slots=%s, retry_successes=%s, "
+                    "retry_failures=%s, evict_retry_cpu_ms=%.3f, "
+                    "evict_retry_avg_cpu_ms=%.3f, "
+                    "evict_retry_max_cpu_ms=%.3f",
+                    phase,
+                    pool_name,
+                    events,
+                    pool_stats["requested_slots"],
+                    pool_stats["eviction_calls"],
+                    pool_stats["evicted_slots"],
+                    pool_stats["retry_successes"],
+                    pool_stats["retry_failures"],
+                    pool_stats["evict_retry_cpu_ms"],
+                    avg_retry_ms,
+                    pool_stats["evict_retry_max_cpu_ms"],
+                )
 
     def _start_storage_threads(self):
         super()._start_storage_threads()
@@ -352,6 +669,23 @@ class HybridCacheController(BaseHiCacheController):
 
     def reset(self):
         super().reset()
+        if hasattr(self, "_layer_split_l2_write_stats"):
+            self._layer_split_l2_write_stats_phase = "cold_fill"
+            self._layer_split_l2_write_stats = {
+                "cold_fill": self._new_layer_split_l2_write_stats(),
+                "saturated": self._new_layer_split_l2_write_stats(),
+            }
+            self._layer_split_l2_pool_allocation_stats = {
+                "cold_fill": {},
+                "saturated": {},
+            }
+            self._layer_split_l2_d2h_pool_page_copies = {
+                "cold_fill": {},
+                "saturated": {},
+            }
+            self._layer_split_l2_pending_d2h_timings = []
+            self._layer_split_l2_write_stats_last_log_time = time.monotonic()
+            self._layer_split_l2_last_write_failure_reason = None
         if self.enable_storage:
             self.host_mem_release_queue.queue.clear()
             for release_queue in self.extra_host_mem_release_queues.values():
@@ -365,8 +699,13 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
+        self._layer_split_l2_last_write_failure_reason = None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
+            self.mark_layer_split_l2_capacity_pressure(
+                reason="anchor_host_pool_allocation"
+            )
+            self._layer_split_l2_last_write_failure_reason = "host_allocation"
             return None
         pool_transfers = self._resolve_pool_transfers_allocation(
             extra_pools,
@@ -376,6 +715,10 @@ class HybridCacheController(BaseHiCacheController):
         )
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
+            if self._layer_split_l2_last_write_failure_reason is None:
+                self._layer_split_l2_last_write_failure_reason = (
+                    "side_pool_allocation"
+                )
             return None
 
         self.write_queue.append(
@@ -393,6 +736,7 @@ class HybridCacheController(BaseHiCacheController):
     def start_writing(self) -> None:
         if not self.write_queue:
             return
+        self._poll_layer_split_l2_d2h_timings()
         op = CacheOperation.merge_ops(self.write_queue)
         # Page-first write-back JIT kernels can keep destination host indices on CPU.
         if (
@@ -410,9 +754,33 @@ class HybridCacheController(BaseHiCacheController):
         self.write_queue.clear()
         start_event = device_module.Event()
         finish_event = device_module.Event()
+        timing_enabled = getattr(
+            self, "_layer_split_l2_write_stats_enabled", False
+        )
+        timing_start_event = (
+            device_module.Event(enable_timing=True) if timing_enabled else None
+        )
+        timing_finish_event = (
+            device_module.Event(enable_timing=True) if timing_enabled else None
+        )
+        timing_phase = self._layer_split_l2_write_stats_phase
+        anchor_pages = int(op.device_indices.numel())
+        # The DSV4 LayerSplit KV anchor is logical-only; count actual side-pool
+        # copies separately from its page-address bookkeeping.
+        pool_pages: dict[str, int] = {}
+        for transfer in resolved_pool_transfers or []:
+            if transfer.device_indices is None:
+                continue
+            pool_name = str(transfer.name)
+            pool_pages[pool_name] = pool_pages.get(pool_name, 0) + int(
+                transfer.device_indices.numel()
+            )
         start_event.record()
+        enqueue_start = time.perf_counter()
         with device_module.stream(self.write_stream):
             start_event.wait(self.write_stream)
+            if timing_start_event is not None:
+                timing_start_event.record()
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device,
                 host_indices,
@@ -427,12 +795,24 @@ class HybridCacheController(BaseHiCacheController):
                     device_indices,
                     self.io_backend,
                 )
+            if timing_finish_event is not None:
+                timing_finish_event.record()
             finish_event.record()
             self._record_transfer_indices_on_stream(
                 self.write_stream,
                 host_indices,
                 device_indices,
                 resolved_pool_transfers,
+            )
+        enqueue_cpu_ms = (time.perf_counter() - enqueue_start) * 1000.0
+        if timing_start_event is not None and timing_finish_event is not None:
+            self._record_layer_split_l2_d2h_submit(
+                phase=timing_phase,
+                start_event=timing_start_event,
+                finish_event=timing_finish_event,
+                anchor_pages=anchor_pages,
+                pool_pages=pool_pages,
+                enqueue_cpu_ms=enqueue_cpu_ms,
             )
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
@@ -760,9 +1140,32 @@ class HybridCacheController(BaseHiCacheController):
                 size = len(pool.host_indices)
             indices = alloc_fn(size)
             if indices is None and evict_fn:
-                evict_fn(size)
+                pressure_phase = self._layer_split_l2_write_stats_phase
+                if alloc_host:
+                    self.mark_layer_split_l2_capacity_pressure(
+                        reason=f"side_pool_allocation:{pool.name}"
+                    )
+                retry_start = time.perf_counter()
+                evicted = evict_fn(size)
                 indices = alloc_fn(size)
+                retry_elapsed_ms = (time.perf_counter() - retry_start) * 1000.0
+                if alloc_host:
+                    self._record_layer_split_l2_pool_allocation_pressure(
+                        phase=pressure_phase,
+                        pool_name=pool.name,
+                        requested_slots=size,
+                        evicted_slots=self._normalize_evicted_slots(evicted),
+                        retry_success=indices is not None,
+                        elapsed_ms=retry_elapsed_ms,
+                    )
             if indices is None:
+                if alloc_host:
+                    self.mark_layer_split_l2_capacity_pressure(
+                        reason=f"side_pool_allocation:{pool.name}"
+                    )
+                    self._layer_split_l2_last_write_failure_reason = (
+                        "side_pool_allocation"
+                    )
                 # Atomic rollback: free everything we successfully allocated.
                 rollback_allocated()
                 return None

@@ -167,6 +167,31 @@ class TestJDInternalCIContract(unittest.TestCase):
             ],
         )
 
+    def test_dspark_sps_image_asset_installer_copies_verified_table(self):
+        source_table = REPO_ROOT / "dspark-sps-2d.json"
+        installer = REPO_ROOT / "test/jd-ci/image/install_dspark_sps_table.sh"
+        script = self._script()
+
+        self.assertTrue(source_table.is_file())
+        self.assertTrue(installer.is_file())
+        self.assertIn("install_dspark_sps_table.sh", script)
+        self.assertIn("/dspark-sps-2d.json' | sha256sum -c -", script)
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            installed_table = Path(temporary_directory) / "dspark-sps-2d.json"
+            result = subprocess.run(
+                ["bash", str(installer), str(source_table), str(installed_table)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                hashlib.sha256(installed_table.read_bytes()).hexdigest(),
+                "a9d6b97e2691b5c5b20748bea01d8542f4a3db395409afe1569711461c83e7d0",
+            )
+            self.assertEqual(installed_table.read_bytes(), source_table.read_bytes())
+
     def test_sgl_kernel_build_is_enabled_by_default(self):
         script = (REPO_ROOT / "test/jd-ci/run_jd_ci.sh").read_text(encoding="utf-8")
 
@@ -577,29 +602,4 @@ printf 'LENGTH=%s\\n' "${#value}"
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)    def test_dspark_sps_image_asset_installer_copies_verified_table(self):
-        source_table = REPO_ROOT / "dspark-sps-2d.json"
-        installer = REPO_ROOT / "test/jd-ci/image/install_dspark_sps_table.sh"
-        script = self._script()
-
-        self.assertTrue(source_table.is_file())
-        self.assertTrue(installer.is_file())
-        self.assertIn("install_dspark_sps_table.sh", script)
-        self.assertIn("/dspark-sps-2d.json' | sha256sum -c -", script)
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            installed_table = Path(temporary_directory) / "dspark-sps-2d.json"
-            result = subprocess.run(
-                ["bash", str(installer), str(source_table), str(installed_table)],
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(
-                hashlib.sha256(installed_table.read_bytes()).hexdigest(),
-                "a9d6b97e2691b5c5b20748bea01d8542f4a3db395409afe1569711461c83e7d0",
-            )
-            self.assertEqual(installed_table.read_bytes(), source_table.read_bytes())
-
-
+    unittest.main(verbosity=2)

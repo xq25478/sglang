@@ -843,6 +843,15 @@ class C4IndexerBackendMixin:
             c4_seq_lens=c4_seq_lens,
             query_rows=query_rows,
         )
+        indexer_page_table = page_table
+        if hasattr(token_to_kv_pool, "remap_indexer_page_table_for_read"):
+            indexer_page_table = token_to_kv_pool.remap_indexer_page_table_for_read(
+                c4_indexer.layer_id, indexer_page_table
+            )
+        else:
+            # Pre-LayerSplit invariant: backend builds indexer page table from
+            # the same source as core_attn_metadata.page_table.
+            assert indexer_metadata.page_table is core_metadata.page_table
         if nonpaged_plan is not None:
             assert isinstance(q_indexer, torch.Tensor)
             nonpaged_kv_fp8 = self._get_nonpaged_indexer_kv(
@@ -894,13 +903,12 @@ class C4IndexerBackendMixin:
                 c4_indexer_kv_cache,
                 weights[start:end],
                 _c4sl[start:end],
-                page_table[start:end],
+                indexer_page_table[start:end],
                 deep_gemm_metadata,
                 indexer_metadata.max_c4_seq_len,
                 False,
             )
 
-        assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
             compute_logits(0, query_rows)
             return

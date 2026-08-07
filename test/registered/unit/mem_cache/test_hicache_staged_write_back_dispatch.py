@@ -1,5 +1,6 @@
 """Unit tests for HiCache staged write-back host-pool dispatch."""
 
+import threading
 import unittest
 from contextlib import contextmanager
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     PoolEntry,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
@@ -135,6 +137,17 @@ class _FakeEvent:
         pass
 
 
+class _CompletedTimingEvent:
+    def __init__(self, elapsed_ms: float = 0.0):
+        self.elapsed_ms = elapsed_ms
+
+    def query(self):
+        return True
+
+    def elapsed_time(self, _finish_event):
+        return self.elapsed_ms
+
+
 class _FakeDeviceModule:
     Event = _FakeEvent
 
@@ -144,7 +157,7 @@ class _FakeDeviceModule:
         yield
 
 
-class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
+class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
     def _patched_transfers(self, src_registry=None):
         staged_side_effect = None
         if src_registry is not None:
@@ -652,6 +665,40 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
         self.assertEqual(group.layout, "page_first")
         self.assertTrue(group.can_use_write_back_jit)
 
+    def test_logical_host_pool_reuses_slots_across_queue_wraparound(self):
+        pool = LogicalHostPool(8, 2, layout="page_first")
+        storage_ptr = pool._free_slot_queue._slots.data_ptr()
+
+        first = pool.alloc(6)
+        self.assertTrue(torch.equal(first, _indices(0, 6)))
+        self.assertEqual(pool.available_size(), 2)
+
+        self.assertEqual(pool.free(first[:4]), 4)
+        self.assertEqual(pool.available_size(), 6)
+
+        wrapped = pool.alloc(4)
+        self.assertTrue(torch.equal(wrapped, torch.tensor([6, 7, 0, 1])))
+        self.assertEqual(pool.available_size(), 2)
+
+        self.assertEqual(pool.free(first[4:]), 2)
+        self.assertEqual(pool.free(wrapped), 4)
+        self.assertEqual(pool.available_size(), 8)
+        self.assertEqual(pool._free_slot_queue._slots.data_ptr(), storage_ptr)
+
+    def test_dsv4_paged_host_pool_uses_fixed_capacity_free_slots(self):
+        pool = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+        pool.size = 8
+        pool.slot_page_size = 2
+        pool.lock = threading.RLock()
+        pool.clear()
+
+        allocated = pool.alloc(3)
+        self.assertTrue(torch.equal(allocated, _indices(0, 4)))
+        self.assertEqual(pool.available_size(), 4)
+
+        self.assertEqual(pool.free(allocated), 4)
+        self.assertEqual(pool.available_size(), 8)
+
     def test_write_back_jit_hybrid_write_keeps_extra_host_indices_on_cpu(self):
         captured = {}
 
@@ -924,6 +971,212 @@ class TestHiCacheStagedWriteBackDispatch(unittest.TestCase):
 
         controller.move_indices.assert_called_once()
         self.assertEqual(captured["host_indices"].device.type, "cpu")
+
+    def test_base_cache_controller_layer_split_write_stats_are_noop(self):
+        controller = HiCacheController.__new__(HiCacheController)
+
+        ticket = controller.begin_layer_split_l2_write(8)
+        controller.mark_layer_split_l2_capacity_pressure("test")
+        controller.record_layer_split_l2_eviction_shortfall(
+            ticket, required_tokens=8, evicted_tokens=0
+        )
+        controller.finish_layer_split_l2_write(ticket, success=False)
+
+        self.assertIsNone(ticket)
+        self.assertIsNone(controller.consume_layer_split_l2_write_failure_reason())
+
+    def test_layer_split_l2_write_stats_split_cold_and_saturated_phases(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 4
+        controller._layer_split_l2_write_stats_enabled = True
+        controller._layer_split_l2_write_stats_phase = "cold_fill"
+        controller._layer_split_l2_write_stats = {
+            "cold_fill": controller._new_layer_split_l2_write_stats(),
+            "saturated": controller._new_layer_split_l2_write_stats(),
+        }
+        controller._layer_split_l2_pool_allocation_stats = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+        controller._layer_split_l2_d2h_pool_page_copies = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+        controller._layer_split_l2_pending_d2h_timings = []
+        controller._layer_split_l2_write_stats_interval_seconds = 3600.0
+        controller._layer_split_l2_write_stats_last_log_time = float("inf")
+        controller._layer_split_l2_last_write_failure_reason = None
+
+        cold_ticket = controller.begin_layer_split_l2_write(7)
+        controller.mark_layer_split_l2_capacity_pressure("host_pool_full")
+        controller.finish_layer_split_l2_write(cold_ticket, success=True)
+
+        saturated_ticket = controller.begin_layer_split_l2_write(4)
+        controller.record_layer_split_l2_eviction_shortfall(
+            saturated_ticket, required_tokens=12, evicted_tokens=4
+        )
+        controller.finish_layer_split_l2_write(
+            saturated_ticket,
+            success=False,
+            failure_reason="host_allocation",
+        )
+
+        cold_stats = controller._layer_split_l2_write_stats["cold_fill"]
+        self.assertEqual(cold_stats["attempted_write_pages"], 2)
+        self.assertEqual(cold_stats["successful_write_pages"], 2)
+
+        saturated_stats = controller._layer_split_l2_write_stats["saturated"]
+        self.assertEqual(saturated_stats["attempted_write_pages"], 1)
+        self.assertEqual(saturated_stats["successful_write_pages"], 0)
+        self.assertEqual(saturated_stats["host_pool_allocation_failures"], 1)
+        self.assertEqual(saturated_stats["eviction_shortfall_pages"], 2)
+        self.assertEqual(saturated_stats["abandoned_write_pages"], 1)
+
+    def test_layer_split_l2_write_stats_log_success_rate(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller.page_size = 4
+        controller._layer_split_l2_write_stats_enabled = True
+        controller._layer_split_l2_write_stats_phase = "cold_fill"
+        controller._layer_split_l2_write_stats = {
+            "cold_fill": controller._new_layer_split_l2_write_stats(),
+            "saturated": controller._new_layer_split_l2_write_stats(),
+        }
+        controller._layer_split_l2_pool_allocation_stats = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+        controller._layer_split_l2_d2h_pool_page_copies = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+        controller._layer_split_l2_pending_d2h_timings = []
+        controller._layer_split_l2_write_stats_interval_seconds = 10.0
+        controller._layer_split_l2_write_stats_last_log_time = float("inf")
+        controller._layer_split_l2_last_write_failure_reason = None
+
+        success_ticket = controller.begin_layer_split_l2_write(12)
+        controller.finish_layer_split_l2_write(success_ticket, success=True)
+        failure_ticket = controller.begin_layer_split_l2_write(4)
+        controller._layer_split_l2_write_stats_last_log_time = 0.0
+        with mock.patch.object(hybrid_cache_controller.logger, "info") as log:
+            controller.finish_layer_split_l2_write(
+                failure_ticket,
+                success=False,
+                failure_reason="side_pool_allocation",
+            )
+
+        args = log.call_args.args
+        self.assertEqual(args[1], "cold_fill")
+        self.assertEqual(args[2], 4)
+        self.assertEqual(args[3], 3)
+        self.assertEqual(args[4], 75.0)
+        self.assertEqual(args[6], 1)
+
+    def test_layer_split_l2_pool_allocation_retry_stats(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller._layer_split_l2_write_stats_enabled = True
+        controller._layer_split_l2_pool_allocation_stats = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+
+        controller._record_layer_split_l2_pool_allocation_pressure(
+            phase="cold_fill",
+            pool_name=PoolName.SWA,
+            requested_slots=77,
+            evicted_slots=64,
+            retry_success=True,
+            elapsed_ms=2.5,
+        )
+
+        stats = controller._layer_split_l2_pool_allocation_stats["cold_fill"][
+            "swa"
+        ]
+        self.assertEqual(stats["initial_allocation_misses"], 1)
+        self.assertEqual(stats["requested_slots"], 77)
+        self.assertEqual(stats["evicted_slots"], 64)
+        self.assertEqual(stats["retry_successes"], 1)
+        self.assertEqual(stats["retry_failures"], 0)
+        self.assertEqual(stats["evict_retry_cpu_ms"], 2.5)
+
+    def test_layer_split_l2_side_pool_retry_is_recorded(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller._layer_split_l2_write_stats_enabled = True
+        controller._layer_split_l2_write_stats_phase = "cold_fill"
+        controller._layer_split_l2_pool_allocation_stats = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+        controller._layer_split_l2_last_write_failure_reason = None
+
+        host_pool = SimpleNamespace(
+            alloc=mock.Mock(side_effect=[None, _indices(10, 13)]),
+            free=mock.Mock(),
+        )
+        entry = SimpleNamespace(
+            host_pool=host_pool,
+            host_evict_fn=mock.Mock(return_value=3),
+        )
+        controller.mem_pool_host = SimpleNamespace(
+            entry_map={PoolName.SWA: entry}
+        )
+        transfer = PoolTransfer(
+            name=PoolName.SWA,
+            device_indices=_indices(0, 3),
+        )
+
+        result = controller._resolve_pool_transfers_allocation(
+            [transfer],
+            alloc_host=True,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(controller._layer_split_l2_write_stats_phase, "saturated")
+        entry.host_evict_fn.assert_called_once_with(3)
+        stats = controller._layer_split_l2_pool_allocation_stats["cold_fill"][
+            "swa"
+        ]
+        self.assertEqual(stats["initial_allocation_misses"], 1)
+        self.assertEqual(stats["requested_slots"], 3)
+        self.assertEqual(stats["evicted_slots"], 3)
+        self.assertEqual(stats["retry_successes"], 1)
+
+    def test_layer_split_l2_d2h_device_timing_stats(self):
+        controller = HybridCacheController.__new__(HybridCacheController)
+        controller._layer_split_l2_write_stats_enabled = True
+        controller._layer_split_l2_write_stats = {
+            "cold_fill": controller._new_layer_split_l2_write_stats(),
+            "saturated": controller._new_layer_split_l2_write_stats(),
+        }
+        controller._layer_split_l2_d2h_pool_page_copies = {
+            "cold_fill": {},
+            "saturated": {},
+        }
+        controller._layer_split_l2_pending_d2h_timings = []
+
+        controller._record_layer_split_l2_d2h_submit(
+            phase="saturated",
+            start_event=_CompletedTimingEvent(elapsed_ms=3.25),
+            finish_event=_CompletedTimingEvent(),
+            anchor_pages=32,
+            pool_pages={"swa": 128},
+            enqueue_cpu_ms=0.4,
+        )
+        controller._poll_layer_split_l2_d2h_timings()
+
+        stats = controller._layer_split_l2_write_stats["saturated"]
+        self.assertEqual(stats["d2h_submitted_batches"], 1)
+        self.assertEqual(stats["d2h_completed_batches"], 1)
+        self.assertEqual(stats["d2h_anchor_pages"], 32)
+        self.assertEqual(stats["d2h_pool_page_copies"], 128)
+        self.assertEqual(stats["d2h_gpu_ms"], 3.25)
+        self.assertEqual(stats["d2h_max_gpu_ms"], 3.25)
+        self.assertEqual(stats["d2h_enqueue_cpu_ms"], 0.4)
+        self.assertEqual(
+            controller._layer_split_l2_d2h_pool_page_copies["saturated"],
+            {"swa": 128},
+        )
+        self.assertEqual(controller._layer_split_l2_pending_d2h_timings, [])
 
 
 if __name__ == "__main__":

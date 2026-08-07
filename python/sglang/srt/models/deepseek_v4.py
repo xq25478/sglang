@@ -137,6 +137,11 @@ else:
     from sglang.srt.layers.mhc import hc_split_sinkhorn, mhc_fused_post_pre, npu_hc_pre
 
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_helpers import (
+    is_cp_cache_layer_split_deepseek_v4_pool,
+    maybe_prefetch_cp_kv_swa,
+    maybe_wait_cp_kv_swa_prefetch,
+)
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
@@ -340,6 +345,38 @@ if TYPE_CHECKING:
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def _can_dsa_cp_split_for_deepseek_v4(
+    input_ids_len: int,
+    cp_size: int,
+    use_dsa: bool,
+    forward_batch: ForwardBatch,
+) -> bool:
+    if can_dsa_cp_split(input_ids_len, cp_size, use_dsa, forward_batch):
+        return True
+    if (
+        not use_dsa
+        or not is_dsa_prefill_cp_round_robin_split()
+        or cp_size <= 1
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or input_ids_len == 0
+        or input_ids_len % cp_size != 0
+    ):
+        return False
+    extend_seq_lens = forward_batch.extend_seq_lens_cpu
+    if extend_seq_lens is None:
+        return False
+    real_extend_tokens = sum(int(x) for x in extend_seq_lens)
+    if real_extend_tokens == 0:
+        return False
+    token_to_kv_pool = get_token_to_kv_pool()
+    # LayerSplit KV is CP-sharded, so tiny padded prefill batches still need
+    # the CP path to broadcast/remap non-owned layers before attention reads.
+    can_force_tiny_cp = is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
+    if not can_force_tiny_cp:
+        return False
+    return True
 
 
 @register_custom_op(mutates_args=["output"])
@@ -703,13 +740,17 @@ class MQALayer(MqaAttentionBase):
         Replaces the bf16-kv-intermediate path. Used everywhere except the DSA
         prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
         """
+        token_to_kv_pool = get_token_to_kv_pool()
+        if TYPE_CHECKING:
+            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        if is_cp_cache_layer_split_deepseek_v4_pool(
+            token_to_kv_pool
+        ) and token_to_kv_pool.should_skip_swa_write(self.layer_id):
+            return
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :].contiguous()
         else:
             kv, _ = self.wkv(x)
-        token_to_kv_pool = get_token_to_kv_pool()
-        if TYPE_CHECKING:
-            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
             swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -1031,8 +1072,12 @@ class MQALayer(MqaAttentionBase):
 
         unified = is_unified_kv_triton()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
+        token_to_kv_pool = get_token_to_kv_pool()
+        use_layer_split_prefill = (
+            is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool) and use_cp
+        )
         do_fused_store = (unified and is_decode) or (
-            not unified and self.use_fused_qk_norm_rope
+            not unified and self.use_fused_qk_norm_rope and not use_layer_split_prefill
         )
 
         if do_fused_store:
@@ -1053,7 +1098,6 @@ class MQALayer(MqaAttentionBase):
                 else self.wkv(x_linear)[0]
             )
 
-            token_to_kv_pool = get_token_to_kv_pool()
             if unified:
                 swa_cache = token_to_kv_pool.get_unified_kv(self.layer_id)
                 # swa_loc is layer-independent; computed once per forward by the
@@ -1170,8 +1214,28 @@ class MQALayer(MqaAttentionBase):
                 )
                 kv = None
 
+        maybe_prefetch_cp_kv_swa(get_token_to_kv_pool(), self.layer_id, forward_batch)
+
         del qkv_a
 
+        token_to_kv_pool = get_token_to_kv_pool()
+        reorder_c4_extra = (
+            use_cp
+            and self.indexer is not None
+            and self.compressor is not None
+            and is_cp_cache_layer_split_deepseek_v4_pool(token_to_kv_pool)
+            and token_to_kv_pool.should_prefetch_extra_from_page_table(self.layer_id)
+        )
+
+        if reorder_c4_extra:
+            # LayerSplit runs C4 compression before the indexer so the extra-KV
+            # broadcast can overlap with indexer work on this layer.
+            attn_backend.forward_core_compressor(
+                x,
+                forward_batch,
+                self.layer_id,
+                self.compressor,
+            )
         if self.indexer is not None:
             self.indexer(
                 x=x,
@@ -1179,14 +1243,13 @@ class MQALayer(MqaAttentionBase):
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
             )
-        if self.compressor is not None:
+        if self.compressor is not None and not reorder_c4_extra:
             attn_backend.forward_core_compressor(
                 x,
                 forward_batch,
                 self.layer_id,
                 self.compressor,
             )
-
         return q, kv
 
     def forward(
@@ -1196,7 +1259,18 @@ class MQALayer(MqaAttentionBase):
         forward_batch: ForwardBatch,
         x_quant=None,
     ) -> torch.Tensor:
-        if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
+        token_to_kv_pool = get_token_to_kv_pool()
+        use_layer_split_prefill = is_cp_cache_layer_split_deepseek_v4_pool(
+            token_to_kv_pool
+        ) and dsa_use_prefill_cp(forward_batch)
+        if (
+            not get_attn_tp_context().input_scattered
+            and x.shape[0] == 0
+            and not use_layer_split_prefill
+        ):
+            assert (
+                not self.wo_b.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = get_attn_backend()
@@ -1249,6 +1323,9 @@ class MQALayer(MqaAttentionBase):
                 ]
                 self._attn_sink_local = sink
 
+        has_tokens = x.shape[0] > 0 or get_attn_tp_context().input_scattered
+        q: torch.Tensor
+        kv: Optional[torch.Tensor]
         if enable_cp_multi_stream:
             q, kv = self._forward_prepare_multi_stream_cp(
                 x,
@@ -1258,7 +1335,7 @@ class MQALayer(MqaAttentionBase):
                 q_out,
                 x_quant=x_quant,
             )
-        elif enable_multi_stream:
+        elif enable_multi_stream and has_tokens:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
             if _is_hip:
@@ -1280,6 +1357,9 @@ class MQALayer(MqaAttentionBase):
                     x_quant=x_quant,
                 )
             kv = None
+            maybe_prefetch_cp_kv_swa(
+                get_token_to_kv_pool(), self.layer_id, forward_batch
+            )
         else:
             q, kv = self._forward_prepare(
                 x,
@@ -1290,11 +1370,23 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        if not has_tokens:
+            maybe_wait_cp_kv_swa_prefetch(
+                get_token_to_kv_pool(), self.layer_id, forward_batch
+            )
+            assert (
+                not self.wo_b.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return x
+
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
         # attention path doesn't read it once `save_kv_cache=False`.
         attn_k = kv if kv is not None else q
+        maybe_wait_cp_kv_swa_prefetch(
+            get_token_to_kv_pool(), self.layer_id, forward_batch
+        )
         from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
             is_unified_kv_triton,
         )
@@ -2627,7 +2719,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.dsa_enable_prefill_cp:
-            if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+            if _can_dsa_cp_split_for_deepseek_v4(
+                len(input_ids), self.cp_size, True, forward_batch
+            ):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
@@ -2645,6 +2739,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                         metadata.indexer_metadata = (
                             attn_backend.init_forward_metadata_indexer(core_meta)
                         )
+            else:
+                forward_batch.attn_cp_metadata = None
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(

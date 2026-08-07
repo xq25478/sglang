@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DSPark × DeepSeek-V4-Flash 技术报告 · 三模块代码走读</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor:'#e0f2fe', primaryTextColor:'#0f172a', primaryBorderColor:'#0369a1',
+      lineColor:'#64748b', secondaryColor:'#f1f5f9', tertiaryColor:'#f8fafc',
+      fontSize:'13px', fontFamily:'-apple-system,"PingFang SC",sans-serif'
+    },
+    flowchart:{ curve:'basis', htmlLabels:true, nodeSpacing:40, rankSpacing:38 },
+    sequence:{ actorMargin:50, boxMargin:6, mirrorActors:false },
+    securityLevel:'loose'
+  });
+</script>
+<style>
+  :root{
+    --bg:#fafaf9; --surface:#ffffff; --ink:#1c1917; --muted:#57534e;
+    --line:#e7e5e4; --accent:#0369a1; --accent-2:#0d9488;
+    --code-bg:#0f172a; --code-ink:#e2e8f0;
+    --ok:#15803d; --warn:#b45309; --bad:#b91c1c; --lead:#6d28d9;
+    --p0:#b91c1c; --p1:#b45309; --p2:#0369a1;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Noto Sans CJK SC",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1140px; margin:0 auto; padding:0 28px 120px}
+  header.report-head{
+    background:linear-gradient(135deg,#0f172a 0%, #134e4a 60%, #1e3a5f 100%);
+    color:#f8fafc; padding:42px 0 34px; margin-bottom:36px;
+  }
+  header.report-head .wrap{padding:0 28px}
+  header.report-head h1{margin:0 0 6px; font-size:27px; font-weight:700; letter-spacing:-.01em}
+  header.report-head .sub{color:#cbd5e1; font-size:14px; margin-bottom:8px}
+  header.report-head .errata{color:#fca5a5; font-size:13px}
+  .baseline{
+    background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.15);
+    border-radius:8px; padding:13px 18px; font:12px/1.6 "SF Mono",Menlo,Consolas,monospace;
+    color:#e2e8f0; white-space:pre; overflow-x:auto; margin-top:14px;
+  }
+  h2{
+    font-size:23px; margin:56px 0 16px; padding-bottom:9px; border-bottom:2px solid var(--line);
+    color:#0f172a; font-weight:700; letter-spacing:-.01em;
+  }
+  h2 .num{
+    display:inline-block; background:var(--accent); color:#fff; font-size:13px;
+    width:28px; height:28px; line-height:28px; text-align:center; border-radius:6px;
+    margin-right:11px; vertical-align:1px; font-weight:600;
+  }
+  h2.mod{
+    background:linear-gradient(90deg,#0f172a,#1e3a5f); color:#f8fafc; border:none;
+    padding:16px 20px; border-radius:8px; margin-top:64px; font-size:21px;
+  }
+  h2.mod .num{background:#22d3ee; color:#0f172a}
+  h3{font-size:17px; margin:30px 0 10px; color:#0f172a; font-weight:650}
+  h4{font-size:14.5px; margin:22px 0 8px; color:#334155; font-weight:650}
+  p{margin:10px 0}
+  code{
+    font:12.5px/1.4 "SF Mono",Menlo,Consolas,monospace; background:#f1f5f9;
+    color:#be123c; padding:1.5px 5px; border-radius:4px;
+  }
+  pre{
+    background:var(--code-bg); color:var(--code-ink); padding:15px 18px;
+    border-radius:8px; overflow-x:auto; font:12.5px/1.6 "SF Mono",Menlo,Consolas,monospace;
+    margin:12px 0;
+  }
+  pre .c{color:#94a3b8; font-style:italic}
+  pre .k{color:#7dd3fc}
+  pre .s{color:#86efac}
+  pre .n{color:#fcd34d}
+  pre .r{color:#fda4af}
+  pre .file{color:#94a3b8; display:block; margin-bottom:6px; font-size:11px}
+  table{
+    width:100%; border-collapse:collapse; margin:14px 0; font-size:13px;
+    background:var(--surface); border:1px solid var(--line); border-radius:8px; overflow:hidden;
+  }
+  th,td{text-align:left; padding:8px 11px; border-bottom:1px solid var(--line); vertical-align:top}
+  th{background:#f8fafc; font-weight:650; color:#334155; font-size:12px}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:#fafbfc}
+  td code, th code{font-size:11.5px}
+  .pill{
+    display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;
+    font-weight:600; font-family:"SF Mono",Menlo,monospace; white-space:nowrap;
+  }
+  .ok{background:#dcfce7; color:var(--ok)}
+  .warn{background:#fef3c7; color:var(--warn)}
+  .bad{background:#fee2e2; color:var(--bad)}
+  .lead{background:#ede9fe; color:var(--lead)}
+  .info{background:#e0f2fe; color:var(--accent)}
+  .callout{
+    border-left:3px solid var(--accent); background:#f0f9ff; padding:11px 16px;
+    border-radius:0 6px 6px 0; margin:14px 0; font-size:13.5px;
+  }
+  .callout.warn{border-color:var(--warn); background:#fffbeb}
+  .callout.bad{border-color:var(--bad); background:#fef2f2}
+  .callout.lead{border-color:var(--lead); background:#f5f3ff}
+  .callout.ok{border-color:var(--ok); background:#f0fdf4}
+  .callout strong{display:block; margin-bottom:3px; font-size:13px}
+  ul,ol{margin:9px 0; padding-left:24px}
+  li{margin:4px 0}
+  .file-link{color:var(--accent); text-decoration:none; font-family:"SF Mono",Menlo,monospace; font-size:12px}
+  .file-link:hover{text-decoration:underline}
+  .mermaid{
+    background:#fff; border:1px solid var(--line); border-radius:8px;
+    padding:16px; margin:16px 0; text-align:center; overflow-x:auto;
+  }
+  .fig-cap{font-size:12px; color:var(--muted); text-align:center; margin:-8px 0 18px; font-style:italic}
+  .grid2{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin:14px 0}
+  .grid3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; margin:14px 0}
+  .card{background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:14px 16px}
+  .card h4{margin-top:0}
+  .toc{
+    background:var(--surface); border:1px solid var(--line); border-radius:8px;
+    padding:18px 26px; margin:0 0 8px; columns:2; font-size:13px;
+  }
+  .toc a{color:var(--accent); text-decoration:none; display:block; padding:2px 0}
+  .toc a:hover{text-decoration:underline}
+  .toc .toc-h{font-weight:650; color:#334155; margin-top:10px; font-size:11px; text-transform:uppercase; letter-spacing:.05em}
+  .toc .toc-h:first-child{margin-top:0}
+  .footer-note{font-size:12px; color:var(--muted); margin-top:48px; padding-top:16px; border-top:1px solid var(--line)}
+  .errata-box{
+    background:#fef2f2; border:2px solid var(--bad); border-radius:8px;
+    padding:14px 18px; margin:18px 0;
+  }
+  .errata-box h3{margin-top:0; color:var(--bad)}
+  @media (max-width:760px){
+    .grid2,.grid3{grid-template-columns:1fr}
+    .toc{columns:1}
+    h2.mod{font-size:18px}
+  }
+</style>
+</head>
+<body>
+
+<header class="report-head">
+  <div class="wrap">
+    <h1>DSPark × DeepSeek-V4-Flash 技术报告</h1>
+    <div class="sub">三模块代码走读 — 模型结构 · DSpark 原理 · PD 分离视角 · 基于当前分支源码逐行核对</div>
+    <div class="errata">勘误(2026-08-05):前版报告关于"DSpark 不支持/PD 不可用"的结论已被纠正 — 见下方支持性复核。</div>
+    <div class="baseline">基线快照
+As of: 2026-08-05  (本地 +08:00)
+Upstream: upstream/main @ 99709f734d8362282d4cec44d3b62465a87c9678
+Internal: moe_gate_fused_0515-DSpark @ a7ca0cb5564b9729212961534bbff376d80b7f87
+审计方式: ref-to-ref 只读代码走读 (4 个 agent 并行, 194 次工具调用, 逐行核对 file:line)</div>
+  </div>
+</header>
+
+<div class="wrap">
+
+<!-- ============ 支持性复核(勘误) ============ -->
+<div class="errata-box">
+  <h3>⚠ 勘误:DSpark 在当前分支是可以正常运行的</h3>
+  <p>前版报告称"LayerSplit + DSPark PD 当前不可用 / DSpark 不支持",经逐行复核当前 HEAD <code>a7ca0cb556</code>,此结论<strong>过度宽泛且部分错误</strong>。真实情况:</p>
+  <ul>
+    <li><strong>DSpark 本身(纯 DSpark、DSpark+PD)都没被 block</strong>。<code>_handle_dspark</code>(<a class="file-link" href="python/sglang/srt/arg_groups/speculative_hook.py">speculative_hook.py:263</a>)<strong>没有任何</strong>对 <code>enable_cp_cache_layer_split</code> / <code>disaggregation_mode</code> / PD 的 gate。它只约束:非 CUDA 设备、DP attention 须带 dp_lm_head 且 moe_a2a_backend='none' 且 attn_cp_size==1、pp_size==1、gamma/num_draft_tokens 一致、num_draft_tokens&ge;2。</li>
+    <li><strong>DSpark+PD 是主动支持的</strong>:<code>scheduler.py:1172</code> <code>init_dspark_disaggregation_metadata_config</code> 主动初始化,<code>MetadataBuffers</code> 带 <code>dspark_hidden_pool</code>/<code>dspark_hidden_size</code>。</li>
+    <li><strong>唯一硬 gate 是 LayerSplit + DSpark</strong>:<code>server_args.py:5062</code> <code>_validate_cp_cache_layer_split_speculative_decoding</code> 要求 <code>algorithm=="EAGLE" && topk==1</code>,而 DSpark 的 algorithm 是独立字符串 <code>"DSPARK"</code>,故 DSpark+LayerSplit 是<strong>唯一被 block 的组合</strong>。关键是 L5065 的 <code>not self.enable_cp_cache_layer_split</code> 短路 —— LayerSplit 关掉时根本不进这个函数,所以纯 DSpark / DSpark+PD 干净通过。你能跑起来,跑的就是这两者之一。</li>
+    <li><strong>memory note 里 <code>kv_data_layout=[]</code> wipe → RuntimeError 在当前分支不复现</strong>:<code>utils.py:1211</code> 的 <code>.clear()</code> 被 <code>if draft_ptrs:</code> 保护,DSpark DSV4 draft 用 SWA ring 存 KV,<code>draft_ptrs</code> 为空 → clear 是 no-op;note 引用的 commit <code>bc49b7a4b7</code> 根本不在本分支。</li>
+  </ul>
+</div>
+
+<div class="callout">
+  <strong>阅读说明</strong>
+  本报告为三模块代码走读,所有结论以 <code>file:line</code> 锚定并附真实代码片段。Mermaid 图(框架图/流程图/时序图/状态图/数据流图)在线渲染,需联网加载 mermaid.js。第三模块(PD)是重点。
+</div>
+
+<nav class="toc">
+  <div class="toc-h">第一模块 · DSV4-Flash 模型</div>
+  <a href="#m1">一、模型结构总览</a>
+  <a href="#m1-attn">1.2 Attention: MQA + SWA ring + DSA 分级压缩</a>
+  <a href="#m1-moe">1.3 Decoder 层 + mHC 混合 + MoE</a>
+  <a href="#m1-capture">1.4 STAGING: target hidden 捕获</a>
+  <a href="#m1-draft">1.5 DSpark draft 模型</a>
+  <a href="#m1-markov">1.6 Markov head / Confidence head</a>
+  <a href="#m1-bootstrap">1.7 KV bootstrap 链路</a>
+  <a href="#m1-knobs">1.8 性能开关</a>
+  <div class="toc-h">第二模块 · DSpark 原理</div>
+  <a href="#m2">二、DSpark 详细原理</a>
+  <a href="#m2-step">2.1 decode-step 全流程</a>
+  <a href="#m2-draft">2.2 Draft 提案</a>
+  <a href="#m2-budget">2.3 Confidence-scheduled budget(核心)</a>
+  <a href="#m2-verify">2.4 Verify 与接受策略</a>
+  <a href="#m2-compact">2.5 Compact ragged 模式</a>
+  <a href="#m2-graph">2.6 CUDA Graph folding</a>
+  <a href="#m2-sps">2.7 SPS/STS 离线标定</a>
+  <div class="toc-h">第三模块 · PD 分离视角</div>
+  <a href="#m3">三、PD 分离:DSV4-Flash + DSpark</a>
+  <a href="#m3-arch">3.1 PD 拓扑与协调</a>
+  <a href="#m3-problem">3.2 核心问题与解法</a>
+  <a href="#m3-window">3.3 hidden 传输窗口</a>
+  <a href="#m3-inject">3.4 注入双路径</a>
+  <a href="#m3-seq">3.5 完整 bootstrap 时序</a>
+  <a href="#m3-comm">3.6 通信模型</a>
+  <a href="#m3-kv">3.7 KV Cache 模型</a>
+  <a href="#m3-concl">3.8 小结</a>
+</nav>
+
+<!-- ================================================================ -->
+<!--                    第一模块 · DSV4-Flash 模型                     -->
+<!-- ================================================================ -->
+
+<h2 class="mod" id="m1"><span class="num">1</span>第一模块 · DeepSeek-V4-Flash 模型结构</h2>
+
+<p>先澄清命名:仓库里<strong>没有</strong> <code>deepseek_v4_flash.py</code>。基础模型是 <a class="file-link" href="python/sglang/srt/models/deepseek_v4.py">deepseek_v4.py</a>,EntryClass 为 <code>DeepseekV4ForCausalLM</code>。"Flash"指的是其 FlashMLA SWA-MQA attention 路径,不是一个独立文件。DSpark draft 变体在 <a class="file-link" href="python/sglang/srt/models/deepseek_v4_dspark.py">deepseek_v4_dspark.py</a>。</p>
+
+<h3 id="m1-attn">1.1 架构常量</h3>
+<p><a class="file-link" href="python/sglang/srt/configs/deepseek_v4.py">configs/deepseek_v4.py:47-110</a> 的 <code>DeepSeekV4Config</code> 默认:</p>
+<pre><span class="file">python/sglang/srt/configs/deepseek_v4.py:47-110</span>
+num_hidden_layers      = <span class="n">43</span>
+hidden_size            = <span class="n">4096</span>
+num_attention_heads    = <span class="n">64</span>
+num_key_value_heads    = <span class="n">1</span>            <span class="c"># MQA</span>
+head_dim               = <span class="n">512</span>          <span class="c"># 448 nope + 64 rope</span>
+q_lora_rank            = <span class="n">1024</span>
+o_lora_rank            = <span class="n">1024</span>; o_groups = <span class="n">8</span>
+n_routed_experts       = <span class="n">256</span>; num_experts_per_tok = <span class="n">6</span>; n_shared_experts = <span class="n">1</span>
+topk_method            = <span class="s">"noaux_tc"</span>; scoring_func = <span class="s">"sqrtsoftplus"</span>
+window_size            = <span class="n">128</span>          <span class="c"># SWA 滑窗</span>
+hc_mult                = <span class="n">4</span>; hc_sinkhorn_iters = <span class="n">20</span>
+vocab_size             = <span class="n">129280</span>
+compress_ratios        = [per-layer]   <span class="c"># 每层选 DSA 压缩模式 ∈ {0,4,128}</span></pre>
+
+<div class="grid3">
+  <div class="card"><h4>Attention</h4>MLA 风格 MQA(num_kv_heads=1)+ 每层独立 DSA 压缩分级(compress_ratio ∈ {0,4,128}),SWA KV 是 window_size=128 的 paged ring。</div>
+  <div class="card"><h4>MoE</h4>256 routed + 1 shared;shared expert 在 fusion 开启时融合进 expert 列表 index 256,effective topk = 6+1 = 7。</div>
+  <div class="card"><h4>STAGING</h4>target 在调用方指定的 layer ids 捕获已完成 hidden(mHC 折叠 + hc_mult 均值),feature-wise 拼成 hidden_size*N 喂 draft。</div>
+</div>
+
+<h3 id="m1-attn">1.2 Attention: MQA + SWA ring + DSA 分级压缩</h3>
+<p><a class="file-link" href="python/sglang/srt/models/deepseek_v4.py">deepseek_v4.py:478-487</a> 每层 <code>compress_ratio</code> 三选一,决定该层走纯 SWA、C4 压缩、还是 C128 压缩:</p>
+<pre><span class="file">python/sglang/srt/models/deepseek_v4.py:605-695 (节选)</span>
+class MQALayer(MqaAttentionBase):
+    def __init__(self, config, layer_id, ...):
+        self.compress_ratio = compress_ratio or config.compress_ratios[layer_id]
+        <span class="k">assert</span> self.compress_ratio <span class="k">in</span> (<span class="n">0</span>, <span class="n">4</span>, <span class="n">128</span>)
+        <span class="k">if</span> self.compress_ratio <span class="k">in</span> (<span class="n">4</span>, <span class="n">128</span>):
+            self.compressor = Compressor(..., compress_ratio=self.compress_ratio, ...)
+            <span class="k">if</span> self.compress_ratio == <span class="n">4</span>:
+                self.indexer = C4Indexer(...)
+        self.attn_mqa = RadixAttention(self.n_local_heads, self.head_dim,
+            self.softmax_scale, num_kv_heads=<span class="n">1</span>, layer_id=layer_id, ...)</pre>
+
+<p>Q 路径:<code>wq_a</code>(ReplicatedLinear hidden→q_lora_rank)→<code>q_norm</code>→<code>wq_b</code>(ColumnParallel q_lora_rank→n_heads*head_dim)→<code>fused_q_norm_rope</code>(融合 RMSNorm+RoPE)。KV 路径:<code>wkv</code>(ReplicatedLinear hidden→head_dim)→<code>kv_norm</code>→<code>set_swa_key_buffer_radix_fused_norm_rope</code>(融合 RMSNorm+RoPE+paged scatter 进 SWA ring)。O 路径:attn output → inverse RoPE → <code>wo_a</code> einsum → <code>wo_b</code> → 可选 attn_tp all-reduce。compressor/indexer 在 <code>SGLANG_OPT_USE_MULTI_STREAM_OVERLAP</code> 时跑在 alt stream。</p>
+
+<div class="mermaid">
+graph LR
+  subgraph Q["Q 路径"]
+    Q1[wq_a: hidden→q_lora] --> Q2[q_norm] --> Q3[wq_b: →64*512] --> Q4["fused_q_norm_rope"]
+  end
+  subgraph KV["KV 路径 → SWA ring"]
+    K1[wkv: hidden→head_dim] --> K2[kv_norm] --> K3["set_swa_key_buffer_radix_fused_norm_rope<br/>RMSNorm+RoPE+paged scatter"]
+    K3 --> RING["SWA ring buffer<br/>kv_buffer[layer]<br/>window=128, paged"]
+  end
+  Q4 --> ATN["RadixAttention MQA<br/>num_kv_heads=1"]
+  RING --> ATN
+  ATN --> O1[wo_a einsum] --> O2[wo_b] --> O3[可选 all-reduce]
+</div>
+<div class="fig-cap">图 1.1 — DSV4 Flash 注意力:Q/KV/O 路径与 SWA ring 写入(融合 norm+RoPE)</div>
+
+<h3 id="m1-moe">1.3 Decoder 层 + mHC 混合 + MoE</h3>
+<p>每层结构(<a class="file-link" href="python/sglang/srt/models/deepseek_v4.py">deepseek_v4.py:1493-1875</a>):<code>mhc_pre(attn) → input_layernorm → self_attn → mhc_post → mhc_pre(ffn) → post_attention_layernorm → MoE → mhc_post</code>。mHC(multi-head compression)混合由 <code>make_hc_mixing_params</code> 参数化,<code>hc_pre</code> 经 RMSNorm+线性混合+<code>hc_split_sinkhorn</code>(Sinkhorn 平衡路由)产出 pre/post/comb;<code>hc_post</code> 重组 <code>post*x + comb*residual</code>。开启 <code>SGLANG_OPT_FUSE_MHC_POST_PRE</code> 时,<code>mhc_fused_post_pre</code> 把上一层的 hc_post 与本层 hc_pre+norm 融合,跨层携带 (residual, post, comb)。</p>
+<p>MoE(<a class="file-link" href="python/sglang/srt/models/deepseek_v2.py">deepseek_v2.py:526-700</code></a>)复用 <code>DeepseekV2MoE</code>:256 routed + 1 shared,shared expert 在 fusion 时作为 index 256 融入列表,topk=6+1=7,路由 <code>noaux_tc</code> + <code>sqrtsoftplus</code>。</p>
+
+<h3 id="m1-capture">1.4 STAGING:target hidden 捕获(承上启下的关键)</h3>
+<p>target 在调用方指定的 layer ids(<code>dspark_layers_to_capture</code>,由 <code>set_dspark_layers_to_capture</code> 设置)捕获<strong>已完成 hidden</strong>。在 <a class="file-link" href="python/sglang/srt/models/deepseek_v4.py">deepseek_v4.py:2507-2557</a> 的逐层 eager 循环里,捕获层的 completed hidden(fused 时经 <code>layer.hc_post</code> 折叠,否则原样)做 <code>.mean(dim=1)</code>(对 hc_mult 维求均值),append 到 <code>dspark_aux_hidden_states</code>,末尾 <code>torch.cat(dim=-1)</code> 拼成 <code>[num_tokens, hidden_size*num_target_layers]</code> 作为 <code>logits_output.hidden_states</code> 返回 —— 这正是 draft stage-0 <code>main_proj</code> 的输入。</p>
+<pre><span class="file">python/sglang/srt/models/deepseek_v4.py:2507-2557 (节选)</span>
+dspark_layers_to_capture = getattr(forward_batch, <span class="s">"dspark_hidden_capture_layer_ids"</span>, None)
+<span class="k">if</span> dspark_layers_to_capture <span class="k">is</span> None:
+    dspark_layers_to_capture = self.dspark_layers_to_capture
+capture_dspark = dspark_layers_to_capture <span class="k">is not</span> None
+...
+<span class="k">for</span> i <span class="k">in</span> range(self.start_layer, self.end_layer):
+    hidden_states, prev_residual, prev_post, prev_comb = layer(...)
+    <span class="k">if</span> capture_dspark <span class="k">and</span> i <span class="k">in</span> dspark_layers_to_capture:
+        completed = layer.hc_post(...) <span class="k">if</span> use_fused <span class="k">else</span> hidden_states
+        dspark_aux_hidden_states.append(completed.mean(dim=<span class="n">1</span>))
+<span class="c"># 末尾拼接</span>
+logits_output.hidden_states = torch.cat(
+    [x.flatten(<span class="n">1</span>) <span class="k">if</span> x.ndim==<span class="n">3</span> <span class="k">else</span> x <span class="k">for</span> x <span class="k">in</span> dspark_aux_hidden_states], dim=-<span class="n">1</span>)</pre>
+
+<h3 id="m1-draft">1.5 DSpark draft 模型:DeepseekV4ForCausalLMDSpark</h3>
+<p><a class="file-link" href="python/sglang/srt/models/deepseek_v4_dspark.py">deepseek_v4_dspark.py:560-647</code></a>。关键点:</p>
+<ul>
+  <li><code>gamma == block_size == num_stages</code>(默认 fallback 到 num_hidden_layers=43)。</li>
+  <li><code>attach_shared_modules(embed_tokens, lm_head)</code> 复用 target 的 embed 和 lm_head —— draft <strong>从不训练自己的 embedding/head</strong>(权重 remap 对 <code>embed.</code>/<code>head.</code> 前缀返回 None)。</li>
+  <li>每个 stage 是 <code>DSparkV4Stage</code>(<code>DeepseekV4DecoderLayer</code> 子类,<code>is_nextn=True</code>);stage 0 额外加 <code>main_proj</code>(ReplicatedLinear <code>hidden*num_target_layers → hidden</code>)+ <code>main_norm</code> 把拼接的 target hidden 投影进 draft 隐空间;最后 stage 加 <code>norm</code>+<code>hc_head</code>。</li>
+  <li><code>_build_self_attn</code> 返回 <code>DSparkAttention</code>(不是 <code>MQALayer</code>),强制 <code>compress_ratio=0</code>(纯 SWA)、<code>fuse_wqa_wkv=False</code>。</li>
+</ul>
+
+<div class="mermaid">
+graph TD
+  subgraph T["Target: DeepseekV4ForCausalLM (43 层)"]
+    E[embed_tokens] --> L0["DecoderLayer 0..42"]
+    L0 -.捕获 aux hidden.-> CAP[dspark_aux_hidden_states]
+    CAP --> CAT["torch.cat dim=-1<br/>→ hidden_size*N"]
+    LH["hc_head+norm+lm_head"] --> TLOG[target logits]
+  end
+  subgraph D["Draft: DeepseekV4ForCausalLMDSpark"]
+    CAT --> MP["stage0: main_proj + main_norm<br/>hidden*N → hidden"]
+    MP --> CKV["CommitKvProj: 堆叠 wkv → 逐 stage kv"] --> SWA["写各 stage SWA ring"]
+    DE["draft embed mask tokens"] --> S0["Stage 0 mHC+attn+MoE"]
+    S0 --> S1["Stage 1"] --> SL["Stage N-1"]
+    SL --> CBL["compute_base_logits<br/>hc_head+norm+lm_head → x_post_hc tap"]
+    CBL --> MH["Markov head: apply_step_logits + sample_block"]
+    CBL --> CH["Confidence head on x_post_hc"]
+  end
+  MH --> DT["draft tokens + corrected logits"]
+  CH --> CONF["confidence → verify budget"]
+  DT --> TV["target verify"] --> ACC["accept/reject"]
+  E -.attach_shared_modules.-> D
+  LH -.attach_shared_modules.-> D
+</div>
+<div class="fig-cap">图 1.2 — DSV4-Flash + DSpark draft 架构:共享 embed/lm_head + target-hidden 自举 KV</div>
+
+<h3 id="m1-markov">1.6 Markov head 与 Confidence head</h3>
+<p><code>DSparkV4MarkovHead</code>(<a class="file-link" href="python/sglang/srt/models/deepseek_v4_dspark.py">deepseek_v4_dspark.py:287-414</a>)是 bigram bias head:<code>markov_w1</code>(VocabParallelEmbedding,vocab→markov_rank)把上一个 token embed 成 rank-<code>markov_rank</code> 隐向量;<code>markov_w2</code>(Linear markov_rank→vocab)投回 vocab 级 bias 加到 base logits。"rank"= Markov 近似的隐瓶颈维。采样是 semi-AR 的 <code>run_markov_block</code>(<a class="file-link" href="python/sglang/srt/models/dspark.py">dspark.py:32-62</a>):每步把上一步采样的 token 喂下一步 bias。</p>
+<pre><span class="file">python/sglang/srt/models/dspark.py:32-62 run_markov_block</span>
+<span class="k">for</span> step_idx <span class="k">in</span> range(proposal_len):
+    step_logits = head.apply_step_logits(base_logits[:, step_idx, :], token_ids=prev_tokens, ...)
+    next_tokens = sampler(step_logits, step_idx)
+    sampled_tokens.append(next_tokens)
+    prev_tokens = next_tokens</pre>
+
+<p><code>DSparkConfidenceHead</code>(<a class="file-link" href="python/sglang/srt/models/dspark.py">dspark.py:287-328</a>)是单层 Linear(<code>hidden_size + markov_rank → 1</code>),<code>apply_sts</code> 做 <code>sigmoid(confidence_raw / sts_temperatures)</code> 把原始 logit 映射到 [0,1] 生存概率。</p>
+
+<h4>compute_base_logits 的 x_post_hc tap</h4>
+<p><a class="file-link" href="python/sglang/srt/models/deepseek_v4_dspark.py">deepseek_v4_dspark.py:719-739</a> 返回 <code>(logits, x_post_hc)</code>,其中 <code>x_post_hc</code> 是 hc_head 之后、最终 norm 之前的 hidden —— 这个"抽头"直接喂给 <code>compute_confidence</code>,<strong>避免重算 hc_head+norm</strong>。它经 <code>DraftProposal.confidence_tap</code> 流到 planner。</p>
+
+<h3 id="m1-bootstrap">1.7 KV bootstrap 链路(target hidden → draft SWA KV)</h3>
+<p><a class="file-link" href="python/sglang/srt/models/deepseek_v4_dspark.py">deepseek_v4_dspark.py:649-678</a>:</p>
+<pre><span class="file">python/sglang/srt/models/deepseek_v4_dspark.py:649-678</span>
+<span class="k">def</span> <span class="n">project_target_hidden</span>(self, main_hidden):
+    stage0 = self.stages[<span class="n">0</span>]
+    projected, _ = stage0.main_proj(main_hidden)        <span class="c"># hidden*N → hidden</span>
+    <span class="k">return</span> stage0.main_norm(projected)
+
+<span class="k">def</span> <span class="n">write_target_hidden_kv</span>(self, *, main_hidden, swa_loc, positions, pool):
+    main_x = self.project_target_hidden(main_hidden)
+    kvs = CommitKvProj.execute(main_x=main_x,
+                               wkv_linears=[s.self_attn.wkv <span class="k">for</span> s <span class="k">in</span> self.stages])
+    <span class="k">for</span> stage, kv <span class="k">in</span> zip(self.stages, kvs):
+        attn = stage.self_attn
+        pool.set_swa_key_buffer_radix_fused_norm_rope(layer_id=attn.layer_id, swa_loc=swa_loc,
+            kv=kv, kv_weight=attn.kv_norm.weight.data, eps=attn.eps,
+            freqs_cis=attn.freqs_cis, positions=positions)</pre>
+
+<p><code>CommitKvProj</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/kernels/dspark_draft_model.py">kernels/dspark_draft_model.py:207-271</a>)把所有 stage 的 <code>wkv</code> ReplicatedLinear <code>torch.cat(dim=0)</code> 堆成<strong>一个</strong> GEMM,一次算出全部 stage 的 KV,再按 head_dim 切片;支持 fp8 block-quant + ue8m0 scale。最终写 SWA ring 用 <code>set_swa_key_buffer_radix_fused_norm_rope</code>(<a class="file-link" href="python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py">deepseek_v4_memory_pool.py:1243-1262</a>),它 dispatch 到 <code>fused_k_norm_rope_flashmla</code>,融合 RMSNorm+RoPE+paged scatter。</p>
+
+<div class="mermaid">
+graph LR
+  subgraph W["KV 写入路径"]
+    X["target hidden (逐层)"] --> W1["wkv ReplicatedLinear<br/>hidden→head_dim"]
+    W1 --> K["raw kv head_dim"]
+    K --> F["fused_k_norm_rope_flashmla<br/>RMSNorm+RoPE+paged scatter"]
+    F --> RB["SWA ring kv_buffer[layer]<br/>paged by page_size"]
+  end
+  subgraph AR["Attention 读取"]
+    QP["q: wq_a→q_norm→wq_b<br/>+fused_q_norm_rope"] --> A["RadixAttention MQA<br/>k=v ring, window=128"]
+    RB --> A
+    A --> OO["wo_a einsum + wo_b → output"]
+  end
+</div>
+<div class="fig-cap">图 1.3 — SWA KV ring 数据流:融合写入与 MQA 读取</div>
+
+<h3 id="m1-knobs">1.8 性能开关(SGLANG_DSPARK_*)</h3>
+<p>全部在 <a class="file-link" href="python/sglang/srt/environ.py">environ.py:262-284</a>,默认值如下:</p>
+<table>
+  <thead><tr><th>Env</th><th>默认</th><th>作用</th></tr></thead>
+  <tbody>
+    <tr><td><code>SGLANG_DSPARK_FAST_KERNEL</code></td><td>True</td><td>用 <code>fused_q_norm_rope</code>/<code>fused_rope_inplace</code> 快速 CUDA kernel,否则 torch fallback</td></tr>
+    <tr><td><code>SGLANG_DSPARK_FP32_LM_HEAD</code></td><td>False</td><td>强制 fp32 lm_head matmul</td></tr>
+    <tr><td><code>SGLANG_DSPARK_OPT_MARKOV_W2_BF16</code></td><td>True</td><td>markov_w2 存 bf16</td></tr>
+    <tr><td><code>SGLANG_DSPARK_OPT_MARKOV_W2_TP_SHARD</code></td><td>True</td><td>markov_w2 按 lm_head 的 vocab TP 分片,逐步 bias 只算本地切片再 all-gather</td></tr>
+    <tr><td><code>SGLANG_DSPARK_ENABLE_MULTI_STREAM</code></td><td>True</td><td>alt stream 上重叠 kv_proj_only+_store_block_kv 与 _compute_q</td></tr>
+    <tr><td><code>SGLANG_DSPARK_FAST_SAMPLING</code></td><td>True</td><td>Triton <code>SampleStepTokens</code> online-softmax 采样器</td></tr>
+    <tr><td><code>SGLANG_DSPARK_COMPACT_CUDA_GRAPH_SYNC</code></td><td>True</td><td>compact target-verify 图回放前的 device-wide barrier(纠正 async IMA 竞态)</td></tr>
+    <tr><td><code>SGLANG_DSPARK_PD_TARGET_LAYER_IDS</code></td><td>()</td><td>PD target layer 选择覆盖</td></tr>
+    <tr><td><code>SGLANG_DSPARK_PD_HIDDEN_POOL_TOKENS</code> / <code>_RECV_POOL_TOKENS</code></td><td>None</td><td>PD hidden 发送/接收池容量</td></tr>
+  </tbody>
+</table>
+
+<!-- ================================================================ -->
+<!--                    第二模块 · DSpark 原理                          -->
+<!-- ================================================================ -->
+
+<h2 class="mod" id="m2"><span class="num">2</span>第二模块 · DSpark 详细原理</h2>
+
+<p>DSpark 是 <strong>confidence-scheduled 的自草稿推测解码</strong>:draft 与 target 共享 embed/lm_head,draft 不做独立完整前向,而是用 target 中间层 hidden 自举自己的 KV,再用 Markov 头逐 token 采样出 γ 个 draft;confidence head 对每个 draft 位置打生存概率;一个 host 侧优化把"总 verify token 预算"算成吞吐最优;Triton top-k kernel 把预算分到各请求 verify_len;compact 模式把幸存 token 压实成变长张量让 target 只 verify 有希望的 draft。核心链路在 <a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py">dspark_worker_v2.py</a> 的 <code>_forward_decode</code>。</p>
+
+<h3 id="m2-step">2.1 decode-step 全流程</h3>
+<p><code>_forward_decode</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py">dspark_worker_v2.py:551-771</a>)12 步:</p>
+<ol>
+  <li><strong>alloc_verify_window</strong>(L583):建 <code>positions_2d = prefix_lens + block_pos_offsets</code> + <code>verify_cache_loc</code>,预留 [bs, verify_w] KV 槽。</li>
+  <li><strong>PD prefill-tail 注入</strong>(L593):<code>_maybe_inject_pd_prefill_tail</code> 把 P 角色 prefill 带来的 target hidden 散进 draft KV(第三模块详解)。</li>
+  <li><strong>Draft 提案</strong>(L595):<code>proposer.propose</code> 返回 <code>DraftProposal</code>。</li>
+  <li><strong>Confidence</strong>(L608):若没 fold 进图,则 <code>compute_confidence_tensor</code>。</li>
+  <li><strong>Verify 预算</strong>(L617):<code>resolve_verify_token_budget</code> 返回总预算(overlap 时读预算;否则同步算)。</li>
+  <li><strong>schedule_layout</strong>(L631):<code>ScheduleVerifyLensTopk</code> 把预算转 per-req verify_len,建 <code>RaggedVerifyLayout</code>(compact)或 None(static)。</li>
+  <li><strong>build verify ids</strong>(L642):<code>[bonus, draft_1..γ]</code>。</li>
+  <li><strong>fold 判定</strong>(L654)。</li>
+  <li><strong>Target verify</strong>(L660):<code>run_compact</code> 或 <code>run_non_compact</code>。</li>
+  <li><strong>accept_and_finalize</strong>(L688):返回 correct_len/bonus/commit_lens。</li>
+  <li><strong>hidden commit/回写</strong>(L709):若没 fold,把接受的 target hidden 注回 draft KV,保持 draft 存活。</li>
+  <li><strong>observe + next draft input</strong>(L723):<code>make_next_draft_input(bonus, new_seq_lens)</code>。</li>
+</ol>
+
+<div class="mermaid">
+flowchart TD
+  A["_forward_decode entry"] --> B["alloc_verify_window<br/>positions_2d + verify_cache_loc_2d"]
+  B --> PD["_maybe_inject_pd_prefill_tail<br/>(仅 PD,首步)"]
+  PD --> C["proposer.propose<br/>draft forward + sample_draft_block → draft_tokens"]
+  C --> D{"confidence 已 fold 进图?"}
+  D -->|否| E["compute_confidence_tensor<br/>cumprod 生存概率 sigmoid/T"]
+  D -->|是| F["读 epilogue buffer 的 folded confidence"]
+  E --> G["resolve_verify_token_budget<br/>tau_star = N + cumsum(sorted survival)<br/>theta = tau_star/step_time; argmax"]
+  F --> G
+  G --> H["schedule_layout<br/>ScheduleVerifyLensTopk: 预算 → per-req verify_len (top-k)"]
+  H --> I{"run_compact?"}
+  I -->|是| J["run_compact: 压实幸存者成 ragged 张量<br/>target forward on graph_num_tokens"]
+  I -->|否| K["run_non_compact: 固定 bs×verify_w grid forward"]
+  J --> L["accept_and_finalize<br/>AcceptGreedy/Sampling/SelectMixed<br/>→ correct_len + bonus"]
+  K --> L
+  L --> M{"folded_commit?"}
+  M -->|是| N["commit 已在图内经 DsparkVerifyEpilogue._commit_inject"]
+  M -->|否| O["commit_hidden: 注 strided hidden → draft KV<br/>via write_target_hidden_kv"]
+  O --> P["make_next_draft_input: bonus + new_seq_lens"]
+  N --> P
+  P --> Q["GenerationBatchResult"]
+</div>
+<div class="fig-cap">图 2.1 — DSpark decode-step 全流程(compact vs non-compact、folded vs eager 分支点)</div>
+
+<h3 id="m2-draft">2.2 Draft 提案</h3>
+<p><code>DraftBlockProposer.propose</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_draft.py">dspark_draft.py:262</a>)。<code>_run_forward</code>(L355)把 draft 输入网格填成 [bs, gamma]:第 0 列是上一步 bonus(anchor),其余填 mask token(噪声),跑 draft backbone 得 <code>draft_hidden_3d</code>。采样两条路:</p>
+<ul>
+  <li><strong>Folded</strong>(L289):<code>can_run_graph && all_greedy</code> 时,sampling 已在 draft CUDA graph 内经 <code>DsparkDraftSampler</code> capture-tail hook 完成,直接读 buffer。</li>
+  <li><strong>Eager</strong>(L310):<code>compute_base_logits</code> → <code>sample_draft_block</code>。</li>
+</ul>
+<p><code>write_target_hidden_kv</code> 每步经 <code>commit_hidden</code> 调用,把 target 接受的 hidden 投影+CommitKvProj+norm+RoPE 写进 draft KV —— 这是 draft KV 的<strong>续命机制</strong>,让 draft KV 始终镜像 target 接受的轨迹。</p>
+
+<div class="mermaid">
+sequenceDiagram
+  participant W as DSparkWorkerV2
+  participant P as DraftBlockProposer
+  participant D as Draft Model
+  participant M as MarkovHead
+  participant CH as ConfidenceHead
+  W->>P: propose(batch, draft_input)
+  P->>D: _run_forward: embed[mask tokens] → backbone → raw_hidden
+  P->>D: compute_base_logits(raw_hidden) → (base_logits, x_post_hc)
+  P->>M: sample_block(base_logits, anchor, hidden, sampler)
+  loop gamma 步 semi-AR
+    M->>M: apply_step_logits(base[:,step], prev_tokens) + step_bias
+    M->>M: sampler(step_logits, step) → next_token
+    M-->>M: prev_tokens = next_token
+  end
+  M-->>P: draft_tokens [bs,gamma], corrected_logits
+  P->>CH: compute_confidence(x_post_hc, anchor, draft_tokens)
+  CH-->>P: confidence [bs,gamma] in (0,1)
+  P-->>W: DraftProposal(draft_tokens, draft_hidden, confidence, confidence_tap)
+  W->>W: resolve_verify_token_budget(confidence)
+</div>
+<div class="fig-cap">图 2.2 — Draft 提案 + Markov semi-AR 采样 + confidence 计算时序</div>
+
+<h3 id="m2-budget">2.3 Confidence-scheduled verify budget(核心创新)</h3>
+<p>三段:算 confidence(生存)→ host 优化算总预算 → Triton top-k 分配到 per-req verify_len。</p>
+
+<h4>(a) compute_confidence — 生存概率</h4>
+<p><a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_planner.py">dspark_planner.py:918</a>。<code>DSparkConfidenceHead</code> 输出 per-(req,position) 标量 logit,<code>apply_sts</code>(<a class="file-link" href="python/sglang/srt/models/dspark.py">dspark.py:326</a>)做 <code>sigmoid(confidence_raw / sts_temperatures)</code>,得到 [0,1] 生存概率 P(draft token i 被 target 接受 | 历史)。</p>
+
+<h4>(b) compute_verify_token_budget — 优化</h4>
+<p><a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_planner.py">dspark_planner.py:971-1008</a>。给定 <code>history_survival_probs [N, max_len]</code>(经 lag/refresh):</p>
+<pre><span class="file">python/sglang/srt/speculative/dspark_components/dspark_planner.py:971-1008 (核心)</span>
+candidates = history_survival_probs[:, :max_len].flatten()
+candidates = candidates[candidates &gt;= survival_eps].to(float64)
+candidates_sorted = torch.sort(candidates, descending=<span class="k">True</span>).values
+prefix_sum = torch.cumsum(candidates_sorted, dim=<span class="n">0</span>)
+<span class="c"># tau_star[k] = N + 最大的 k 个生存概率之和</span>
+tau_star = num_requests + torch.cat([torch.zeros(<span class="n">1</span>), prefix_sum])
+<span class="c"># 最大化吞吐比 theta = 期望接受 token 数 / step_time</span>
+<span class="c"># 加性模型: step_time[k] = bias + alpha(N) + theta(N+k)</span>
+<span class="c">#   → theta_ratio[k] = tau_star[k] / step_time[k]; idx = argmax</span>
+<span class="c"># 简单 SPS 表: sps[k] = lookup(N+k)</span>
+<span class="c">#   → theta_ratio[k] = tau_star[k] * sps[k]; idx = argmax</span>
+budget = idx   <span class="c"># 总 extra verify token 数(在 per-req floor 之上)</span></pre>
+
+<p><code>tau_star[k]</code> = 若验证生存概率最高的 k 个 (req,position) 槽位的期望接受数:N(每请求一个 bonus)+ top-k 生存概率之和。argmax 选吞吐最优预算。</p>
+
+<h4>(c) HostConfidenceBudgetPlanner — relay lag</h4>
+<p><a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_planner.py">dspark_planner.py:1040-1135</a>。overlap 调度下 confidence 滞后用:<code>_shift_to_lag</code> 用 carry ring 取 <code>lag_steps</code> 前的 confidence;<code>_two_steps_prior_survival</code> 做 <code>cumprod(lagged_confidence, dim=1)</code> 得前缀生存,<code>fresh = (current_gen &gt;=1) & (lagged_gen == current_gen)</code> 对新生请求(刚 prefill)置生存=1.0(verify-all),避免冷启动误判。</p>
+
+<h4>(d) ScheduleVerifyLensTopk — Triton top-k 分配</h4>
+<p><a class="file-link" href="python/sglang/srt/speculative/dspark_components/kernels/dspark_schedule.py">dspark_schedule.py:19</a>,三个 kernel:</p>
+<ol>
+  <li><code>_schedule_topk_prep_kernel</code>:每请求 cumprod(confidence) → survival[bs,cols],清零 selected_extra。</li>
+  <li><code>_schedule_topk_selected_extra_kernel</code>:全局 top-k。每个 block 用计数比较 <code>gt | (eq & (pos_lt | (pos_eq & req_lt)))</code> 算候选的 rank,<code>selected = valid & (rank &lt; budget)</code>,<code>atomic_add(selected_extra[r], selected)</code> 把每个 extra 槽分给拥有最高生存候选的请求。</li>
+  <li><code>_schedule_topk_finalize_kernel</code>:<code>verify_lens = clamp(min_verify_len + selected_extra, lb, max_len)</code>。</li>
+</ol>
+<p>结果 <code>verify_lens[bs]</code> 跨 TP rank broadcast(L618)保证各 rank 选同一图层级。<code>min_verify_len=1</code>(anchor 必验),<code>max_verify_len=gamma+1</code>。</p>
+
+<div class="mermaid">
+sequenceDiagram
+  participant W as DSparkWorkerV2
+  participant P as HostConfidenceBudgetPlanner
+  participant S as SpsCostTable
+  participant T as ScheduleVerifyLensTopk (Triton)
+  participant V as TargetVerifyExecutor
+  Note over W: step t: draft 产出 confidence[bs,gamma]
+  W->>P: compute_budget(confidence, generation, current_generation)
+  P->>P: _shift_to_lag (carry ring, overlap lag)
+  P->>P: _two_steps_prior_survival: cumprod(lagged); fresh? survival : 1.0
+  P->>P: compute_verify_token_budget(survival, sps_table)
+  Note over P: flatten survival, sort desc, cumsum → prefix_sum<br/>tau_star[k] = N + (k==0?0:prefix_sum[k-1])
+  alt SpsAdditiveCostTable
+    P->>S: step_time = bias + alpha(N) + theta(N+k)
+    Note over P: theta_ratio[k] = tau_star[k]/step_time[k]
+  else SpsCostTable
+    P->>S: sps = lookup(N+k)
+    Note over P: theta_ratio[k] = tau_star[k] * sps[k]
+  end
+  P->>P: budget = argmax_k(theta_ratio)
+  P-->>W: budget (总 extra verify token 数)
+  W->>T: ScheduleVerifyLensTopk.execute(confidence, budget)
+  T->>T: prep: cumprod → survival[bs,cols]
+  T->>T: selected_extra: top-k by survival, atomic_add per row
+  T->>T: finalize: verify_len = clamp(min+extra, lb, max)
+  T-->>W: verify_lens[bs]
+  W->>V: schedule_layout(verify_lens) → RaggedVerifyLayout
+</div>
+<div class="fig-cap">图 2.3 — Confidence → budget → per-req verify_len 分配(host 优化 + SPS 表 + Triton top-k)</div>
+
+<h3 id="m2-verify">2.4 Verify 与接受策略</h3>
+<p><code>accept_and_finalize</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_verify.py">dspark_verify.py:108</a>)。<code>verify_accept_can_be_folded</code>(L68)= <code>is_all_greedy and verify_logits_adjustments_are_noop</code>(无 grammar/penalty/logit processor/vocab mask/logit_bias)。三种接受策略(<code>accept_draft_tokens</code> L681):</p>
+<table>
+  <thead><tr><th>策略</th><th>适用</th><th>机制</th></tr></thead>
+  <tbody>
+    <tr><td><code>AcceptGreedy</code></td><td>全 greedy batch</td><td><code>target_predict=argmax</code>;<code>matches = candidates[:,1:]==target_predict[:,:-1]</code>;<code>correct_len=cumprod(matches).sum</code>;<code>bonus=target_predict[arange, correct_len]</code>;有 verify_len 时 <code>CapCorrectLen</code> 截断</td></tr>
+    <tr><td><code>AcceptSampling</code></td><td>全采样 batch</td><td>标准 rejection sampling(<code>chain_speculative_sampling_triton</code>+ uniform samples)</td></tr>
+    <tr><td><code>SelectMixedAccept</code></td><td>混合 batch</td><td>同时跑 Greedy 和 Sampling,按 <code>greedy_mask</code> 逐请求选取</td></tr>
+  </tbody>
+</table>
+<p><code>FinalizeAcceptLens</code>:<code>commit_lens = correct_len+1</code>(+1 是 bonus),<code>new_seq_lens = prefix_lens + commit_lens</code>。<code>commit_hidden</code>(L308):non-compact 走 <code>inject_target_hidden</code> 只写已 commit 位置;compact 走 <code>inject_ragged</code> 用 <code>BuildCommitInjectLayout</code> 映射 strided→SWA loc 再 <code>write_target_hidden_kv</code>。</p>
+
+<h3 id="m2-compact">2.5 Compact ragged 模式</h3>
+<p><code>RaggedVerifyMode</code>(<a class="file-link" href="python/sglang/srt/speculative/ragged_verify.py">ragged_verify.py:13</a>):<code>static</code>(默认)/<code>cap-accept</code>/<code>compact</code>。</p>
+<ul>
+  <li><strong>static</strong>:无 ragged 调度,固定 [bs, verify_w] grid 全验,不需要 confidence head。</li>
+  <li><strong>cap-accept</strong>:调度 per-req verify_len 但仍跑固定 grid,<code>CapCorrectLen</code> 截断接受长度(低置信请求浪费算力)。</li>
+  <li><strong>compact</strong>:调度 per-req verify_len <strong>且</strong>只把幸存者压实成 <code>graph_num_tokens</code> 的连续张量,target 只算 <code>total_verify_tokens</code> 个真实 token(pad 到捕获图 bucket)。</li>
+</ul>
+<p><code>run_compact</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_verify.py">dspark_verify.py:378</a>):<code>BuildRaggedVerifyWindow</code> 用 <code>compact_row_index</code>(cumsum verify_lens + searchsorted)把每个 flat slot 映射回 (req_id, within);target forward 用变长 cu_seqlens;<code>ScatterCompactToStrided</code> 把 compact logits/hidden 散回 strided 给 accept kernel。</p>
+<div class="callout warn"><strong>compact 必需 SGLANG_PREP_IN_CUDA_GRAPH=1</strong>
+<code>_require_prep_in_cuda_graph</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_planner.py">dspark_planner.py:206</a>)在 mode != static 且该 env 为 false 时 raise:捕获图的 prepare 路径必须跑在图内,否则 per-step <code>verify_lens_cpu</code> 的 host 读会上关键路径。env 默认 True。</div>
+<div class="callout warn"><strong>compact + dense draft + DP attention 不支持 cuda graph</strong>
+<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py">dspark_worker_v2.py:173-185</a>:空闲 DP group 无法加入 token-keyed compact 图,须 <code>--disable-cuda-graph</code> 或 static。DSV4 MoE draft 豁免(DP sync 走 MoE all-reduce,不走 compact 图)。</div>
+
+<h3 id="m2-graph">2.6 CUDA Graph folding</h3>
+<p>两个 capture-tail hook 把 host 逻辑塞进图:</p>
+<table>
+  <thead><tr><th>折叠点</th><th>机制</th><th>条件</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Draft 采样折叠</strong></td><td><code>DsparkDraftSampler</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_draft.py">dspark_draft.py:58</a>)挂 draft graph capture-tail,图内算 base_logits + greedy sample + confidence 写 buffer</td><td>cuda graph on, gamma&gt;0, 有 compute_base_logits + markov_head, all_greedy</td></tr>
+    <tr><td><strong>Verify 接受折叠</strong></td><td><code>DsparkVerifyEpilogue</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_verify.py">dspark_verify.py:476</a>)挂 target graph capture-tail:scatter compact→strided、accept_greedy、finalize、<strong>commit hidden 回写</strong>(<code>folds_commit</code> 时)</td><td>compact + cuda graph + CUDA + greedy + 无 logits 调整</td></tr>
+  </tbody>
+</table>
+<p><code>folds_commit</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_verify.py">dspark_verify.py:554</code>):<code>commit_ctx is not None and hasattr(pool, 'set_swa_key_buffer_radix_fused_norm_rope')</code> —— 只有 DSV4 SWA pool 支持融合注入。inject 受 <code>inject_gate_buf</code>(仅 fold_eligible 时 arm=1)门控,使捕获了 epilogue 的图在采样请求时仍能走 eager accept。强制 eager 的条件:任何采样请求、任何 logits 调整、<code>SGLANG_SIMULATE_ACC_LEN&gt;0</code>、draft sampler 未建、<code>can_run_graph=False</code>、compact layout 超出捕获 grid、低显存(&lt;1GB)。</p>
+
+<h3 id="m2-sps">2.7 SPS/STS 离线标定</h3>
+<p><strong>SpsCostTable</strong>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_sps.py">dspark_sps.py:14</a>):冻结的 (batch_tokens probes, steps_per_sec) 表,<code>lookup</code> 用 bisect。<strong>未标定表</strong>(单探测 [1]→[1.0])会让 compact 退化为 verify-all(零调度收益),planner 记 warning。</p>
+<p><strong>SpsAdditiveCostTable</strong>(L62):加性模型 <code>step_time = bias + alpha(bs) + theta(m)</code>,m = N+budget。<code>load_sps_table_from_path</code> 按 JSON 是否含 <code>bias_seconds</code> 选变体。profiler(<code>profile_sps_table</code> L106)在 staged batch-token tier 跑 target verify 记 steps/sec;加性模型在 (bs,m) 2D grid 拟合。表经 <code>--speculative-dspark-sps-table-path</code> 传入。</p>
+<p><strong>STS</strong>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_sts.py">dspark_sts.py:9</a>):per-position 温度向量(长 gamma),<code>apply_sts</code> 做 <code>sigmoid(raw/T)</code>。<code>StsDataRecorder</code>(L39)录 (confidence_raw, num_correct_drafts) prefix mask 落盘 shard;离线 Platt scaling 拟合温度。<strong>不影响无损性</strong>,只校准生存概率供 budget 决策。表 γ 须与运行时 γ 一致。</p>
+
+<!-- ================================================================ -->
+<!--                    第三模块 · PD 分离视角                          -->
+<!-- ================================================================ -->
+
+<h2 class="mod" id="m3"><span class="num">3</span>第三模块 · PD 分离视角:DSV4-Flash + DSpark</h2>
+
+<p>PD(prefill-decode)分离把一个逻辑服务拆成 prefill 和 decode 两个独立进程(各自是完整的 Scheduler+engine)。本模块详解在此模式下 DSV4-Flash + DSpark 的<strong>计算模型、通信模型、KV Cache 模型</strong>,核心是 draft KV 如何在 decode 端 bootstrap。</p>
+
+<h3 id="m3-arch">3.1 PD 拓扑与协调</h3>
+<p>一个独立的 HTTP bootstrap server(<code>CommonKVBootstrapServer</code>,<a class="file-link" href="python/sglang/srt/disaggregation/common/conn.py">common/conn.py:1407</a>)是全局协调者:prefill rank PUT <code>/route</code> 注册拓扑(attn_tp/cp/dp/pp + rank_ip:rank_port + page_size + kv_cache_dtype);decode GET <code>/route</code> 取 <code>PrefillServerInfo</code> 解析确定性 TP/CP/PP rank 映射。</p>
+<ul>
+  <li><strong>控制面</strong>:ZMQ PUSH/PULL,传小元数据(kv_indices、aux_index、decode_prefix_len、spec_metadata、abort)。</li>
+  <li><strong>数据面</strong>:backend 特定。Mooncake 用 TransferEngine(RDMA/NVLink,<code>NVLinkAllocator</code>/<code>BarexAllocator</code>);也支持 NIXL/ASCEND/MORI/FAKE。<strong>DSPARK_HIDDEN state 类型只 Mooncake 和 Fake 实现</strong>(<a class="file-link" href="python/sglang/srt/managers/scheduler.py">scheduler.py:1216-1223</a>,NIXL/Ascend/Mori raise NotImplementedError)。</li>
+</ul>
+<p>decode 侧请求生命周期(decode.py:1-19 模块 docstring):PreallocQueue → TransferQueue → WaitingQueue(建 <code>PrebuiltExtendBatch</code>,跳过 prefill forward)→ RunningBatch。DSpark 新增 <code>StateType.DSPARK_HIDDEN = "dspark_hidden"</code>(<a class="file-link" href="python/sglang/srt/disaggregation/base/conn.py">base/conn.py:28</a>)承载 target-hidden 行。</p>
+
+<div class="mermaid">
+flowchart TB
+  subgraph RT["Global Router / Bootstrap Server"]
+    BS["CommonKVBootstrapServer<br/naiohttp :disaggregation_bootstrap_port)<br/>PUT /route 注册 prefill rank<br/>GET /route 返回 rank_ip:rank_port<br/>store: dp→cp→tp→pp→PrefillRankInfo"]
+  end
+  subgraph PW["Prefill Worker (进程 A, GPU A)"]
+    PBQ["PrefillBootstrapQueue"]
+    PFR["SchedulerDisaggregationPrefillMixin"]
+    PMR["ModelRunner forward<br/>CaptureHiddenMode.FULL"]
+    PHP["dspark_hidden_pool (发送)<br/>DSparkHiddenRowPool on cuda"]
+    PSEND["MooncakeKVSender.send<br/>TransferEngine RDMA/NVLink"]
+    PBQ --> PFR --> PMR
+    PMR -- "captured aux hidden" --> PHP
+    PHP --> PSEND
+  end
+  subgraph DW["Decode Worker (进程 B, GPU B)"]
+    DPQ["DecodePreallocQueue"]
+    DTQ["DecodeTransferQueue"]
+    DMR["Scheduler event_loop_normal_disagg_decode"]
+    DHP["dspark_hidden_pool (接收)<br/>DSparkHiddenRowPool on cuda"]
+    DRCV["MooncakeKVReceiver<br/>state_data_ptrs 注册到 engine"]
+    DSKW["DSparkWorkerV2<br/>_maybe_inject_pd_prefill_tail<br/>TargetHiddenKvInjector"]
+    DPQ -- "alloc recv rows + send_metadata" --> BS
+    BS -- "route rank info" --> PBQ
+    DPQ --> DTQ --> DMR --> DSKW
+    DRCV --> DHP
+    DHP -- "read(indices)" --> DSKW
+  end
+  PSEND -. "RDMA write KV + DSPARK_HIDDEN" .-> DRCV
+  BS -. "HTTP 元数据交换" .-> DPQ
+  PBQ -. "register PUT /route" .-> BS
+</div>
+<div class="fig-cap">图 3.1 — PD 拓扑:prefill/decode 独立进程 + bootstrap server + 双 DSparkHiddenRowPool(Mooncake RDMA 桥接)</div>
+
+<h3 id="m3-problem">3.2 核心问题与 DSPark 解法</h3>
+<div class="callout bad"><strong>核心矛盾</strong>
+DSpark draft 在 decode worker 上跑,但 decode worker <strong>从不跑 target prefill forward</strong>,所以 target 中间层 hidden —— 那个种子 draft KV 的东西 —— 在 decode 端根本不存在。非 PD 时 draft 可复用同一 forward 里 target 刚算出的 hidden;PD 下这条路断了。</div>
+<p>DSPark 三段解:</p>
+<ol>
+  <li><strong>Prefill 端捕获</strong>:<code>_prepare_dspark_hidden_capture_for_batch</code>(<a class="file-link" href="python/sglang/srt/disaggregation/prefill.py">prefill.py:1298-1332</a>)设 <code>batch.capture_hidden_mode = CaptureHiddenMode.FULL</code> + <code>dspark_hidden_capture_layer_ids</code>。DSV4 forward 在逐层 eager 循环里(<a class="file-link" href="python/sglang/srt/models/deepseek_v4.py">deepseek_v4.py:2507-2557</a>,<strong>捕获时显式禁用 TBO</strong> L2519,因为 TBO 无法暴露逐层 completed hidden)对每个 target layer append <code>completed.mean(dim=1)</code>,末尾拼接成 <code>logits_output.hidden_states</code>。</li>
+  <li><strong>跨进程传输</strong>:<code>process_batch_result_disagg_prefill</code> → <code>_write_dspark_hidden_rows_for_batch</code>(<a class="file-link" href="python/sglang/srt/disaggregation/prefill.py">prefill.py:1421-1542</a>)把捕获张量切片到 <code>[hidden_start, hidden_start+hidden_len)</code> 写进发送侧 <code>DSparkHiddenRowPool</code>,sender 作为 <code>StateType.DSPARK_HIDDEN</code> 发出。</li>
+  <li><strong>Decode 端注入</strong>:首步 <code>_forward_decode</code> → <code>_maybe_inject_pd_prefill_tail</code>(<a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py">dspark_worker_v2.py:488-527</a>)按 valid length flatten tail-hidden,算 positions,从 <code>req_to_token</code> 解析 cache_loc,调 <code>TargetHiddenKvInjector.inject_target_hidden</code> 写 draft SWA KV。</li>
+</ol>
+
+<h3 id="m3-window">3.3 hidden 传输窗口——限到 draft SWA 窗口</h3>
+<p><a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py">dspark_worker_v2.py:282-296</a>:</p>
+<pre><span class="file">python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py:282-296</span>
+<span class="k">def</span> <span class="n">get_pd_hidden_transfer_window_size</span>(self):
+    <span class="k">if not</span> self._draft_is_moe:
+        <span class="k">return</span> None            <span class="c"># 非 DSV4 MoE draft:保守传全上下文</span>
+    window_size = getattr(self.draft_model_runner.model_config, <span class="s">"window_size"</span>, None)
+    <span class="k">if</span> window_size <span class="k">is</span> None <span class="k">or</span> int(window_size) &lt;= <span class="n">0</span>:
+        <span class="k">return</span> None
+    <span class="k">return</span> int(window_size)   <span class="c"># DSV4: 返回 128</span></pre>
+<p>DSV4 draft 的 attention KV 存在 window_size=128 的 SWA ring 里,<strong>超过窗口的 hidden 在首步 decode 前就被 ring 覆盖</strong>,传过去是浪费内存和带宽。<code>_resolve_dspark_hidden_transfer_range</code>(<a class="file-link" href="python/sglang/srt/disaggregation/decode.py">decode.py:118-143</a>):</p>
+<pre><span class="file">python/sglang/srt/disaggregation/decode.py:118-143</span>
+hidden_start = decode_prefix_len                  <span class="c"># 默认:传 decode prefix 之后全部</span>
+draft_context_window = None
+get_window_size = getattr(draft_worker, <span class="s">"get_pd_hidden_transfer_window_size"</span>, None)
+<span class="k">if</span> get_window_size <span class="k">is not</span> None:
+    resolved_window = get_window_size()
+    <span class="k">if</span> resolved_window <span class="k">is not</span> None <span class="k">and</span> int(resolved_window) &gt; <span class="n">0</span>:
+        draft_context_window = int(resolved_window)
+        hidden_start = max(decode_prefix_len, prompt_len - draft_context_window)
+<span class="k">return</span> hidden_start, prompt_len - hidden_start, draft_context_window</pre>
+<p>prefill 侧 <code>_validate_dspark_hidden_range</code>(<a class="file-link" href="python/sglang/srt/disaggregation/prefill.py">prefill.py:472-508</a>)做镜像校验,两边必须对齐,不一致 abort。prefill 端池容量也对应封顶 <code>2 * max_running_requests * window_size</code>(<a class="file-link" href="python/sglang/srt/managers/scheduler.py">scheduler.py:1253-1256</a>),避免 64K 窗口下每 rank 浪费 >1GiB。</p>
+
+<h3 id="m3-inject">3.4 注入双路径(TargetHiddenKvInjector)</h3>
+<p><a class="file-link" href="python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py">dspark_kv_inject.py:33-80</a> 按 <code>hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")</code> 分流:</p>
+<pre><span class="file">python/sglang/srt/speculative/dspark_components/dspark_kv_inject.py:60-105 (节选)</span>
+pool = self.draft_model_runner.token_to_kv_pool
+<span class="k">if</span> hasattr(pool, <span class="s">"set_swa_key_buffer_radix_fused_norm_rope"</span>):
+    self._inject_mla(pool=pool, target_hidden=target_hidden, ...)   <span class="c"># DSV4 路径</span>
+    <span class="k">return</span>
+<span class="k">with</span> torch.inference_mode():
+    self.draft_model.write_target_hidden_kv(target_hidden=..., pool=pool, ...)  <span class="c"># 通用路径</span>
+
+<span class="c"># _inject_mla (L82-105)</span>
+swa_loc = pool.translate_loc_from_full_to_swa(cache_loc).to(torch.int32)   <span class="c"># full→SWA 槽</span>
+<span class="c"># 可选用 commit_lens mask 未 commit 槽为 -1</span>
+self.draft_model.write_target_hidden_kv(main_hidden=target_hidden, swa_loc=swa_loc,
+                                       positions=positions, pool=pool)</pre>
+<p>MLA/SWA 路径(DSV4):<code>translate_loc_from_full_to_swa</code> 把全序列 cache_loc 映射到 SWA ring 槽,然后 <code>write_target_hidden_kv</code> → <code>project_target_hidden</code> + <code>CommitKvProj</code> + 逐 stage <code>set_swa_key_buffer_radix_fused_norm_rope</code>(融合 norm+RoPE+paged scatter)。通用路径:非 MLA draft 直接写标准 paged KV。</p>
+
+<h3 id="m3-seq">3.5 完整 bootstrap 时序(最重要)</h3>
+<div class="mermaid">
+sequenceDiagram
+  participant U as Client
+  participant R as Router
+  participant BS as BootstrapServer
+  participant P as PrefillWorker
+  participant D as DecodeWorker
+  participant DR as DSparkWorkerV2
+  U->>R: POST /generate
+  R->>D: route to decode worker
+  D->>D: DecodePreallocQueue.add: create CommonKVReceiver
+  D->>BS: receiver.init: fetch PrefillServerInfo (/route)
+  D->>BS: send_metadata(kv_indices, aux_index, state_indices,<br/>decode_prefix_len, spec_metadata{hidden_start,hidden_len,<br/>hidden_size,dst_indices,pp_slices,target_layer_ids})
+  BS->>P: forward metadata via ZMQ PUSH
+  P->>P: _finalize_dspark_hidden_bootstrap: 校验 range,<br/>alloc src_indices, set dspark_hidden_capture_layer_ids,<br/>dspark_prefill_recompute_start=hidden_start
+  P->>BS: sender.init (ack ready)
+  BS->>D: KVPoll.WaitingForInput
+  D->>D: pre_alloc KV slots (skip [0,decode_prefix_len))
+  P->>P: get_next_disagg_prefill_batch:<br/>_prepare_dspark_hidden_capture sets capture_hidden_mode=FULL
+  P->>P: model forward: 逐层 eager (TBO 禁用)<br/>capture completed.mean(dim=1) at target layers
+  P->>P: process_batch_result_disagg_prefill:<br/>slice [hidden_start, +hidden_len) → pool.write(src_indices, hidden)
+  P->>P: send_kv: _dspark_hidden_payload() → state_indices[ DSPARK_HIDDEN ]=src_indices;<br/>record cuda source_event for overlap
+  P->>D: MooncakeKVSender.send: TransferEngine.transfer (RDMA/NVLink)<br/>写 KV pages + DSPARK_HIDDEN rows 进 decode 注册 buffer
+  D->>D: DecodeTransferQueue.poll until KVPoll.Success
+  D->>D: pop_preallocated: read cached_tokens;<br/>read dspark_hidden_pool(dst_indices) → hidden tensor;<br/>_validate_dspark_hidden_tensor (NaN/Inf/zero/abnorm)
+  D->>D: set req.prefill_tail_hidden_states_tensor,<br/>prefill_tail_valid_mask, prefill_tail_hidden_start
+  D->>D: get_new_prebuilt_batch: prepare_for_prebuilt (跳过 prefill forward, 仅元数据)
+  D->>D: merge into running_batch
+  D->>DR: _forward_decode → _maybe_inject_pd_prefill_tail
+  DR->>DR: flatten tail_hidden by valid lengths;<br/>pos = start_positions + offsets;<br/>cache_loc = req_to_token[req_pool_idx, pos]
+  DR->>DR: TargetHiddenKvInjector.inject_target_hidden
+  alt DSV4 MLA/SWA ring (pool 有 set_swa_key_buffer_radix_fused_norm_rope)
+    DR->>DR: _inject_mla: translate_loc_from_full_to_swa;<br/>write_target_hidden_kv → CommitKvProj + 融合 norm+RoPE 进 SWA ring
+  else 通用 draft
+    DR->>DR: draft_model.write_target_hidden_kv(target_hidden, pool, positions, cache_loc)
+  end
+  DR->>DR: draft KV 已 bootstrap; _proposer.propose 可运行
+  DR-->>D: verify draft tokens vs target; 输出接受 token
+</div>
+<div class="fig-cap">图 3.2 — 完整 prefill→decode DSpark hidden bootstrap 时序(命名每个函数与异步/overlap 点)</div>
+
+<h3 id="m3-comm">3.6 通信模型</h3>
+<p>两类数据跨进程:</p>
+<table>
+  <thead><tr><th>类别</th><th>内容</th><th>机制</th></tr></thead>
+  <tbody>
+    <tr><td><strong>KV cache pages</strong></td><td>正常 PD 转移,prefill <code>token_to_kv_pool</code> 的子集 <code>[decode_prefix_len, prompt_len)</code></td><td>page-by-page <code>TransferEngine.transfer</code>(<a class="file-link" href="python/sglang/srt/disaggregation/mooncake/conn.py">mooncake/conn.py:649-655</a>),buffer 注册到 engine</td></tr>
+    <tr><td><strong>DSPARK_HIDDEN rows</strong></td><td>每行 <code>n_target_layers * hidden_size</code> float,DSV4 64K 窗口下几百 MB</td><td><code>_send_dspark_hidden_packet</code>(<a class="file-link" href="python/sglang/srt/disaggregation/mooncake/conn.py">mooncake/conn.py:1410-1477</a>)flat positional copy <code>force_flat=True, force_positional=True</code>:src_indices 行 1:1 拷到 dst_indices 行</td></tr>
+  </tbody>
+</table>
+<p><strong>overlap</strong>:prefill 在 compute stream 录 CUDA <code>source_event</code> 挂到 sender(<a class="file-link" href="python/sglang/srt/disaggregation/prefill.py">prefill.py:2266-2268</a>),RDMA issue 等 <code>pool.write</code> 落地再发;decode 侧 poll 非阻塞,只在 <code>KVPoll.Success</code> 后 read+inject,其他请求的 decode compute 在传输在途时可继续。<strong>释放协议</strong>:<code>DSparkHiddenReleaseGuard</code>(<a class="file-link" href="python/sglang/srt/disaggregation/mooncake/conn.py">mooncake/conn.py:1377-1398</a>)让 prefill sender worker 或 scheduler 抢占式清理 src hidden 行;decode 侧 <code>_release_dspark_hidden_rows</code>(<a class="file-link" href="python/sglang/srt/disaggregation/decode.py">decode.py:2040-2057</a>)注入后 free recv 行。</p>
+
+<div class="callout warn"><strong>传输校验</strong>
+<code>_validate_dspark_hidden_tensor</code>(<a class="file-link" href="python/sglang/srt/disaggregation/decode.py">decode.py:167-203</a>)在 <code>SGLANG_DSPARK_DEBUG_DUMP</code> 开启时查 NaN/Inf/全零(absmax==0 或 l2==0)/异常大(absmax&gt;1e4 或 l2&gt;1e8);失败触发 <code>_abort_dspark_hidden_commit</code>。<code>_dspark_hidden_debug_summary</code>(L151)产 shape/sum/absmax/l2/前8值供日志取证。</div>
+
+<div class="mermaid">
+stateDiagram-v2
+  [*] --> Bootstrapping
+  Bootstrapping --> WaitingForInput: receiver.init + send_metadata done
+  WaitingForInput --> Transferring: prefill sender.send 触发 RDMA transfer
+  Transferring --> Success: poll() 所有 prefill rank 完成 + DSPARK_HIDDEN 行收到
+  WaitingForInput --> Failed: waiting_timeout (SGLANG_DISAGGREGATION_WAITING_TIMEOUT)
+  Transferring --> Failed: transfer error / abort
+  Success --> [*]: clear() pop room, 注入后 free recv hidden rows
+  Failed --> [*]: abort() 通知 prefill, free rows
+</div>
+<div class="fig-cap">图 3.3 — Decode 请求 KVTransfer 状态机(KVPoll),Success 时释放 DSpark hidden 行</div>
+
+<h3 id="m3-kv">3.7 KV Cache 模型——什么存在哪</h3>
+<p>四个 cache、三个位置参与:</p>
+<table>
+  <thead><tr><th>Cache</th><th>位置</th><th>性质</th><th>来源</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Prefill KV cache</strong></td><td>prefill GPU</td><td>paged <code>token_to_kv_pool</code></td><td>target prefill forward 填充;子集 <code>[decode_prefix_len, prompt_len)</code> 发往 decode</td></tr>
+    <tr><td><strong>Decode KV cache</strong></td><td>decode GPU</td><td>paged <code>token_to_kv_pool</code></td><td>从 prefill KV 转移 bootstrap 进预分配 <code>req_to_token</code> 槽;后续 decode 步追加</td></tr>
+    <tr><td><strong>Draft SWA KV</strong></td><td>decode GPU</td><td>SWA ring(<code>SWAKVPool</code>/<code>DeepSeekV4TokenToKVPool</code>),window=128</td><td><strong>非</strong>来自转移,而是从注入的 target hidden 经 <code>set_swa_key_buffer_radix_fused_norm_rope</code> bootstrap</td></tr>
+    <tr><td><strong>Hidden pool(发送/接收)</strong></td><td>两侧 GPU</td><td>transient <code>DSparkHiddenRowPool</code></td><td>prefill 端:forward 完到 send 完之间持有;decode 端:Success 到注入之间持有,注入后 free</td></tr>
+  </tbody>
+</table>
+<p>关键关系:target KV(prefill)与 draft SWA KV(decode)<strong>从不在同一 worker 共存</strong>——这正是 PD 的意义。hidden pool 是把 prefill 算出的 target 激活"转译"成 decode 端 draft KV 的桥梁,把 draft 的 KV 生命周期与 target forward 的时间线解耦。</p>
+
+<div class="mermaid">
+flowchart LR
+  subgraph PF["Prefill Worker"]
+    PKV["Prefill KV cache<br/>(token_to_kv_pool, paged)<br/>在 prefill GPU"]
+    PHP["dspark_hidden_pool (发送)<br/>rows × (n_target_layers × hidden_size)<br/>transient, 传输后 free"]
+    CAP["captured target hidden<br/>logits_output.hidden_states<br/>逐层 mean over HC heads"]
+    CAP --> PHP
+  end
+  subgraph XF["跨进程 (Mooncake RDMA)"]
+    T1["KV pages: page_ids → decode req_to_token 槽"]
+    T2["DSPARK_HIDDEN rows: src_indices → dst_indices<br/>flat positional copy"]
+  end
+  subgraph DF["Decode Worker"]
+    DKV["Decode KV cache<br/>(token_to_kv_pool, paged)<br/>从 prefill KV 转移 bootstrap"]
+    DHP["dspark_hidden_pool (接收)<br/>rows × hidden_size<br/>transient, 注入后 free"]
+    DSWA["Draft SWA KV ring<br/>(SWAKVPool/DSV4UnifiedKV)<br/>ring window = 128<br/>从注入的 hidden bootstrap"]
+    DKV -.-> DSWA
+  end
+  PKV --> T1
+  PHP --> T2
+  T1 --> DKV
+  T2 --> DHP
+  DHP -- "TargetHiddenKvInjector<br/>project + CommitKvProj + 融合 norm+RoPE" --> DSWA
+  DSWA -- "draft proposes" --> DKV
+</div>
+<div class="fig-cap">图 3.4 — KV 与 hidden 数据流:四个 cache 的位置与流转(transient 池是桥梁)</div>
+
+<h3>3.8 计算模型小结(PD 视角)</h3>
+<div class="grid2">
+  <div class="card">
+    <h4>Prefill 端计算</h4>
+    <ul>
+      <li>target prefill forward(<strong>eager 逐层,禁用 TBO</strong>)以暴露逐层 completed hidden</li>
+      <li>在 target layer ids 捕获 <code>completed.mean(dim=1)</code> 并拼接</li>
+      <li>切片到 SWA 窗口后缀写发送池</li>
+      <li>录 source_event 让 RDMA 等计算 stream</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4>Decode 端计算</h4>
+    <ul>
+      <li>跳过 prefill forward(PrebuiltExtendBatch 仅元数据)</li>
+      <li>首步 <code>_maybe_inject_pd_prefill_tail</code> 注入 draft SWA KV</li>
+      <li>之后每步走第二模块的完整 DSpark decode-step(draft propose → budget → verify → commit)</li>
+      <li>compact + graph folding + confidence relay 全程适用</li>
+    </ul>
+  </div>
+</div>
+
+<h3 id="m3-concl">3.9 小结</h3>
+<table>
+  <thead><tr><th style="width:20%">维度</th><th style="width:14%">判断</th><th>说明</th></tr></thead>
+  <tbody>
+    <tr><td>DSpark 可用性</td><td><span class="pill ok">可运行</span></td><td>纯 DSpark、DSpark+PD 在 a7ca0cb556 均未被 block;唯一硬 gate 是 DSpark+LayerSplit(DSV4)</td></tr>
+    <tr><td>PD hidden 传输</td><td><span class="pill info">仅 Mooncake/Fake</span></td><td>NIXL/Ascend/Mori 对 DSPARK_HIDDEN raise NotImplementedError</td></tr>
+    <tr><td>计算-通信 overlap</td><td><span class="pill ok">有</span></td><td>source_event 让 RDMA 等 prefill compute;decode poll 非阻塞,其他请求传输在途时可算</td></tr>
+    <tr><td>窗口优化</td><td><span class="pill ok">DSV4 限到 128</span></td><td>SWA ring 覆盖语义使只传后缀;非 MoE draft 保守传全上下文</td></tr>
+    <tr><td>资源回收</td><td><span class="pill ok">有协议</span></td><td>DSparkHiddenReleaseGuard + decode _release_dspark_hidden_rows 双向 free</td></tr>
+    <tr><td>prefill 性能代价</td><td><span class="pill warn">TBO 禁用</span></td><td>捕获须 eager 逐层,PD DSpark prefill 放弃 two-batch-overlap(仅 perf,非正确性)</td></tr>
+  </tbody>
+</table>
+
+<div class="footer-note">
+  报告生成于 2026-08-05 · 基于 upstream/main@99709f734d 与 moe_gate_fused_0515-DSpark@a7ca0cb556 的只读代码走读(4 agent 并行,194 次工具调用)。
+  <br>勘误:前版"DSpark 不支持/PD 不可用"结论已纠正 —— DSpark(含 PD)可正常运行,唯一被 block 的是 DSpark+LayerSplit 组合。
+  <br>Mermaid 图需联网加载 CDN 渲染。所有 file:line 锚定真实代码。
+</div>
+
+</div>
+</body>
+</html>

@@ -16,6 +16,7 @@ from sglang.srt.configs.model_config import (
     is_minimax_sparse,
 )
 from sglang.srt.distributed.parallel_state import (
+    get_attn_cp_group,
     get_world_group,
 )
 from sglang.srt.environ import envs
@@ -33,6 +34,13 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.common import get_req_to_token_extra_context_len
+from sglang.srt.mem_cache.cp_cache_layer_split.deepseek_v4_pool import (
+    CpCacheLayerSplitDeepSeekV4TokenToKVPool,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    get_cp_cache_layer_shard_info,
+    should_use_cp_cache_layer_split_pool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
@@ -691,7 +699,7 @@ class ModelRunnerKVCacheMixin:
                 should_use_speculative_state_ring,
             )
 
-            self.token_to_kv_pool = pool_cls(
+            pool_kwargs = dict(
                 max_num_reqs=self.max_running_requests,
                 # SWA ring is indexed by req_pool_idx; PD decode inflates req_to_token
                 # past max_running_requests (pre-alloc), so size to the real capacity.
@@ -724,6 +732,15 @@ class ModelRunnerKVCacheMixin:
                     self.server_args
                 ),
             )
+            layer_shard_rank, layer_shard_size = get_cp_cache_layer_shard_info(self)
+            if layer_shard_rank is not None:
+                self.token_to_kv_pool = CpCacheLayerSplitDeepSeekV4TokenToKVPool(
+                    cp_rank=layer_shard_rank,
+                    cp_size=layer_shard_size,
+                    **pool_kwargs,
+                )
+            else:
+                self.token_to_kv_pool = pool_cls(**pool_kwargs)
         elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_dsa_kv_pool_cls()
@@ -849,16 +866,29 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_dsa_model:
-            PoolCls = (
-                HiSparseDSATokenToKVPool if self.enable_hisparse else DSATokenToKVPool
-            )
+            (
+                dsa_cp_layer_shard_rank,
+                dsa_cp_layer_shard_size,
+            ) = get_cp_cache_layer_shard_info(self)
             pool_kwargs = {}
             if self.enable_hisparse:
+                PoolCls = HiSparseDSATokenToKVPool
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            elif dsa_cp_layer_shard_rank is not None:
+                # DSA cache layer split: shard KV/indexer layers across CP ranks.
+                from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                    LayerSplitDSATokenToKVPool,
+                )
+
+                PoolCls = LayerSplitDSATokenToKVPool
+                pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+                pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+            else:
+                PoolCls = DSATokenToKVPool
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -1224,6 +1254,17 @@ class ModelRunnerKVCacheMixin:
                 tensor,
                 op=torch.distributed.ReduceOp.MIN,
                 group=get_world_group().cpu_group,
+            )
+            token_capacity = tensor.item()
+
+        # Keep capacity identical across CP ranks so sharded pools and
+        # dynamically grown staging buffers use a consistent capacity bound.
+        if should_use_cp_cache_layer_split_pool(self):
+            tensor = torch.tensor(token_capacity, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_attn_cp_group().cpu_group,
             )
             token_capacity = tensor.item()
 

@@ -31,11 +31,18 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
+from sglang.srt.mem_cache.cp_cache_layer_split import (
+    build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout,
+)
+from sglang.srt.mem_cache.cp_cache_layer_split.utils import (
+    should_use_cp_cache_layer_split_pool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     should_use_speculative_state_ring,
 )
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -180,6 +187,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         # args to config cell size
         model_config = mr.model_config
         kv_cache_dtype = mr.kv_cache_dtype
+        effective_num_layers = num_layers
+        if (
+            should_use_cp_cache_layer_split_pool(mr)
+            and mr.use_mla_backend
+            and is_deepseek_dsa(model_config.hf_config)
+        ):
+            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                get_dsa_layer_split_effective_num_layers,
+            )
+
+            effective_num_layers = get_dsa_layer_split_effective_num_layers(
+                num_layers, get_parallel().attn_cp_size
+            )
 
         kv_size = torch._utils._element_size(kv_cache_dtype)
         tp_size = get_attention_tp_size()
@@ -187,7 +207,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if mr.use_mla_backend:
             cell_size = (
                 (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
+                * effective_num_layers
                 * kv_size
             )
             if is_float4_e2m1fn_x2(kv_cache_dtype):
@@ -198,7 +218,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                         // scale_block_size
                     )
-                    * num_layers
+                    * effective_num_layers
                     * kv_size
                 )
 
@@ -212,7 +232,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                cell_size += (
+                    indexer_size_per_token * effective_num_layers * element_size
+                )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
             # (sparse-only, single-head; kv layers store K+V, k-only layers store K).
@@ -549,6 +571,11 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
         self.context_len = mr.model_config.context_len
+        self.compress_ratios = cfg.compress_ratios
+        self.start_layer = mr.start_layer
+        self.end_layer = mr.end_layer
+        self.use_cp_cache_layer_split = should_use_cp_cache_layer_split_pool(mr)
+        self.attn_cp_size = mr.server_args.attn_cp_size
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
         if mr.pp_size > 1:
@@ -604,6 +631,26 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.num_layers_total = len(self.compression_ratios)
         self.num_layers_ca4 = sum(1 for r in self.compression_ratios if r == 4)
         self.num_layers_ca128 = sum(1 for r in self.compression_ratios if r == 128)
+        self.num_layers_ca4_indexer = self.num_layers_ca4
+        self.num_layers_ca4_state = self.num_layers_ca4
+        self.num_layers_ca128_state = self.num_layers_ca128
+        self.num_layers_ca4_indexer_state = self.num_layers_ca4
+
+        if self.use_cp_cache_layer_split:
+            layout = build_cp_cache_layer_split_deepseek_v4_worst_case_pool_layout(
+                self.attn_cp_size,
+                self.start_layer,
+                self.end_layer,
+                self.compress_ratios,
+            )
+            self.num_layers_total = layout.swa_layer_num
+            self.num_layers_ca4 = layout.c4_layer_num
+            self.num_layers_ca128 = layout.c128_layer_num
+            self.num_layers_ca4_indexer = layout.c4_indexer_layer_num
+            self.num_layers_ca4_state = layout.c4_state_layer_num
+            self.num_layers_ca128_state = layout.c128_state_layer_num
+            self.num_layers_ca4_indexer_state = layout.c4_indexer_state_layer_num
+            logger.info("CP Cache LayerSplit layout=%s", layout)
 
         self.bytes_per_full_token = self._get_bytes_per_full_token()
         if self.is_speculative:
@@ -674,18 +721,36 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         c128_state_ratio = 0
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
-        return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
-            + 1 / 4 * indexer_bytes * self.num_layers_ca4
-            + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
-            + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
-            + self.swa_ratio
+        components = {
+            "swa_kv": self.swa_ratio * kv_bytes * self.num_layers_total,
+            "c4_kv": c4_frac * kv_bytes * self.num_layers_ca4,
+            "c128_kv": 1 / 128 * kv_bytes * self.num_layers_ca128,
+            "c4_indexer_kv": 1 / 4 * indexer_bytes * self.num_layers_ca4_indexer,
+            "c4_state": self.swa_ratio
+            * c4_state_ratio
+            * c4_state_bytes
+            * self.num_layers_ca4_state,
+            "c128_state": c128_state_ratio
+            * c128_state_bytes
+            * self.num_layers_ca128_state,
+            "c4_indexer_state": self.swa_ratio
             * c4_state_ratio
             * c4_indexer_state_bytes
-            * self.num_layers_ca4
-        )
+            * self.num_layers_ca4_indexer_state,
+        }
+        if self.use_cp_cache_layer_split:
+            # Non-owned reads use one rank-local scratch buffer per KV family.
+            # Reserve their full capacities so staging cannot OOM after startup.
+            components.update(
+                {
+                    "staging_swa_kv": self.swa_ratio * kv_bytes,
+                    "staging_c4_kv": c4_frac * kv_bytes,
+                    "staging_c128_kv": 1 / 128 * kv_bytes,
+                    "staging_c4_indexer_kv": 1 / 4 * indexer_bytes,
+                }
+            )
+        total = sum(components.values())
+        return total
 
     def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
         full_token = full_token // page_size * page_size

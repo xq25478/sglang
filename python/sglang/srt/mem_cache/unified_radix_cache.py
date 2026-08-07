@@ -1553,6 +1553,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        write_stats_ticket = self.cache_controller.begin_layer_split_l2_write(
+            len(device_value)
+        )
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
         # Build aux transfers, keyed per component.
@@ -1571,9 +1574,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
+            self.cache_controller.mark_layer_split_l2_capacity_pressure(
+                reason="unified_radix_host_eviction_required"
+            )
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)
             if evicted < needed:
+                self.cache_controller.record_layer_split_l2_eviction_shortfall(
+                    write_stats_ticket,
+                    required_tokens=needed,
+                    evicted_tokens=evicted,
+                )
+                self.cache_controller.finish_layer_split_l2_write(
+                    write_stats_ticket,
+                    success=False,
+                    failure_reason="eviction_shortfall",
+                )
                 return 0
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -1582,7 +1598,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
         if host_indices is None:
+            self.cache_controller.finish_layer_split_l2_write(
+                write_stats_ticket,
+                success=False,
+                failure_reason=(
+                    self.cache_controller.consume_layer_split_l2_write_failure_reason()
+                ),
+            )
             return 0
+        self.cache_controller.finish_layer_split_l2_write(
+            write_stats_ticket,
+            success=True,
+        )
 
         # Commit
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)

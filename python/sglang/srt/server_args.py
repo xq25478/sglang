@@ -99,6 +99,7 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+CP_CACHE_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS = ("file", "mooncake")
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -901,6 +902,14 @@ class ServerArgs:
             choices=("zigzag", "interleave"),
         ),
     ] = None
+    # Split model cache layers across CP ranks.
+    enable_cp_cache_layer_split: A[
+        bool,
+        Arg(
+            help="Split selected GPU cache layers across context-parallel ranks to reduce per-rank cache memory. Model-specific support is required.",
+            aliases=["--enable-dsa-cache-layer-split"],
+        ),
+    ] = False
     enable_dsa_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
     dsa_prefill_cp_mode: A[str, Arg(no_cli=True)] = "round-robin-split"
     enable_prefill_context_parallel: A[bool, Arg(no_cli=True)] = False
@@ -2759,6 +2768,12 @@ class ServerArgs:
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
 
+        # Re-apply after model-specific defaults resolve attention_backend so
+        # canonical CP mirrors to the right legacy runtime aliases before
+        # LayerSplit adjusts CUDA graph settings.
+        self._handle_legacy_cp_arguments()
+        self._handle_cp_cache_layer_split()
+
         # Set kernel backends.
         self._handle_sampling_backend()
         # Must run before _handle_attention_backend_compatibility so the
@@ -2818,6 +2833,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
         handle_speculative_decoding(self)
+        self._validate_cp_cache_layer_split_speculative_decoding()
 
         # Validate the CuteDSL A2A token budget now that num_tokens_per_bs is final.
         self._validate_cutedsl_a2a_token_budget()
@@ -4933,6 +4949,129 @@ class ServerArgs:
         from sglang.srt.layers.cp.base import init_cp_strategy
 
         init_cp_strategy(self)
+
+    def _validate_cp_cache_layer_split_model(self) -> bool:
+        """Validate the model and return whether DSV4-specific guards apply."""
+        has_concrete_model_config = (
+            self.model_path.lower() not in ("none", "dummy")
+            and parse_connector_type(self.model_path) != ConnectorType.INSTANCE
+        )
+        if not has_concrete_model_config:
+            return True
+
+        hf_config = self.get_model_config().hf_config
+        model_arch = hf_config.architectures[0]
+        from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
+
+        is_dsv4_layer_split = is_deepseek_v4(hf_config)
+        if not (is_dsv4_layer_split or is_deepseek_dsa(hf_config)):
+            raise ValueError(
+                "--enable-cp-cache-layer-split is not supported for model arch "
+                f"{model_arch!r}."
+            )
+        return is_dsv4_layer_split
+
+    def _handle_cp_cache_layer_split(self):
+        if not self.enable_cp_cache_layer_split:
+            return
+
+        is_dsv4_layer_split = self._validate_cp_cache_layer_split_model()
+
+        # Shared constraints for all cache layer-split implementations.
+        if not self.enable_prefill_cp:
+            raise ValueError(
+                "--enable-cp-cache-layer-split requires --enable-prefill-cp "
+                "--cp-strategy interleave"
+            )
+        if self.attn_cp_size <= 1:
+            raise ValueError(
+                "--enable-cp-cache-layer-split requires --attn-cp-size > 1"
+            )
+        if self.cp_strategy != "interleave":
+            raise ValueError(
+                "--enable-cp-cache-layer-split requires --cp-strategy interleave"
+            )
+        if self.pp_size > 1:
+            raise ValueError(
+                "--enable-cp-cache-layer-split is not supported with pipeline "
+                "parallelism (pp_size > 1) yet"
+            )
+        if self.disaggregation_mode != "prefill":
+            raise ValueError(
+                "--enable-cp-cache-layer-split is currently supported only on "
+                "prefill-only servers. Set --disaggregation-mode prefill."
+            )
+        if self.enable_hisparse:
+            raise ValueError(
+                "--enable-cp-cache-layer-split is incompatible with --enable-hisparse"
+            )
+        if self.prefill_only_disable_kv_cache:
+            raise ValueError(
+                "--enable-cp-cache-layer-split is incompatible with "
+                "--prefill-only-disable-kv-cache"
+            )
+        if not is_cuda():
+            raise ValueError(
+                "--enable-cp-cache-layer-split is currently supported only on CUDA"
+            )
+        if self.disaggregation_transfer_backend != "mooncake":
+            raise ValueError(
+                "--enable-cp-cache-layer-split currently supports PD transfer only "
+                "with --disaggregation-transfer-backend mooncake"
+            )
+        backend = self.hicache_storage_backend
+        if (
+            backend is not None
+            and backend not in CP_CACHE_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS
+        ):
+            supported = ", ".join(CP_CACHE_LAYER_SPLIT_HICACHE_STORAGE_BACKENDS)
+            raise ValueError(
+                f"--enable-cp-cache-layer-split + --hicache-storage-backend={backend!r} "
+                f"is not yet supported. Supported backends: {supported}."
+            )
+
+        cuda_graph_config = getattr(self, "cuda_graph_config", None)
+        if (
+            cuda_graph_config is not None
+            and cuda_graph_config.prefill.backend != Backend.DISABLED
+        ):
+            logger.warning(
+                "Disabling prefill CUDA graph because "
+                "--enable-cp-cache-layer-split is enabled."
+            )
+            cuda_graph_config.prefill.backend = Backend.DISABLED
+
+        if not is_dsv4_layer_split:
+            return
+
+        # DeepSeek V4-specific implementation constraints.
+        if not envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+            raise ValueError(
+                "--enable-cp-cache-layer-split requires the Compressor V2 path"
+            )
+        from sglang.srt.layers.attention.dsv4.unified_kv_kernels.env_gate import (
+            is_unified_kv_triton,
+        )
+
+        if is_unified_kv_triton():
+            raise ValueError(
+                "--enable-cp-cache-layer-split is incompatible with "
+                "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton"
+            )
+
+    def _validate_cp_cache_layer_split_speculative_decoding(self) -> None:
+        if (
+            not self.enable_cp_cache_layer_split
+            or self.speculative_algorithm is None
+            or not self._validate_cp_cache_layer_split_model()
+        ):
+            return
+
+        if self.speculative_algorithm != "EAGLE" or self.speculative_eagle_topk != 1:
+            raise ValueError(
+                "DeepSeek V4 CP Cache LayerSplit supports speculative decoding "
+                "only with EAGLE topk=1"
+            )
 
     def _handle_data_parallelism(self):
         # The dp_size==1 resets moved to the resolution pipeline

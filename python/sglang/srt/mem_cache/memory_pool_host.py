@@ -2276,6 +2276,66 @@ class MambaPoolHost(HostKVCache):
 # ---- V4 Compressed KV Host Pools ----
 
 
+class _FixedCapacityFreeSlotQueue:
+    """FIFO free-slot queue backed by one fixed-size CPU tensor."""
+
+    def __init__(self, capacity: int):
+        if capacity < 0:
+            raise ValueError(f"Free-slot capacity must be non-negative, got {capacity}")
+        self.capacity = capacity
+        self._slots = torch.arange(capacity, dtype=torch.int64)
+        self._head = 0
+        self._count = capacity
+
+    def available_size(self) -> int:
+        return self._count
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        if need_size < 0:
+            raise ValueError(
+                f"Free-slot allocation size must be non-negative, got {need_size}"
+            )
+        if need_size > self._count:
+            return None
+        if need_size == 0:
+            return torch.empty(0, dtype=torch.int64)
+
+        first_size = min(need_size, self.capacity - self._head)
+        selected = torch.empty(need_size, dtype=torch.int64)
+        selected[:first_size].copy_(
+            self._slots[self._head : self._head + first_size]
+        )
+        remaining_size = need_size - first_size
+        if remaining_size:
+            selected[first_size:].copy_(self._slots[:remaining_size])
+
+        self._head = (self._head + need_size) % self.capacity
+        self._count -= need_size
+        return selected
+
+    def free(self, indices: torch.Tensor) -> int:
+        indices_cpu = indices.to(dtype=torch.int64, device="cpu").flatten()
+        released_size = indices_cpu.numel()
+        if released_size == 0:
+            return 0
+        if released_size > self.capacity - self._count:
+            raise ValueError(
+                "Free-slot queue capacity exceeded: "
+                f"capacity={self.capacity}, available={self._count}, "
+                f"released={released_size}"
+            )
+
+        tail = (self._head + self._count) % self.capacity
+        first_size = min(released_size, self.capacity - tail)
+        self._slots[tail : tail + first_size].copy_(indices_cpu[:first_size])
+        remaining_size = released_size - first_size
+        if remaining_size:
+            self._slots[:remaining_size].copy_(indices_cpu[first_size:])
+
+        self._count += released_size
+        return released_size
+
+
 class LogicalHostPool:
     """Pure-logical anchor pool for V4 HiCache.
 
@@ -2306,10 +2366,10 @@ class LogicalHostPool:
 
     @synchronized
     def clear(self):
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self._free_slot_queue = _FixedCapacityFreeSlotQueue(self.size)
 
     def available_size(self):
-        return len(self.free_slots)
+        return self._free_slot_queue.available_size()
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -2320,9 +2380,7 @@ class LogicalHostPool:
             )
         if need_size > self.available_size():
             return None
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_index
+        return self._free_slot_queue.alloc(need_size)
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
@@ -2331,9 +2389,7 @@ class LogicalHostPool:
                 "LogicalHostPool free must be page-aligned, "
                 f"got len(indices)={len(indices)}, page_size={self.page_size}"
             )
-        self.free_slots = torch.cat(
-            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
-        )
+        self._free_slot_queue.free(indices)
         return len(indices)
 
     def backup_from_device_all_layer(
@@ -2520,10 +2576,10 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         return self.kv_buffer if isinstance(self.kv_buffer, list) else [self.kv_buffer]
 
     def clear(self):
-        self.free_slots = torch.arange(self.size, dtype=torch.int64)
+        self._free_slot_queue = _FixedCapacityFreeSlotQueue(self.size)
 
     def available_size(self):
-        return len(self.free_slots)
+        return self._free_slot_queue.available_size()
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
@@ -2532,15 +2588,11 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ) * self.slot_page_size
         if need_size > self.available_size():
             return None
-        select_index = self.free_slots[:need_size]
-        self.free_slots = self.free_slots[need_size:]
-        return select_index
+        return self._free_slot_queue.alloc(need_size)
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
-        self.free_slots = torch.cat(
-            [self.free_slots, indices.to(dtype=torch.int64, device="cpu").flatten()]
-        )
+        self._free_slot_queue.free(indices)
         return len(indices)
 
     def backup_from_device_all_layer(

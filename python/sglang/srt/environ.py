@@ -429,6 +429,15 @@ class Envs:
     # Hi-Cache
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
+    # Diagnostic counters for LayerSplit L1-to-L2 write admission. This only
+    # records statistics and does not change HiCache scheduling behavior.
+    SGLANG_LOG_HICACHE_LAYER_SPLIT_WRITE_STATS = EnvBool(False)
+    SGLANG_HICACHE_LAYER_SPLIT_WRITE_STATS_INTERVAL_SECONDS = EnvFloat(10.0)
+    # CP Cache LayerSplit: when True, KV page broadcasts run inline on the
+    # compute stream instead of a dedicated side stream.  Use as a stability
+    # fallback when async broadcasts cause sync issues; performance regresses
+    # but correctness is preserved.
+    SGLANG_CP_CACHE_LAYER_SPLIT_DISABLE_ASYNC_BROADCAST = EnvBool(False)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)

@@ -790,13 +790,22 @@ class HiRadixCache(RadixCache):
         ):
             return 0
 
+        write_stats_ticket = self.cache_controller.begin_layer_split_l2_write(
+            len(node.value)
+        )
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
             **self._get_extra_pools(),
         )
         if host_indices is None:
-            self.evict_host(len(node.value))
+            evicted = self.evict_host(len(node.value))
+            if evicted < len(node.value):
+                self.cache_controller.record_layer_split_l2_eviction_shortfall(
+                    write_stats_ticket,
+                    required_tokens=len(node.value),
+                    evicted_tokens=evicted,
+                )
             host_indices = self.cache_controller.write(
                 device_indices=node.value,
                 node_id=node.id,
@@ -810,8 +819,19 @@ class HiRadixCache(RadixCache):
             if not write_back:
                 self.inc_lock_ref(node)
         else:
+            self.cache_controller.finish_layer_split_l2_write(
+                write_stats_ticket,
+                success=False,
+                failure_reason=(
+                    self.cache_controller.consume_layer_split_l2_write_failure_reason()
+                ),
+            )
             return 0
 
+        self.cache_controller.finish_layer_split_l2_write(
+            write_stats_ticket,
+            success=True,
+        )
         return len(host_indices)
 
     def _track_write_through_node(self, node: TreeNode, backup_len: int) -> None:

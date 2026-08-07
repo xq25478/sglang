@@ -27,6 +27,7 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.cp_cache_layer_split import is_cp_cache_layer_split_pool
 from sglang.srt.utils import is_hip, is_npu
 
 logger = logging.getLogger(__name__)
@@ -1186,6 +1187,38 @@ def filter_kv_indices_for_cp_rank(
 #########################
 
 
+def append_draft_kv_data(
+    kv_data_ptrs: List[int],
+    kv_data_lens: List[int],
+    kv_item_lens: List[int],
+    kv_data_layout: List[tuple],
+    draft_token_to_kv_pool,
+) -> int:
+    """Append draft KV-data buffers and return the number added.
+
+    DSV4 NextN keeps its SWA cache in state buffers, so it contributes no
+    KV-data buffers. Preserve the target's descriptor layout in that case.
+    """
+    draft_ptrs, draft_lens, draft_item_lens = (
+        draft_token_to_kv_pool.get_contiguous_buf_infos()
+    )
+    kv_data_ptrs.extend(draft_ptrs)
+    kv_data_lens.extend(draft_lens)
+    kv_item_lens.extend(draft_item_lens)
+    if draft_ptrs:
+        # Existing draft KV-data transfer is positional and has no descriptor
+        # namespace. Descriptor-required callers will fail loudly downstream.
+        kv_data_layout.clear()
+    return len(draft_ptrs)
+
+
+def should_transfer_draft_cache(token_to_kv_pool) -> bool:
+    """Transfer a replicated draft cache from only one LayerSplit CP rank."""
+    return not is_cp_cache_layer_split_pool(token_to_kv_pool) or (
+        token_to_kv_pool.cp_rank == token_to_kv_pool.cp_size - 1
+    )
+
+
 def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -1200,6 +1233,7 @@ def append_state_component(
     data_lens: List[int],
     item_lens: List[int],
     dim_per_tensor: Optional[List[int]] = None,
+    data_layout: Optional[List[tuple]] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
@@ -1208,6 +1242,7 @@ def append_state_component(
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
     kv_args.state_dim_per_tensor.append(dim_per_tensor or [])
+    kv_args.state_data_layouts.append(data_layout or [])
 
 
 def setup_state_kv_args(
@@ -1225,6 +1260,9 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4TokenToKVPool,
+    )
     from sglang.srt.mem_cache.memory_pool import (
         DSATokenToKVPool,
         HybridLinearKVPool,
@@ -1236,6 +1274,8 @@ def setup_state_kv_args(
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
     kv_args.state_dim_per_tensor = []
+    kv_args.is_hybrid_mla_backend = False
+    kv_args.state_data_layouts = []
 
     if isinstance(token_to_kv_pool, MiniMaxSparseKVPool):
         if token_to_kv_pool.index_kv_pool is not None:
@@ -1252,8 +1292,18 @@ def setup_state_kv_args(
         # DeepSeekV4TokenToKVPool inherits BaseSWAKVPool; its heterogeneous
         # state list is described per-entry via get_state_buf_infos.
         if isinstance(token_to_kv_pool, BaseSWAKVPool):
+            data_layout = (
+                token_to_kv_pool.get_state_transfer_layout()
+                if hasattr(token_to_kv_pool, "get_state_transfer_layout")
+                else None
+            )
             append_state_component(
-                kv_args, StateType.SWA, data_ptrs, data_lens, item_lens
+                kv_args,
+                StateType.SWA,
+                data_ptrs,
+                data_lens,
+                item_lens,
+                data_layout=data_layout,
             )
             # unified_kv: the SWA ring lives in the unified buffers (no separate
             # swa_kv_pool) and is addressed per-row, so ship it as SWA_RING.
@@ -1275,19 +1325,34 @@ def setup_state_kv_args(
                 c128_ptrs, c128_lens, c128_item_lens = (
                     token_to_kv_pool.get_c128_state_buf_infos()
                 )
-                if c128_ptrs:
+                keep_empty_c128_slot = (
+                    is_cp_cache_layer_split_pool(token_to_kv_pool)
+                    and 128 in token_to_kv_pool.compression_ratios
+                )
+                if c128_ptrs or keep_empty_c128_slot:
+                    c128_layout = (
+                        token_to_kv_pool.get_c128_state_transfer_layout()
+                        if hasattr(token_to_kv_pool, "get_c128_state_transfer_layout")
+                        else None
+                    )
+                    # Keep later draft-state components positionally aligned with
+                    # decode ranks even when this CP rank owns no C128 layer.
                     append_state_component(
                         kv_args,
                         StateType.C128_STATE,
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                        data_layout=c128_layout,
                     )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()
                 if hasattr(token_to_kv_pool, "get_state_dim_per_tensor")
                 else None
+            )
+            kv_args.is_hybrid_mla_backend = is_mla_backend(
+                token_to_kv_pool.full_kv_pool
             )
             append_state_component(
                 kv_args, StateType.MAMBA, data_ptrs, data_lens, item_lens, dim
@@ -1395,14 +1460,19 @@ def setup_state_kv_args(
             draft_state_type = StateType.SWA
 
         if draft_ptrs:
+            draft_layout = (
+                draft_token_to_kv_pool.get_state_transfer_layout()
+                if hasattr(draft_token_to_kv_pool, "get_state_transfer_layout")
+                else None
+            )
             append_state_component(
                 kv_args,
                 draft_state_type,
                 draft_ptrs,
                 draft_lens,
                 draft_item_lens,
+                data_layout=draft_layout,
             )
-
     if (
         StateType.MAMBA not in kv_args.state_types
         and req_to_token_pool is not None
